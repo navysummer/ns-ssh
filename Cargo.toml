@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/ssh-core",
+    "crates/ns-ssh",
+    "crates/ns-ssh-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["ns-ssh"]
+description = "Pure Rust SSH implementation"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

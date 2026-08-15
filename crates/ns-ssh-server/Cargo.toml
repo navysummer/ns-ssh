@@ -1,0 +1,29 @@
+[package]
+name = "ns-ssh-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSH server - pure Rust replacement for OpenSSH sshd"
+
+[[bin]]
+name = "ns-ssh-server"
+path = "src/main.rs"
+
+[dependencies]
+ssh-core = { path = "../ssh-core" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+base64 = "0.22"
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+libc = "0.2"
+num-bigint = "0.4"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+ed25519-dalek = "2"
+p256 = "0.13"

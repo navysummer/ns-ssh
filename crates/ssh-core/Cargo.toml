@@ -1,0 +1,40 @@
+[package]
+name = "ssh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure Rust SSH protocol implementation"
+
+[dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+rsa = { version = "0.9", features = ["sha2", "sha1"] }
+signature = "2"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
+elliptic-curve = { version = "0.13", features = ["sec1"] }
+aes = "0.8"
+cipher = "0.4"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+bcrypt-pbkdf = "0.10"
+aes-gcm = "0.10"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+ctr = "0.9"
+num-modular = "0.5"
+rand = "0.8"
+rand_core = "0.6"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+byteorder = "1"
+thiserror = "2"
+dirs = "6"
+libc = "0.2"
+
+[features]
+default = []

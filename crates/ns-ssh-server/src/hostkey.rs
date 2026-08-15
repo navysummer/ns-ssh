@@ -1,0 +1,334 @@
+use ssh_core::error::{Result, SshError};
+use ssh_core::hostkey::*;
+use std::path::{Path, PathBuf};
+use std::fs;
+use base64::Engine;
+
+pub struct HostKeyManager {
+    keys: Vec<Box<dyn HostKeySigner>>,
+}
+
+impl HostKeyManager {
+    pub fn new() -> Self {
+        HostKeyManager { keys: Vec::new() }
+    }
+
+    pub fn load_or_generate(&mut self, key_files: &[PathBuf]) -> Result<()> {
+        for key_path in key_files {
+            match self.load_key(key_path) {
+                Ok(key) => {
+                    self.keys.push(key);
+                }
+                Err(_) => {
+                    match self.generate_key(key_path) {
+                        Ok(key) => {
+                            self.keys.push(key);
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to load or generate host key {}: {}", key_path.display(), e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.keys.is_empty() {
+            return Err(SshError::Protocol("no host keys available".into()));
+        }
+
+        Ok(())
+    }
+
+    fn load_key(&self, path: &Path) -> Result<Box<dyn HostKeySigner>> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| SshError::Io(e))?;
+
+        let content = content.trim();
+
+        if content.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
+            load_openssh_key(content)
+        } else {
+            Err(SshError::InvalidKey("unsupported key format".into()))
+        }
+    }
+
+    fn generate_key(&self, path: &Path) -> Result<Box<dyn HostKeySigner>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| SshError::Io(e))?;
+        }
+
+        let key_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        let key: Box<dyn HostKeySigner> = if key_name.contains("ed25519") {
+            Box::new(Ed25519HostKey::generate()?)
+        } else if key_name.contains("ecdsa") {
+            Box::new(EcdsaP256HostKey::generate()?)
+        } else if key_name.contains("rsa") {
+            Box::new(RsaHostKey::generate(2048)?)
+        } else {
+            Box::new(Ed25519HostKey::generate()?)
+        };
+
+        self.save_key(path, key.as_ref())?;
+        Ok(key)
+    }
+
+    fn save_key(&self, path: &Path, key: &dyn HostKeySigner) -> Result<()> {
+        let key_name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        let content = if key_name.contains("ed25519") {
+            let signer = key as *const dyn HostKeySigner as *const Ed25519HostKey;
+            let ed_key = unsafe { &*signer };
+            format_openssh_ed25519(&ed_key.secret_bytes())
+        } else if key_name.contains("ecdsa") {
+            let signer = key as *const dyn HostKeySigner as *const EcdsaP256HostKey;
+            let ecdsa_key = unsafe { &*signer };
+            format_openssh_ecdsa(&ecdsa_key.secret_bytes())
+        } else {
+            return Err(SshError::Protocol("unsupported key type for generation".into()));
+        };
+
+        fs::write(path, &content)
+            .map_err(|e| SshError::Io(e))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| SshError::Io(e))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_key_for_algorithm(&self, algorithm: &str) -> Option<&dyn HostKeySigner> {
+        self.keys.iter().find(|k| k.algorithm_name() == algorithm).map(|k| k.as_ref())
+    }
+
+    pub fn get_all_keys(&self) -> &[Box<dyn HostKeySigner>] {
+        &self.keys
+    }
+
+    pub fn get_key_blobs(&self) -> Vec<(String, Vec<u8>)> {
+        self.keys.iter().map(|k| {
+            (k.algorithm_name().to_string(), k.public_key_bytes())
+        }).collect()
+    }
+}
+
+fn format_openssh_ed25519(secret: &[u8; 32]) -> String {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"openssh-key-v1\0");
+    buf.extend_from_slice(&0u32.to_be_bytes()); // cipher: none
+    buf.extend_from_slice(&0u32.to_be_bytes()); // kdf: none
+    buf.extend_from_slice(&0u32.to_be_bytes()); // kdf options: empty
+    buf.extend_from_slice(&1u32.to_be_bytes()); // number of keys: 1
+
+    let mut pub_key_buf = Vec::new();
+    pub_key_buf.extend_from_slice(b"ssh-ed25519");
+    let signing = ed25519_dalek::SigningKey::from_bytes(secret);
+    let pub_key = signing.verifying_key();
+    pub_key_buf.extend_from_slice(&(32u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(pub_key.as_bytes());
+    buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&pub_key_buf);
+
+    let mut priv_key_buf = Vec::new();
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // check int 1
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // check int 2
+    priv_key_buf.extend_from_slice(b"ssh-ed25519");
+    priv_key_buf.extend_from_slice(&(32u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(pub_key.as_bytes());
+    priv_key_buf.extend_from_slice(&(64u32).to_be_bytes()); // secret key length
+    priv_key_buf.extend_from_slice(secret);
+    priv_key_buf.extend_from_slice(pub_key.as_bytes());
+    priv_key_buf.extend_from_slice(b"\0\0\0\0"); // comment (empty)
+    priv_key_buf.extend_from_slice(b"\0\0\0\0\0\0\0\0"); // padding
+
+    buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&priv_key_buf);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+    let mut result = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(70) {
+        result.push_str(std::str::from_utf8(chunk).unwrap());
+        result.push('\n');
+    }
+    result.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    result
+}
+
+fn format_openssh_ecdsa(secret: &[u8]) -> String {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"openssh-key-v1\0");
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    buf.extend_from_slice(&1u32.to_be_bytes());
+
+    let signing_key = p256::ecdsa::SigningKey::from_bytes(secret.into()).unwrap();
+    let verifying_key = signing_key.verifying_key();
+    let point = verifying_key.to_encoded_point(false);
+
+    let mut pub_key_buf = Vec::new();
+    pub_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
+    pub_key_buf.extend_from_slice(b"nistp256");
+    pub_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(point.as_bytes());
+    buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&pub_key_buf);
+
+    let mut priv_key_buf = Vec::new();
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
+    priv_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
+    priv_key_buf.extend_from_slice(b"nistp256");
+    priv_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(point.as_bytes());
+    priv_key_buf.extend_from_slice(&(secret.len() as u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(secret);
+    priv_key_buf.extend_from_slice(b"\0\0\0\0");
+    priv_key_buf.extend_from_slice(b"\0\0\0\0\0\0\0\0");
+
+    buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&priv_key_buf);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+    let mut result = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
+    for chunk in encoded.as_bytes().chunks(70) {
+        result.push_str(std::str::from_utf8(chunk).unwrap());
+        result.push('\n');
+    }
+    result.push_str("-----END OPENSSH PRIVATE KEY-----\n");
+    result
+}
+
+fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {
+    let base64_content: String = content.lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&base64_content)
+        .map_err(|e| SshError::InvalidKey(format!("base64 decode: {}", e)))?;
+
+    if decoded.len() < 15 {
+        return Err(SshError::InvalidKey("key too short".into()));
+    }
+
+    let magic = &decoded[..15];
+    if magic != b"openssh-key-v1\0" {
+        return Err(SshError::InvalidKey("invalid openssh key magic".into()));
+    }
+
+    let mut r = &decoded[15..];
+    let _ciphername = read_simplified_string(&mut r)?;
+    let _kdfname = read_simplified_string(&mut r)?;
+    let _kdfoptions = read_simplified_string(&mut r)?;
+    let _num_keys = read_simplified_uint32(&mut r)?;
+
+    let _pub_len = read_simplified_uint32(&mut r)? as usize;
+    r = &r[_pub_len..];
+
+    let priv_len = read_simplified_uint32(&mut r)? as usize;
+    if r.len() < priv_len {
+        return Err(SshError::InvalidKey("truncated private key".into()));
+    }
+    let priv_data = &r[..priv_len];
+
+    let mut pr = &priv_data[8..];
+    let key_type = read_simplified_string(&mut pr)?;
+
+    match key_type.as_str() {
+        "ssh-ed25519" => {
+            let _check1 = read_simplified_uint32(&mut pr)?;
+            let _check2 = read_simplified_uint32(&mut pr)?;
+            let _pub_len = read_simplified_uint32(&mut pr)? as usize;
+            pr = &pr[_pub_len..];
+            let _secret_len = read_simplified_uint32(&mut pr)? as usize;
+            let secret_bytes = read_simplified_raw(&mut pr, 32)?;
+            let _pub_after = read_simplified_raw(&mut pr, 32)?;
+
+            Ok(Box::new(Ed25519HostKey::from_bytes(
+                &secret_bytes.try_into().map_err(|_| SshError::InvalidKey("wrong ed25519 key size".into()))?
+            )?))
+        }
+        "ecdsa-sha2-nistp256" => {
+            let _check1 = read_simplified_uint32(&mut pr)?;
+            let _check2 = read_simplified_uint32(&mut pr)?;
+            let _pub_curve = read_simplified_string(&mut pr)?;
+            let _pub_len = read_simplified_uint32(&mut pr)? as usize;
+            pr = &pr[_pub_len..];
+            let secret_len = read_simplified_uint32(&mut pr)? as usize;
+            let secret_bytes = read_simplified_raw(&mut pr, secret_len - 8)?;
+
+            Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&secret_bytes)?))
+        }
+        "ssh-rsa" => {
+            let _check1 = read_simplified_uint32(&mut pr)?;
+            let _check2 = read_simplified_uint32(&mut pr)?;
+
+            let n_bytes = read_simplified_string_bytes(&mut pr)?;
+            let e_bytes = read_simplified_string_bytes(&mut pr)?;
+            let _d_bytes = read_simplified_string_bytes(&mut pr)?;
+            let _iqmp_bytes = read_simplified_string_bytes(&mut pr)?;
+            let _p_bytes = read_simplified_string_bytes(&mut pr)?;
+            let _q_bytes = read_simplified_string_bytes(&mut pr)?;
+
+            let n = rsa::BigUint::from_bytes_be(&n_bytes);
+            let e = rsa::BigUint::from_bytes_be(&e_bytes);
+            let d = rsa::BigUint::from_bytes_be(&_d_bytes);
+
+            let rsa_key = rsa::RsaPrivateKey::from_components(n, e, d, vec![])
+                .map_err(|e| SshError::InvalidKey(format!("RSA: {}", e)))?;
+            let public_key = rsa::RsaPublicKey::from(&rsa_key);
+
+            Ok(Box::new(RsaHostKey::new(Some(rsa_key), public_key, 2048)))
+        }
+        _ => Err(SshError::InvalidKey(format!("unsupported key type: {}", key_type))),
+    }
+}
+
+fn read_simplified_string(r: &mut &[u8]) -> Result<String> {
+    let len = read_simplified_uint32(r)? as usize;
+    if r.len() < len {
+        return Err(SshError::InvalidKey("truncated string".into()));
+    }
+    let s = String::from_utf8_lossy(&r[..len]).to_string();
+    *r = &r[len..];
+    Ok(s)
+}
+
+fn read_simplified_string_bytes(r: &mut &[u8]) -> Result<Vec<u8>> {
+    let len = read_simplified_uint32(r)? as usize;
+    if r.len() < len {
+        return Err(SshError::InvalidKey("truncated string".into()));
+    }
+    let bytes = r[..len].to_vec();
+    *r = &r[len..];
+    Ok(bytes)
+}
+
+fn read_simplified_uint32(r: &mut &[u8]) -> Result<u32> {
+    if r.len() < 4 {
+        return Err(SshError::InvalidKey("truncated uint32".into()));
+    }
+    let val = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
+    *r = &r[4..];
+    Ok(val)
+}
+
+fn read_simplified_raw(r: &mut &[u8], len: usize) -> Result<Vec<u8>> {
+    if r.len() < len {
+        return Err(SshError::InvalidKey("truncated raw data".into()));
+    }
+    let bytes = r[..len].to_vec();
+    *r = &r[len..];
+    Ok(bytes)
+}
