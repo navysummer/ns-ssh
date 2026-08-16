@@ -18,6 +18,7 @@ pub enum KexState {
     KexDhReplyReceived,
     NewKeysSent,
     NewKeysReceived,
+    RekeyInProgress,
     Established,
 }
 
@@ -41,6 +42,10 @@ pub struct SshTransport {
     pub server_to_client_cipher: Option<Box<dyn SshCipher>>,
     pub client_to_server_mac: Option<Box<dyn SshMac>>,
     pub server_to_client_mac: Option<Box<dyn SshMac>>,
+    pub client_to_server_compression: String,
+    pub server_to_client_compression: String,
+    pub compression_active_c2s: bool,
+    pub compression_active_s2c: bool,
     pub client_version: Vec<u8>,
     pub server_version: Vec<u8>,
     pub client_kex_init: Vec<u8>,
@@ -48,6 +53,8 @@ pub struct SshTransport {
     pub outgoing_seq: u64,
     pub incoming_seq: u64,
     pub exchange: Option<KexExchange>,
+    pub last_rekey_bytes: u64,
+    pub last_rekey_instant: std::time::Instant,
 }
 
 impl SshTransport {
@@ -60,6 +67,10 @@ impl SshTransport {
             server_to_client_cipher: None,
             client_to_server_mac: None,
             server_to_client_mac: None,
+            client_to_server_compression: "none".to_string(),
+            server_to_client_compression: "none".to_string(),
+            compression_active_c2s: false,
+            compression_active_s2c: false,
             client_version: msg::SSH_VERSION.as_bytes().to_vec(),
             server_version: Vec::new(),
             client_kex_init: Vec::new(),
@@ -67,6 +78,8 @@ impl SshTransport {
             outgoing_seq: 0,
             incoming_seq: 0,
             exchange: None,
+            last_rekey_bytes: 0,
+            last_rekey_instant: std::time::Instant::now(),
         }
     }
 
@@ -79,48 +92,110 @@ impl SshTransport {
 
         payload.extend(encode_name_list(&[
             "curve25519-sha256",
+            "curve25519-sha256@libssh.org",
             "ecdh-sha2-nistp256",
+            "ecdh-sha2-nistp384",
+            "ecdh-sha2-nistp521",
+            "diffie-hellman-group16-sha512",
+            "diffie-hellman-group18-sha512",
             "diffie-hellman-group14-sha256",
+            "diffie-hellman-group14-sha1",
+            "diffie-hellman-group-exchange-sha256",
+            "diffie-hellman-group-exchange-sha1",
+            "ext-info-c",
+            "ext-info-s",
         ]));
 
         payload.extend(encode_name_list(&[
             "ssh-ed25519",
             "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "rsa-sha2-512",
             "rsa-sha2-256",
             "ssh-rsa",
         ]));
 
         payload.extend(encode_name_list(&[
             "chacha20-poly1305@openssh.com",
+            "aes256-gcm@openssh.com",
+            "aes128-gcm@openssh.com",
             "aes256-ctr",
             "aes192-ctr",
             "aes128-ctr",
-            "aes256-gcm@openssh.com",
-            "aes128-gcm@openssh.com",
+            "aes256-cbc",
+            "aes192-cbc",
+            "aes128-cbc",
+            "3des-cbc",
         ]));
 
         payload.extend(encode_name_list(&[
             "chacha20-poly1305@openssh.com",
+            "aes256-gcm@openssh.com",
+            "aes128-gcm@openssh.com",
             "aes256-ctr",
             "aes192-ctr",
             "aes128-ctr",
-            "aes256-gcm@openssh.com",
-            "aes128-gcm@openssh.com",
+            "aes256-cbc",
+            "aes192-cbc",
+            "aes128-cbc",
+            "3des-cbc",
         ]));
 
-        payload.extend(encode_name_list(&["hmac-sha2-256", "hmac-sha2-512"]));
-        payload.extend(encode_name_list(&["hmac-sha2-256", "hmac-sha2-512"]));
+        payload.extend(encode_name_list(&[
+            "hmac-sha2-256-etm@openssh.com",
+            "hmac-sha2-512-etm@openssh.com",
+            "hmac-sha1-etm@openssh.com",
+            "hmac-sha2-256",
+            "hmac-sha2-512",
+            "hmac-sha1",
+            "hmac-sha1-96",
+            "none",
+        ]));
+        payload.extend(encode_name_list(&[
+            "hmac-sha2-256-etm@openssh.com",
+            "hmac-sha2-512-etm@openssh.com",
+            "hmac-sha1-etm@openssh.com",
+            "hmac-sha2-256",
+            "hmac-sha2-512",
+            "hmac-sha1",
+            "hmac-sha1-96",
+            "none",
+        ]));
 
-        payload.extend(encode_name_list(&["none"]));
-        payload.extend(encode_name_list(&["none"]));
+        payload.extend(encode_name_list(&["none", "zlib@openssh.com"]));
+        payload.extend(encode_name_list(&["none", "zlib@openssh.com"]));
 
         payload.extend(encode_name_list(&[]));
         payload.extend(encode_name_list(&[]));
 
-        payload.extend_from_slice(&[0u8; 4]);
+        payload.extend_from_slice(&[0u8; 5]);
 
         self.client_kex_init = payload.clone();
         payload
+    }
+
+    pub fn prepare_rekey(&mut self) -> Vec<u8> {
+        let mut cookie = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
+        let mut payload = Vec::new();
+        payload.push(msg::SSH_MSG_KEXINIT);
+        payload.extend_from_slice(&cookie);
+        payload.extend(self.client_kex_init[17..].to_vec());
+        self.client_kex_init = payload.clone();
+        payload
+    }
+
+    pub const REKEY_BYTES: u64 = 1 << 30;
+    pub const REKEY_SECONDS: u64 = 3600;
+
+    pub fn needs_rekey(&self, total_bytes: u64, elapsed_secs: u64) -> bool {
+        total_bytes.saturating_sub(self.last_rekey_bytes) >= Self::REKEY_BYTES
+            || elapsed_secs >= Self::REKEY_SECONDS
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.outgoing_seq.saturating_add(self.incoming_seq).saturating_mul(1400)
     }
 
     pub fn negotiate_algorithms(
@@ -136,8 +211,8 @@ impl SshTransport {
         let client_ciphers_sc = SshNameList::decode(&mut cr)?;
         let client_macs_cs = SshNameList::decode(&mut cr)?;
         let client_macs_sc = SshNameList::decode(&mut cr)?;
-        let _client_comps_cs = SshNameList::decode(&mut cr)?;
-        let _client_comps_sc = SshNameList::decode(&mut cr)?;
+        let client_comps_cs = SshNameList::decode(&mut cr)?;
+        let client_comps_sc = SshNameList::decode(&mut cr)?;
 
         let mut sr = &server_kex[17..];
         sr = &sr[16..];
@@ -148,8 +223,8 @@ impl SshTransport {
         let server_ciphers_sc = SshNameList::decode(&mut sr)?;
         let server_macs_cs = SshNameList::decode(&mut sr)?;
         let server_macs_sc = SshNameList::decode(&mut sr)?;
-        let _server_comps_cs = SshNameList::decode(&mut sr)?;
-        let _server_comps_sc = SshNameList::decode(&mut sr)?;
+        let server_comps_cs = SshNameList::decode(&mut sr)?;
+        let server_comps_sc = SshNameList::decode(&mut sr)?;
 
         let kex = choose_algorithm(&client_kex_algos.0, &server_kex_algos.0)
             .ok_or_else(|| SshError::KexFailed("no common key exchange algorithm".into()))?;
@@ -163,6 +238,10 @@ impl SshTransport {
             .ok_or_else(|| SshError::KexFailed("no common client-to-server mac".into()))?;
         let mac_sc = choose_algorithm(&client_macs_sc.0, &server_macs_sc.0)
             .ok_or_else(|| SshError::KexFailed("no common server-to-client mac".into()))?;
+        let comp_cs = choose_algorithm(&client_comps_cs.0, &server_comps_cs.0)
+            .unwrap_or_else(|| "none".to_string());
+        let comp_sc = choose_algorithm(&client_comps_sc.0, &server_comps_sc.0)
+            .unwrap_or_else(|| "none".to_string());
 
         Ok(AlgorithmNegotiation {
             kex_algorithm: kex,
@@ -171,8 +250,8 @@ impl SshTransport {
             server_to_client_cipher: cipher_sc,
             client_to_server_mac: mac_cs,
             server_to_client_mac: mac_sc,
-            client_to_server_compression: "none".to_string(),
-            server_to_client_compression: "none".to_string(),
+            client_to_server_compression: comp_cs,
+            server_to_client_compression: comp_sc,
         })
     }
 
@@ -181,11 +260,35 @@ impl SshTransport {
             "curve25519-sha256" | "curve25519-sha256@libssh.org" => {
                 Ok(Box::new(Curve25519Kex::new()))
             }
-            "diffie-hellman-group14-sha256" => {
-                Ok(Box::new(DhGroup14Kex::new()))
-            }
             "ecdh-sha2-nistp256" => {
                 Ok(Box::new(EcdhP256Kex::new()))
+            }
+            "ecdh-sha2-nistp384" => {
+                Ok(Box::new(EcdhP384Kex::new()))
+            }
+            "ecdh-sha2-nistp521" => {
+                Ok(Box::new(EcdhP521Kex::new()))
+            }
+            "diffie-hellman-group14-sha256" => {
+                Ok(Box::new(ModpKex::group14_sha256()))
+            }
+            "diffie-hellman-group14-sha1" => {
+                Ok(Box::new(ModpKex::group14_sha1()))
+            }
+            "diffie-hellman-group16-sha512" => {
+                Ok(Box::new(ModpKex::group16_sha512()))
+            }
+            "diffie-hellman-group18-sha512" => {
+                Ok(Box::new(ModpKex::group18_sha512()))
+            }
+            "diffie-hellman-group-exchange-sha256" => {
+                Ok(Box::new(ModpKex::gex_sha256()))
+            }
+            "diffie-hellman-group-exchange-sha1" => {
+                Ok(Box::new(ModpKex::gex_sha1()))
+            }
+            "ext-info-c" | "ext-info-s" => {
+                Err(SshError::UnsupportedAlgorithm("ext-info is a pseudo-kex, not negotiable alone".into()))
             }
             _ => Err(SshError::UnsupportedAlgorithm(format!("kex: {}", name))),
         }
@@ -194,25 +297,29 @@ impl SshTransport {
     pub fn install_new_keys(
         &mut self,
         negotiation: &AlgorithmNegotiation,
+        hash_name: &str,
         shared_secret: &[u8],
         exchange_hash: &[u8],
         session_id: &[u8],
     ) -> Result<()> {
+        self.client_to_server_compression = negotiation.client_to_server_compression.clone();
+        self.server_to_client_compression = negotiation.server_to_client_compression.clone();
+
         let key_len = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?.key_len();
         let iv_len = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?.iv_len();
         let mac_len = crate::mac::create_mac(&negotiation.client_to_server_mac)?.key_len();
 
-        let c2s_iv = derive_initial_iv(shared_secret, exchange_hash, session_id, iv_len);
-        let c2s_key = derive_encryption_key(shared_secret, exchange_hash, session_id, key_len);
-        let c2s_mac_key = derive_integrity_key(shared_secret, exchange_hash, session_id, mac_len);
+        let c2s_iv = derive_initial_iv(hash_name, shared_secret, exchange_hash, session_id, iv_len);
+        let c2s_key = derive_encryption_key(hash_name, shared_secret, exchange_hash, session_id, key_len);
+        let c2s_mac_key = derive_integrity_key(hash_name, shared_secret, exchange_hash, session_id, mac_len);
 
         let s2c_key_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.key_len();
         let s2c_iv_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.iv_len();
         let s2c_mac_len = crate::mac::create_mac(&negotiation.server_to_client_mac)?.key_len();
 
-        let s2c_iv = derive_initial_iv(shared_secret, exchange_hash, session_id, s2c_iv_len);
-        let s2c_key = derive_encryption_key(shared_secret, exchange_hash, session_id, s2c_key_len);
-        let s2c_mac_key = derive_integrity_key(shared_secret, exchange_hash, session_id, s2c_mac_len);
+        let s2c_iv = derive_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len);
+        let s2c_key = derive_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len);
+        let s2c_mac_key = derive_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len);
 
         let mut c2s_cipher = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?;
         c2s_cipher.set_key(&c2s_key)?;
@@ -271,18 +378,17 @@ pub async fn read_version_string(stream: &mut (impl AsyncRead + Unpin)) -> Resul
 }
 
 pub async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> Result<()> {
-    let padding_len = if payload.len() <= 4 {
-        8 - (payload.len() % 8)
-    } else {
-        8 - ((payload.len() + 4) % 8)
-    };
-    let padding_len = if padding_len < 4 { padding_len + 8 } else { padding_len };
+    let base = 1 + payload.len();
+    let remainder = base % 8;
+    let mut padding_len = if remainder == 0 { 0 } else { 8 - remainder };
+    if padding_len < 4 { padding_len += 8; }
     let mut padding = [0u8; 64];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
-    let total_len = 1 + payload.len() + padding_len;
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
+    let body_len = base + padding_len;
+    let packet_len_field = (4 + body_len) as u32;
 
     let mut packet = Vec::new();
-    packet.extend(&(total_len as u32).to_be_bytes());
+    packet.extend(&packet_len_field.to_be_bytes());
     packet.push(padding_len as u8);
     packet.extend(payload);
     packet.extend(&padding[..padding_len]);
@@ -300,12 +406,13 @@ pub async fn receive_raw_packet(stream: &mut (impl AsyncRead + Unpin)) -> Result
     if total_len > MAX_PACKET_SIZE || total_len < 12 {
         return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
     }
+    let body_len = total_len - 4;
 
-    let mut rest = vec![0u8; total_len];
+    let mut rest = vec![0u8; body_len];
     stream.read_exact(&mut rest).await?;
 
     let padding_len = rest[0] as usize;
-    let payload_len = total_len - 1 - padding_len;
+    let payload_len = body_len - 1 - padding_len;
 
     if payload_len == 0 {
         return Err(SshError::InvalidPacket("empty payload".into()));
@@ -326,6 +433,16 @@ pub async fn send_encrypted_packet(
         return send_raw_packet(stream, payload).await;
     }
 
+    let payload: Vec<u8> = if !is_newkeys
+        && (transport.client_to_server_compression == "zlib"
+            || (transport.client_to_server_compression == "zlib@openssh.com"
+                && transport.compression_active_c2s))
+    {
+        zlib_compress(payload)?
+    } else {
+        payload.to_vec()
+    };
+
     let cipher = transport.client_to_server_cipher.as_mut().unwrap();
     let mac = transport.client_to_server_mac.as_ref().unwrap();
     let block_size = cipher.block_size().max(8);
@@ -333,17 +450,19 @@ pub async fn send_encrypted_packet(
 
     if is_aead {
         let tag_len = cipher.tag_len();
-        let overhead = 5 + tag_len;
-        let mut padding_len = block_size - ((payload.len() + overhead) % block_size);
+        let base = 1 + payload.len();
+        let remainder = base % block_size;
+        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
         if padding_len < 4 { padding_len += block_size; }
         let mut padding = [0u8; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
-        let total_len = 1 + payload.len() + padding_len;
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
+        let body_len = base + padding_len;
+        let packet_len_field = (4 + body_len) as u32;
 
         let mut packet = Vec::new();
-        packet.extend(&(total_len as u32).to_be_bytes());
+        packet.extend(&packet_len_field.to_be_bytes());
         packet.push(padding_len as u8);
-        packet.extend(payload);
+        packet.extend(&payload);
         packet.extend(&padding[..padding_len]);
 
         let ciphertext = cipher.encrypt(seq, &packet[4..])?;
@@ -352,23 +471,33 @@ pub async fn send_encrypted_packet(
 
         stream.write_all(&packet).await?;
     } else {
-        let overhead = 5;
-        let mut padding_len = block_size - ((payload.len() + overhead) % block_size);
+        let base = 1 + payload.len();
+        let remainder = base % block_size;
+        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
         if padding_len < 4 { padding_len += block_size; }
         let mut padding = [0u8; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
-        let total_len = 1 + payload.len() + padding_len;
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
+        let body_len = base + padding_len;
+        let packet_len_field = (4 + body_len) as u32;
+        let len_bytes = packet_len_field.to_be_bytes();
 
         let mut packet_data = Vec::new();
         packet_data.push(padding_len as u8);
-        packet_data.extend(payload);
+        packet_data.extend(&payload);
         packet_data.extend(&padding[..padding_len]);
 
         let ciphertext = cipher.encrypt(seq, &packet_data)?;
-        let mac_tag = mac.as_ref().compute_tag(seq, &packet_data)?;
+        let mac_tag = if mac.as_ref().is_etm() {
+            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
+            etm_input.extend_from_slice(&len_bytes);
+            etm_input.extend_from_slice(&ciphertext);
+            mac.as_ref().compute_tag(seq, &etm_input)?
+        } else {
+            mac.as_ref().compute_tag(seq, &packet_data)?
+        };
 
         let mut packet = Vec::new();
-        packet.extend(&(total_len as u32).to_be_bytes());
+        packet.extend_from_slice(&len_bytes);
         packet.extend(&ciphertext);
         packet.extend(&mac_tag);
 
@@ -396,7 +525,7 @@ pub async fn receive_encrypted_packet(
     let mac = transport.server_to_client_mac.as_ref().unwrap();
     let seq = transport.incoming_seq;
 
-    if is_aead {
+    let payload = if is_aead {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let total_len = u32::from_be_bytes(len_buf) as usize;
@@ -405,19 +534,20 @@ pub async fn receive_encrypted_packet(
         if total_len > MAX_PACKET_SIZE || total_len < 12 {
             return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
         }
+        let body_len = total_len - 4;
 
-        let mut ciphertext = vec![0u8; total_len + tag_len];
+        let mut ciphertext = vec![0u8; body_len + tag_len];
         stream.read_exact(&mut ciphertext).await?;
 
         let plaintext = cipher.decrypt(seq, &ciphertext)
             .map_err(|_| SshError::DecryptionFailed)?;
 
         let padding_len = plaintext[0] as usize;
-        let payload_len = total_len - 1 - padding_len;
+        let payload_len = body_len - 1 - padding_len;
         let payload = plaintext[1..1 + payload_len].to_vec();
 
         if !is_newkeys { transport.incoming_seq += 1; }
-        Ok(payload)
+        payload
     } else {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
@@ -425,28 +555,53 @@ pub async fn receive_encrypted_packet(
         let block_size = cipher.block_size().max(8);
         let mac_len = mac.tag_len();
 
-        if total_len > MAX_PACKET_SIZE || total_len < block_size || total_len % block_size != 0 {
+        if total_len > MAX_PACKET_SIZE || total_len < 12 || (total_len - 4) % block_size != 0 {
             return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
         }
+        let body_len = total_len - 4;
 
-        let mut ciphertext = vec![0u8; total_len];
+        let mut ciphertext = vec![0u8; body_len];
         stream.read_exact(&mut ciphertext).await?;
         let mut mac_buf = vec![0u8; mac_len];
         stream.read_exact(&mut mac_buf).await?;
 
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
-        if !mac_ok {
+        let mac_ok = if mac.as_ref().is_etm() {
+            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
+            etm_input.extend_from_slice(&len_buf);
+            etm_input.extend_from_slice(&ciphertext);
+            mac.as_ref().verify_tag(seq, &etm_input, &mac_buf)?
+        } else {
+            true
+        };
+        if mac.as_ref().is_etm() && !mac_ok {
             return Err(SshError::DecryptionFailed);
         }
 
+        let plaintext = cipher.decrypt(seq, &ciphertext)
+            .map_err(|_| SshError::DecryptionFailed)?;
+
+        if !mac.as_ref().is_etm() {
+            let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
+            if !mac_ok {
+                return Err(SshError::DecryptionFailed);
+            }
+        }
+
         let padding_len = plaintext[0] as usize;
-        let payload_len = total_len - 1 - padding_len;
+        let payload_len = body_len - 1 - padding_len;
         let payload = plaintext[1..1 + payload_len].to_vec();
 
         if !is_newkeys { transport.incoming_seq += 1; }
+        payload
+    };
+
+    if !is_newkeys
+        && (transport.server_to_client_compression == "zlib"
+            || (transport.server_to_client_compression == "zlib@openssh.com"
+                && transport.compression_active_s2c))
+    {
+        Ok(zlib_decompress(&payload)?)
+    } else {
         Ok(payload)
     }
 }
@@ -462,6 +617,16 @@ pub async fn send_encrypted_packet_server(
         return send_raw_packet(stream, payload).await;
     }
 
+    let payload: Vec<u8> = if !is_newkeys
+        && (transport.server_to_client_compression == "zlib"
+            || (transport.server_to_client_compression == "zlib@openssh.com"
+                && transport.compression_active_s2c))
+    {
+        zlib_compress(payload)?
+    } else {
+        payload.to_vec()
+    };
+
     let cipher = transport.server_to_client_cipher.as_mut().unwrap();
     let mac = transport.server_to_client_mac.as_ref().unwrap();
     let block_size = cipher.block_size().max(8);
@@ -469,17 +634,19 @@ pub async fn send_encrypted_packet_server(
 
     if is_aead {
         let tag_len = cipher.tag_len();
-        let overhead = 5 + tag_len;
-        let mut padding_len = block_size - ((payload.len() + overhead) % block_size);
+        let base = 1 + payload.len();
+        let remainder = base % block_size;
+        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
         if padding_len < 4 { padding_len += block_size; }
         let mut padding = [0u8; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
-        let total_len = 1 + payload.len() + padding_len;
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
+        let body_len = base + padding_len;
+        let packet_len_field = (4 + body_len) as u32;
 
         let mut packet = Vec::new();
-        packet.extend(&(total_len as u32).to_be_bytes());
+        packet.extend(&packet_len_field.to_be_bytes());
         packet.push(padding_len as u8);
-        packet.extend(payload);
+        packet.extend(&payload);
         packet.extend(&padding[..padding_len]);
 
         let ciphertext = cipher.encrypt(seq, &packet[4..])?;
@@ -488,23 +655,33 @@ pub async fn send_encrypted_packet_server(
 
         stream.write_all(&packet).await?;
     } else {
-        let overhead = 5;
-        let mut padding_len = block_size - ((payload.len() + overhead) % block_size);
+        let base = 1 + payload.len();
+        let remainder = base % block_size;
+        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
         if padding_len < 4 { padding_len += block_size; }
         let mut padding = [0u8; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
-        let total_len = 1 + payload.len() + padding_len;
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
+        let body_len = base + padding_len;
+        let packet_len_field = (4 + body_len) as u32;
+        let len_bytes = packet_len_field.to_be_bytes();
 
         let mut packet_data = Vec::new();
         packet_data.push(padding_len as u8);
-        packet_data.extend(payload);
+        packet_data.extend(&payload);
         packet_data.extend(&padding[..padding_len]);
 
         let ciphertext = cipher.encrypt(seq, &packet_data)?;
-        let mac_tag = mac.as_ref().compute_tag(seq, &packet_data)?;
+        let mac_tag = if mac.as_ref().is_etm() {
+            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
+            etm_input.extend_from_slice(&len_bytes);
+            etm_input.extend_from_slice(&ciphertext);
+            mac.as_ref().compute_tag(seq, &etm_input)?
+        } else {
+            mac.as_ref().compute_tag(seq, &packet_data)?
+        };
 
         let mut packet = Vec::new();
-        packet.extend(&(total_len as u32).to_be_bytes());
+        packet.extend_from_slice(&len_bytes);
         packet.extend(&ciphertext);
         packet.extend(&mac_tag);
 
@@ -532,7 +709,7 @@ pub async fn receive_encrypted_packet_server(
     let mac = transport.client_to_server_mac.as_ref().unwrap();
     let seq = transport.incoming_seq;
 
-    if is_aead {
+    let payload = if is_aead {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let total_len = u32::from_be_bytes(len_buf) as usize;
@@ -541,19 +718,20 @@ pub async fn receive_encrypted_packet_server(
         if total_len > MAX_PACKET_SIZE || total_len < 12 {
             return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
         }
+        let body_len = total_len - 4;
 
-        let mut ciphertext = vec![0u8; total_len + tag_len];
+        let mut ciphertext = vec![0u8; body_len + tag_len];
         stream.read_exact(&mut ciphertext).await?;
 
         let plaintext = cipher.decrypt(seq, &ciphertext)
             .map_err(|_| SshError::DecryptionFailed)?;
 
         let padding_len = plaintext[0] as usize;
-        let payload_len = total_len - 1 - padding_len;
+        let payload_len = body_len - 1 - padding_len;
         let payload = plaintext[1..1 + payload_len].to_vec();
 
         if !is_newkeys { transport.incoming_seq += 1; }
-        Ok(payload)
+        payload
     } else {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
@@ -561,50 +739,71 @@ pub async fn receive_encrypted_packet_server(
         let block_size = cipher.block_size().max(8);
         let mac_len = mac.tag_len();
 
-        if total_len > MAX_PACKET_SIZE || total_len < block_size || total_len % block_size != 0 {
+        if total_len > MAX_PACKET_SIZE || total_len < 12 || (total_len - 4) % block_size != 0 {
             return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
         }
+        let body_len = total_len - 4;
 
-        let mut ciphertext = vec![0u8; total_len];
+        let mut ciphertext = vec![0u8; body_len];
         stream.read_exact(&mut ciphertext).await?;
         let mut mac_buf = vec![0u8; mac_len];
         stream.read_exact(&mut mac_buf).await?;
 
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
-        if !mac_ok {
+        let mac_ok = if mac.as_ref().is_etm() {
+            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
+            etm_input.extend_from_slice(&len_buf);
+            etm_input.extend_from_slice(&ciphertext);
+            mac.as_ref().verify_tag(seq, &etm_input, &mac_buf)?
+        } else {
+            true
+        };
+        if mac.as_ref().is_etm() && !mac_ok {
             return Err(SshError::DecryptionFailed);
         }
 
+        let plaintext = cipher.decrypt(seq, &ciphertext)
+            .map_err(|_| SshError::DecryptionFailed)?;
+
+        if !mac.as_ref().is_etm() {
+            let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
+            if !mac_ok {
+                return Err(SshError::DecryptionFailed);
+            }
+        }
+
         let padding_len = plaintext[0] as usize;
-        let payload_len = total_len - 1 - padding_len;
+        let payload_len = body_len - 1 - padding_len;
         let payload = plaintext[1..1 + payload_len].to_vec();
 
         if !is_newkeys { transport.incoming_seq += 1; }
+        payload
+    };
+
+    if !is_newkeys
+        && (transport.client_to_server_compression == "zlib"
+            || (transport.client_to_server_compression == "zlib@openssh.com"
+                && transport.compression_active_c2s))
+    {
+        Ok(zlib_decompress(&payload)?)
+    } else {
         Ok(payload)
     }
 }
 
-pub const REKEY_DATA_THRESHOLD: u64 = 1024 * 1024 * 1024;
-pub const REKEY_TIME_THRESHOLD_SECS: u64 = 3600;
-
-pub fn needs_rekey(transport: &SshTransport, bytes_transferred: u64, elapsed_secs: u64) -> bool {
-    if transport.state != KexState::Established {
-        return false;
-    }
-    bytes_transferred >= REKEY_DATA_THRESHOLD || elapsed_secs >= REKEY_TIME_THRESHOLD_SECS
+fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).map_err(|e| SshError::Compression(e.to_string()))?;
+    encoder.finish().map_err(|e| SshError::Compression(e.to_string()))
 }
 
-impl SshTransport {
-    pub fn total_bytes(&self) -> u64 {
-        (self.outgoing_seq + self.incoming_seq) * 32768
-    }
-
-    pub fn prepare_rekey(&mut self) -> Vec<u8> {
-        let kex_init = self.build_kex_init();
-        self.state = KexState::KexInitSent;
-        kex_init
-    }
+fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    let mut decoder = ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(|e| SshError::Compression(e.to_string()))?;
+    Ok(out)
 }

@@ -155,3 +155,14 @@ pub fn parse_userauth_info_request(payload: &[u8]) -> Result<Vec<(String, String
 
     Ok(prompts)
 }
+
+pub fn build_userauth_info_response(answers: &[String]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(msg::SSH_MSG_USERAUTH_INFO_RESPONSE);
+    (answers.len() as u32).encode(&mut payload).unwrap();
+    for a in answers {
+        SshString::new(a.as_str()).encode(&mut payload).unwrap();
+    }
+    payload
+}
+

@@ -33,7 +33,7 @@ struct SshdArgs {
     #[arg(short = 'g')]
     gateway_ports: bool,
 
-    #[arg(short = 'h', long)]
+    #[arg(long)]
     host_key_file: Option<String>,
 
     #[arg(short = 'o', long, action = clap::ArgAction::Append)]
@@ -84,14 +84,86 @@ fn main() {
                 "listenaddress" | "listen_address" => {
                     config.listen_address = value.to_string();
                 }
+                "hostkey" | "host_key" => {
+                    config.host_key_files.push(value.to_string());
+                }
                 "passwordauthentication" | "password_auth" => {
                     config.password_auth = value == "yes";
+                }
+                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth" => {
+                    config.kbd_interactive_auth = value == "yes";
                 }
                 "pubkeyauthentication" | "pubkey_auth" => {
                     config.pubkey_auth = value == "yes";
                 }
                 "permitrootlogin" | "permit_root_login" => {
                     config.permit_root_login = value == "yes";
+                }
+                "authorizedkeysfile" | "authorized_keys_file" => {
+                    config.authorized_keys_files.push(value.to_string());
+                }
+                "allowgroups" | "allow_groups" => {
+                    config.allow_groups.extend(value.split_whitespace().map(|s| s.to_string()));
+                }
+                "denygroups" | "deny_groups" => {
+                    config.deny_groups.extend(value.split_whitespace().map(|s| s.to_string()));
+                }
+                "maxauthtries" | "max_auth_tries" => {
+                    if let Ok(v) = value.parse() {
+                        config.max_auth_tries = v;
+                    }
+                }
+                "maxsessions" | "max_sessions" => {
+                    if let Ok(v) = value.parse() {
+                        config.max_sessions = v;
+                    }
+                }
+                "clientaliveinterval" | "client_alive_interval" => {
+                    if let Ok(v) = value.parse() {
+                        config.client_alive_interval = v;
+                    }
+                }
+                "clientalivecountmax" | "client_alive_count_max" => {
+                    if let Ok(v) = value.parse() {
+                        config.client_alive_count_max = v;
+                    }
+                }
+                "usedns" | "use_dns" => {
+                    config.use_dns = value == "yes";
+                }
+                "pidfile" | "pid_file" => {
+                    config.pid_file = value.to_string();
+                }
+                "logfile" | "log_file" => {
+                    config.log_file = Some(value.to_string());
+                }
+                "banner" => {
+                    config.banner = Some(value.to_string());
+                }
+                "maxstartups" | "max_startups" => {
+                    config.max_startups = value.to_string();
+                }
+                "logingracetime" | "login_grace_time" => {
+                    if let Ok(v) = value.parse() {
+                        config.login_grace_time = v;
+                    }
+                }
+                "allowagentforwarding" | "allow_agent_forwarding" => {
+                    config.allow_agent_forwarding = value == "yes";
+                }
+                "x11forwarding" | "x11_forwarding" => {
+                    config.x11_forwarding = value == "yes";
+                }
+                "x11displayoffset" | "x11_display_offset" => {
+                    if let Ok(v) = value.parse() {
+                        config.x11_display_offset = v;
+                    }
+                }
+                "forcecommand" | "force_command" => {
+                    config.force_command = Some(value.to_string());
+                }
+                "acceptenv" | "accept_env" => {
+                    config.accept_env.push(value.to_string());
                 }
                 _ => {}
             }

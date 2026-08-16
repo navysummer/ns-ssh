@@ -61,6 +61,9 @@ pub enum SshError {
 
     #[error("Buffer overflow")]
     BufferOverflow,
+
+    #[error("Compression error: {0}")]
+    Compression(String),
 }
 
 pub type Result<T> = std::result::Result<T, SshError>;

@@ -103,18 +103,38 @@ impl ServerAuth {
     pub fn create_signer_for_key(&self, key_type: &str, public_key: &[u8]) -> Option<Box<dyn ssh_core::hostkey::HostKeySigner>> {
         match key_type {
             "ssh-ed25519" => {
-                let key_slice = public_key.get(32..64).unwrap_or(public_key);
-                ssh_core::hostkey::Ed25519HostKey::from_public_bytes(
-                    &key_slice.try_into().ok()?
-                ).ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
+                let mut r = public_key;
+                let kt = SshString::decode(&mut r).ok()?;
+                if kt.as_str().ok()? != "ssh-ed25519" { return None; }
+                let pk = SshBytes::decode(&mut r).ok()?;
+                if pk.0.len() != 32 { return None; }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&pk.0);
+                ssh_core::hostkey::Ed25519HostKey::from_public_bytes(&arr)
+                    .ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
             "ecdsa-sha2-nistp256" => {
-                ssh_core::hostkey::EcdsaP256HostKey::from_public_bytes(public_key)
+                let mut r = public_key;
+                let kt = SshString::decode(&mut r).ok()?;
+                if kt.as_str().ok()? != "ecdsa-sha2-nistp256" { return None; }
+                let curve = SshString::decode(&mut r).ok()?;
+                if curve.as_str().ok()? != "nistp256" { return None; }
+                let pk = SshBytes::decode(&mut r).ok()?;
+                ssh_core::hostkey::EcdsaP256HostKey::from_public_bytes(&pk.0)
                     .ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
             "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
-                ssh_core::hostkey::RsaHostKey::from_public_bytes(public_key)
-                    .ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
+                let mut r = public_key;
+                let kt = SshString::decode(&mut r).ok()?;
+                let kt_str = kt.as_str().ok()?;
+                if kt_str != "ssh-rsa" { return None; }
+                let e_bytes = SshBytes::decode(&mut r).ok()?;
+                let n_bytes = SshBytes::decode(&mut r).ok()?;
+                let n = rsa::BigUint::from_bytes_be(&n_bytes.0);
+                let e = rsa::BigUint::from_bytes_be(&e_bytes.0);
+                let public_key = rsa::RsaPublicKey::new(n, e).ok()?;
+                Some(Box::new(ssh_core::hostkey::RsaHostKey::new(None, public_key, 2048))
+                    as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
             _ => None,
         }

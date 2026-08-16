@@ -1,10 +1,14 @@
 use crate::error::{Result, SshError};
-use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
+use chacha20poly1305::{ChaCha20Poly1305, AeadInPlace};
 use chacha20poly1305::aead::Aead;
 use aes::Aes128;
 use aes::Aes192;
 use aes::Aes256;
-use aes::cipher::{StreamCipher, KeyIvInit};
+use cipher::{
+    StreamCipher, KeyIvInit,
+    BlockEncrypt, BlockDecrypt, KeyInit,
+    generic_array::GenericArray,
+};
 
 pub const CHACHA20_POLY1305_KEY_LEN: usize = 32;
 pub const CHACHA20_POLY1305_IV_LEN: usize = 12;
@@ -419,12 +423,277 @@ impl SshCipher for Aes256GcmCipher {
     }
 }
 
+pub const AES128_CBC_KEY_LEN: usize = 16;
+pub const AES192_CBC_KEY_LEN: usize = 24;
+pub const AES256_CBC_KEY_LEN: usize = 32;
+pub const AES_CBC_IV_LEN: usize = 16;
+
+pub const TDES_CBC_KEY_LEN: usize = 24;
+pub const TDES_CBC_IV_LEN: usize = 8;
+
+pub struct Aes128CbcCipher {
+    key: [u8; 16],
+    iv: [u8; 16],
+    initialized: bool,
+}
+
+impl Aes128CbcCipher {
+    pub fn new() -> Self { Aes128CbcCipher { key: [0u8; 16], iv: [0u8; 16], initialized: false } }
+    pub fn kex_name() -> &'static str { "aes128-cbc" }
+}
+
+impl SshCipher for Aes128CbcCipher {
+    fn name(&self) -> &str { Self::kex_name() }
+    fn key_len(&self) -> usize { AES128_CBC_KEY_LEN }
+    fn iv_len(&self) -> usize { AES_CBC_IV_LEN }
+    fn block_size(&self) -> usize { 16 }
+    fn tag_len(&self) -> usize { 0 }
+    fn is_aead(&self) -> bool { false }
+
+    fn set_key(&mut self, key: &[u8]) -> Result<()> {
+        if key.len() != AES128_CBC_KEY_LEN { return Err(SshError::InvalidKey("wrong key length for aes128-cbc".into())); }
+        self.key.copy_from_slice(key);
+        self.initialized = true;
+        Ok(())
+    }
+    fn set_iv(&mut self, iv: &[u8]) -> Result<()> {
+        if iv.len() != AES_CBC_IV_LEN { return Err(SshError::InvalidKey("wrong IV length for aes128-cbc".into())); }
+        self.iv.copy_from_slice(iv);
+        Ok(())
+    }
+    fn encrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC encrypt data must be block-aligned".into())); }
+        let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut iv = self.iv;
+        for chunk in out.chunks_mut(16) {
+            for i in 0..16 { chunk[i] ^= iv[i]; }
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.encrypt_block(block);
+            iv.copy_from_slice(block.as_slice());
+        }
+        self.iv = iv;
+        Ok(out)
+    }
+    fn decrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC decrypt data must be block-aligned".into())); }
+        let cipher = <Aes128 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut prev = self.iv;
+        let mut next_iv = [0u8; 16];
+        for chunk in out.chunks_mut(16) {
+            next_iv.copy_from_slice(chunk);
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.decrypt_block(block);
+            for i in 0..16 { chunk[i] ^= prev[i]; }
+            prev = next_iv;
+        }
+        self.iv = prev;
+        Ok(out)
+    }
+}
+
+pub struct Aes192CbcCipher {
+    key: [u8; 24],
+    iv: [u8; 16],
+    initialized: bool,
+}
+
+impl Aes192CbcCipher {
+    pub fn new() -> Self { Aes192CbcCipher { key: [0u8; 24], iv: [0u8; 16], initialized: false } }
+    pub fn kex_name() -> &'static str { "aes192-cbc" }
+}
+
+impl SshCipher for Aes192CbcCipher {
+    fn name(&self) -> &str { Self::kex_name() }
+    fn key_len(&self) -> usize { AES192_CBC_KEY_LEN }
+    fn iv_len(&self) -> usize { AES_CBC_IV_LEN }
+    fn block_size(&self) -> usize { 16 }
+    fn tag_len(&self) -> usize { 0 }
+    fn is_aead(&self) -> bool { false }
+
+    fn set_key(&mut self, key: &[u8]) -> Result<()> {
+        if key.len() != AES192_CBC_KEY_LEN { return Err(SshError::InvalidKey("wrong key length".into())); }
+        self.key.copy_from_slice(key);
+        self.initialized = true;
+        Ok(())
+    }
+    fn set_iv(&mut self, iv: &[u8]) -> Result<()> {
+        if iv.len() != AES_CBC_IV_LEN { return Err(SshError::InvalidKey("wrong IV length".into())); }
+        self.iv.copy_from_slice(iv);
+        Ok(())
+    }
+    fn encrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC encrypt data must be block-aligned".into())); }
+        let cipher = <Aes192 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut iv = self.iv;
+        for chunk in out.chunks_mut(16) {
+            for i in 0..16 { chunk[i] ^= iv[i]; }
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.encrypt_block(block);
+            iv.copy_from_slice(block.as_slice());
+        }
+        self.iv = iv;
+        Ok(out)
+    }
+    fn decrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC decrypt data must be block-aligned".into())); }
+        let cipher = <Aes192 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut prev = self.iv;
+        let mut next_iv = [0u8; 16];
+        for chunk in out.chunks_mut(16) {
+            next_iv.copy_from_slice(chunk);
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.decrypt_block(block);
+            for i in 0..16 { chunk[i] ^= prev[i]; }
+            prev = next_iv;
+        }
+        self.iv = prev;
+        Ok(out)
+    }
+}
+
+pub struct Aes256CbcCipher {
+    key: [u8; 32],
+    iv: [u8; 16],
+    initialized: bool,
+}
+
+impl Aes256CbcCipher {
+    pub fn new() -> Self { Aes256CbcCipher { key: [0u8; 32], iv: [0u8; 16], initialized: false } }
+    pub fn kex_name() -> &'static str { "aes256-cbc" }
+}
+
+impl SshCipher for Aes256CbcCipher {
+    fn name(&self) -> &str { Self::kex_name() }
+    fn key_len(&self) -> usize { AES256_CBC_KEY_LEN }
+    fn iv_len(&self) -> usize { AES_CBC_IV_LEN }
+    fn block_size(&self) -> usize { 16 }
+    fn tag_len(&self) -> usize { 0 }
+    fn is_aead(&self) -> bool { false }
+
+    fn set_key(&mut self, key: &[u8]) -> Result<()> {
+        if key.len() != AES256_CBC_KEY_LEN { return Err(SshError::InvalidKey("wrong key length".into())); }
+        self.key.copy_from_slice(key);
+        self.initialized = true;
+        Ok(())
+    }
+    fn set_iv(&mut self, iv: &[u8]) -> Result<()> {
+        if iv.len() != AES_CBC_IV_LEN { return Err(SshError::InvalidKey("wrong IV length".into())); }
+        self.iv.copy_from_slice(iv);
+        Ok(())
+    }
+    fn encrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC encrypt data must be block-aligned".into())); }
+        let cipher = <Aes256 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut iv = self.iv;
+        for chunk in out.chunks_mut(16) {
+            for i in 0..16 { chunk[i] ^= iv[i]; }
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.encrypt_block(block);
+            iv.copy_from_slice(block.as_slice());
+        }
+        self.iv = iv;
+        Ok(out)
+    }
+    fn decrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 16 != 0 { return Err(SshError::Protocol("CBC decrypt data must be block-aligned".into())); }
+        let cipher = <Aes256 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut prev = self.iv;
+        let mut next_iv = [0u8; 16];
+        for chunk in out.chunks_mut(16) {
+            next_iv.copy_from_slice(chunk);
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.decrypt_block(block);
+            for i in 0..16 { chunk[i] ^= prev[i]; }
+            prev = next_iv;
+        }
+        self.iv = prev;
+        Ok(out)
+    }
+}
+
+pub struct TDesCbcCipher { key: [u8; 24], iv: [u8; 8], initialized: bool }
+impl TDesCbcCipher {
+    pub fn new() -> Self { TDesCbcCipher { key: [0u8; 24], iv: [0u8; 8], initialized: false } }
+    pub fn kex_name() -> &'static str { "3des-cbc" }
+}
+
+impl SshCipher for TDesCbcCipher {
+    fn name(&self) -> &str { Self::kex_name() }
+    fn key_len(&self) -> usize { 24 }
+    fn iv_len(&self) -> usize { 8 }
+    fn block_size(&self) -> usize { 8 }
+    fn tag_len(&self) -> usize { 0 }
+    fn is_aead(&self) -> bool { false }
+
+    fn set_key(&mut self, key: &[u8]) -> Result<()> {
+        if key.len() != 24 { return Err(SshError::InvalidKey("wrong key length for 3des-cbc".into())); }
+        self.key.copy_from_slice(key);
+        self.initialized = true;
+        Ok(())
+    }
+    fn set_iv(&mut self, iv: &[u8]) -> Result<()> {
+        if iv.len() != 8 { return Err(SshError::InvalidKey("wrong IV length for 3des-cbc".into())); }
+        self.iv.copy_from_slice(iv);
+        Ok(())
+    }
+    fn encrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 8 != 0 { return Err(SshError::Protocol("3DES CBC encrypt data must be block-aligned".into())); }
+        use cipher::{BlockEncrypt, KeyInit};
+        let cipher = <des::TdesEde3 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut iv = self.iv;
+        for chunk in out.chunks_mut(8) {
+            for i in 0..8 { chunk[i] ^= iv[i]; }
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.encrypt_block(block);
+            iv.copy_from_slice(block.as_slice());
+        }
+        self.iv = iv;
+        Ok(out)
+    }
+    fn decrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if !self.initialized { return Err(SshError::Protocol("cipher not initialized".into())); }
+        if data.len() % 8 != 0 { return Err(SshError::Protocol("3DES CBC decrypt data must be block-aligned".into())); }
+        use cipher::{BlockDecrypt, KeyInit};
+        let cipher = <des::TdesEde3 as KeyInit>::new(GenericArray::from_slice(&self.key));
+        let mut out = data.to_vec();
+        let mut prev = self.iv;
+        let mut next_iv = [0u8; 8];
+        for chunk in out.chunks_mut(8) {
+            next_iv.copy_from_slice(chunk);
+            let block = GenericArray::from_mut_slice(chunk);
+            cipher.decrypt_block(block);
+            for i in 0..8 { chunk[i] ^= prev[i]; }
+            prev = next_iv;
+        }
+        self.iv = prev;
+        Ok(out)
+    }
+}
+
 pub fn create_cipher(name: &str) -> Result<Box<dyn SshCipher>> {
     match name {
         "chacha20-poly1305@openssh.com" => Ok(Box::new(ChaCha20Poly1305Cipher::new())),
         "aes128-ctr" => Ok(Box::new(Aes128CtrCipher::new())),
         "aes192-ctr" => Ok(Box::new(Aes192CtrCipher::new())),
         "aes256-ctr" => Ok(Box::new(Aes256CtrCipher::new())),
+        "aes128-cbc" => Ok(Box::new(Aes128CbcCipher::new())),
+        "aes192-cbc" => Ok(Box::new(Aes192CbcCipher::new())),
+        "aes256-cbc" => Ok(Box::new(Aes256CbcCipher::new())),
+        "3des-cbc" => Ok(Box::new(TDesCbcCipher::new())),
         "aes128-gcm@openssh.com" => Ok(Box::new(Aes128GcmCipher::new())),
         "aes256-gcm@openssh.com" => Ok(Box::new(Aes256GcmCipher::new())),
         _ => Err(SshError::UnsupportedAlgorithm(format!("cipher: {}", name))),
@@ -434,10 +703,14 @@ pub fn create_cipher(name: &str) -> Result<Box<dyn SshCipher>> {
 pub fn get_supported_ciphers() -> Vec<&'static str> {
     vec![
         "chacha20-poly1305@openssh.com",
+        "aes256-gcm@openssh.com",
+        "aes128-gcm@openssh.com",
         "aes256-ctr",
         "aes192-ctr",
         "aes128-ctr",
-        "aes256-gcm@openssh.com",
-        "aes128-gcm@openssh.com",
+        "aes256-cbc",
+        "aes192-cbc",
+        "aes128-cbc",
+        "3des-cbc",
     ]
 }

@@ -242,13 +242,13 @@ fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {
     }
     let priv_data = &r[..priv_len];
 
-    let mut pr = &priv_data[8..];
+    let mut pr = priv_data;
+    let _check1 = read_simplified_uint32(&mut pr)?;
+    let _check2 = read_simplified_uint32(&mut pr)?;
     let key_type = read_simplified_string(&mut pr)?;
 
     match key_type.as_str() {
         "ssh-ed25519" => {
-            let _check1 = read_simplified_uint32(&mut pr)?;
-            let _check2 = read_simplified_uint32(&mut pr)?;
             let _pub_len = read_simplified_uint32(&mut pr)? as usize;
             pr = &pr[_pub_len..];
             let _secret_len = read_simplified_uint32(&mut pr)? as usize;
@@ -260,20 +260,14 @@ fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {
             )?))
         }
         "ecdsa-sha2-nistp256" => {
-            let _check1 = read_simplified_uint32(&mut pr)?;
-            let _check2 = read_simplified_uint32(&mut pr)?;
             let _pub_curve = read_simplified_string(&mut pr)?;
             let _pub_len = read_simplified_uint32(&mut pr)? as usize;
             pr = &pr[_pub_len..];
-            let secret_len = read_simplified_uint32(&mut pr)? as usize;
-            let secret_bytes = read_simplified_raw(&mut pr, secret_len - 8)?;
+            let secret_bytes = read_simplified_string_bytes(&mut pr)?;
 
             Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&secret_bytes)?))
         }
         "ssh-rsa" => {
-            let _check1 = read_simplified_uint32(&mut pr)?;
-            let _check2 = read_simplified_uint32(&mut pr)?;
-
             let n_bytes = read_simplified_string_bytes(&mut pr)?;
             let e_bytes = read_simplified_string_bytes(&mut pr)?;
             let _d_bytes = read_simplified_string_bytes(&mut pr)?;

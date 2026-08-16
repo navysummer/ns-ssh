@@ -18,6 +18,9 @@ pub struct ServerConfig {
     pub password_auth: bool,
 
     #[serde(default = "default_true")]
+    pub kbd_interactive_auth: bool,
+
+    #[serde(default = "default_true")]
     pub pubkey_auth: bool,
 
     #[serde(default)]
@@ -112,6 +115,7 @@ impl Default for ServerConfig {
                 "/etc/ssh/ssh_host_ecdsa_key".to_string(),
             ],
             password_auth: default_true(),
+            kbd_interactive_auth: default_true(),
             pubkey_auth: default_true(),
             permit_root_login: false,
             authorized_keys_files: vec![
@@ -195,6 +199,9 @@ impl ServerConfig {
                 }
                 "passwordauthentication" | "password_auth" => {
                     config.password_auth = value == "yes";
+                }
+                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth" => {
+                    config.kbd_interactive_auth = value == "yes";
                 }
                 "pubkeyauthentication" | "pubkey_auth" => {
                     config.pubkey_auth = value == "yes";

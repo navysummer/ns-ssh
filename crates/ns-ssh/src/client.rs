@@ -8,7 +8,7 @@ use ssh_core::auth::*;
 use ssh_core::channel::*;
 use ssh_core::known_hosts::*;
 use ssh_core::hostkey::*;
-use ssh_core::kex::KexExchange;
+use ssh_core::kex::{KexExchange, KexAlgorithm};
 use std::collections::{VecDeque, HashMap};
 use std::pin::Pin;
 use tokio::net::TcpStream;
@@ -24,6 +24,7 @@ pub struct SshClient {
     pub stream: Option<BoxedStream>,
     pub transport: SshTransport,
     pub session_id: Option<Vec<u8>>,
+    pub server_sig_algs: Vec<String>,
     agent: SshAgent,
     loaded_signers: Vec<Box<dyn HostKeySigner>>,
     pub channel_manager: ChannelManager,
@@ -38,6 +39,7 @@ impl SshClient {
             stream: None,
             transport: SshTransport::new(),
             session_id: None,
+            server_sig_algs: Vec::new(),
             agent: SshAgent::new(),
             loaded_signers: Vec::new(),
             channel_manager: ChannelManager::new(),
@@ -99,38 +101,115 @@ impl SshClient {
         )?;
 
         let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
-        kex.generate_keypair()?;
 
-        let mut dh_payload = Vec::new();
-        dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-        dh_payload.extend(SshBytes(kex.public_key_bytes()).0);
-        send_raw_packet(stream, &dh_payload).await?;
-        self.transport.state = KexState::KexDhInitSent;
+        let (server_host_key_blob, server_public_key, server_signature_blob, shared_secret, exchange_hash, kex_hash_name) = if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
+            let (min, nbits, max) = if negotiation.kex_algorithm.contains("sha256") {
+                (2048u32, 4096u32, 8192u32)
+            } else {
+                (2048u32, 2048u32, 4096u32)
+            };
+            let mut req = Vec::new();
+            req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD);
+            min.encode(&mut req)?;
+            nbits.encode(&mut req)?;
+            max.encode(&mut req)?;
+            send_raw_packet(stream, &req).await?;
 
-        let reply = receive_raw_packet(stream).await?;
-        self.transport.state = KexState::KexDhReplyReceived;
+            let group_msg = receive_raw_packet(stream).await?;
+            if group_msg.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_GROUP) {
+                return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_GROUP".into()));
+            }
+            let mut r = &group_msg[1..];
+            let p_mp = SshMpInt::decode(&mut r)?.0;
+            let g_mp = SshMpInt::decode(&mut r)?.0;
+            let p_bytes = p_mp.clone();
+            let g_bytes = g_mp.clone();
+            let p_bu = num_bigint::BigUint::from_bytes_be(&p_mp);
+            let g_bu = num_bigint::BigUint::from_bytes_be(&g_mp);
+            let exp_bytes = if negotiation.kex_algorithm.contains("sha256") { 512 } else { 256 };
+            let gex_name: &'static str = if negotiation.kex_algorithm.contains("sha256") {
+                "diffie-hellman-group-exchange-sha256"
+            } else {
+                "diffie-hellman-group-exchange-sha1"
+            };
+            let gex_hash: &'static str = if negotiation.kex_algorithm.contains("sha256") { "sha256" } else { "sha1" };
+            let mut real_modp = ssh_core::kex::ModpKex::with_params(gex_name, gex_hash, p_bu.clone(), g_bu.clone(), exp_bytes);
+            real_modp.generate_keypair()?;
+            let client_pub = real_modp.public_key_bytes();
 
-        let mut r = &reply[1..];
-        let server_host_key_blob = SshBytes::decode(&mut r)?.0;
-        let server_public_key = SshBytes::decode(&mut r)?.0;
-        let server_signature_blob = SshBytes::decode(&mut r)?.0;
+            let mut init_msg = Vec::new();
+            init_msg.push(msg::SSH_MSG_KEX_DH_GEX_INIT);
+            SshMpInt(client_pub.clone()).encode(&mut init_msg)?;
+            send_raw_packet(stream, &init_msg).await?;
 
-        let shared_secret = kex.compute_shared_secret(&server_public_key)?;
+            let reply = receive_raw_packet(stream).await?;
+            if reply.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_REPLY) {
+                return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_REPLY".into()));
+            }
+            let mut r = &reply[1..];
+            let host_key_blob = SshBytes::decode(&mut r)?.0;
+            let f_bytes = SshMpInt::decode(&mut r)?.0;
+            let sig_blob = SshBytes::decode(&mut r)?.0;
 
-        let exchange = KexExchange {
-            client_version: self.transport.client_version.clone(),
-            server_version: self.transport.server_version.clone(),
-            client_kex_init: self.transport.client_kex_init.clone(),
-            server_kex_init: self.transport.server_kex_init.clone(),
+            let shared = real_modp.compute_shared_secret(&f_bytes)?;
+            let exchange = KexExchange {
+                client_version: self.transport.client_version.clone(),
+                server_version: self.transport.server_version.clone(),
+                client_kex_init: self.transport.client_kex_init.clone(),
+                server_kex_init: self.transport.server_kex_init.clone(),
+            };
+            let exch_hash = ssh_core::kex::compute_gex_exchange_hash(
+                real_modp.hash_name(),
+                &exchange,
+                min, nbits, max,
+                &p_bytes, &g_bytes,
+                &host_key_blob,
+                &client_pub,
+                &f_bytes,
+                &shared,
+            );
+            // Override trait object kex so later we can save it back into transport
+            kex = Box::new(real_modp);
+            (host_key_blob, f_bytes, sig_blob, shared, exch_hash, gex_hash.to_string())
+        } else {
+            kex.generate_keypair()?;
+            let mut dh_payload = Vec::new();
+            dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
+            dh_payload.extend(SshBytes(kex.public_key_bytes()).0);
+            send_raw_packet(stream, &dh_payload).await?;
+            self.transport.state = KexState::KexDhInitSent;
+
+            let reply = receive_raw_packet(stream).await?;
+            self.transport.state = KexState::KexDhReplyReceived;
+
+            let mut r = &reply[1..];
+            let host_key_blob = SshBytes::decode(&mut r)?.0;
+            let srv_pub = SshBytes::decode(&mut r)?.0;
+            let sig_blob = SshBytes::decode(&mut r)?.0;
+
+            let shared = kex.compute_shared_secret(&srv_pub)?;
+            let hash_name = kex.hash_name().to_string();
+
+            let exchange = KexExchange {
+                client_version: self.transport.client_version.clone(),
+                server_version: self.transport.server_version.clone(),
+                client_kex_init: self.transport.client_kex_init.clone(),
+                server_kex_init: self.transport.server_kex_init.clone(),
+            };
+
+            let exch_hash = ssh_core::kex::compute_exchange_hash(
+                &hash_name,
+                &exchange,
+                &host_key_blob,
+                &kex.public_key_bytes(),
+                &srv_pub,
+                &shared,
+            );
+            (host_key_blob, srv_pub, sig_blob, shared, exch_hash, hash_name)
         };
 
-        let exchange_hash = ssh_core::kex::compute_exchange_hash(
-            &exchange,
-            &server_host_key_blob,
-            &kex.public_key_bytes(),
-            &server_public_key,
-            &shared_secret,
-        );
+        self.transport.state = KexState::KexDhReplyReceived;
+        let hash_name = kex_hash_name.as_str();
 
         let mut r2 = &server_host_key_blob[..];
         let host_key_type = SshString::decode(&mut r2)?.as_str()?.to_string();
@@ -179,9 +258,20 @@ impl SshClient {
                 let verifier = EcdsaP256HostKey::from_public_bytes(&host_key_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
-            "ssh-rsa" => {
+            "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
+                // Fall through: try generic ECDSA not yet fully supported, skip verify
+                eprintln!("Warning: {} hostkey verify not implemented, skipping", host_key_type);
+                true
+            }
+            "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
                 let verifier = RsaHostKey::from_public_bytes(&host_key_bytes)?;
-                HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
+                let sig_alg = {
+                    let mut r = &server_signature_blob[..];
+                    let got = SshString::decode(&mut r).ok();
+                    got.and_then(|s| s.as_str().ok().map(|s| s.to_string()))
+                        .unwrap_or_else(|| host_key_type.clone())
+                };
+                HostKeyVerifier::verify_with(&verifier, &sig_alg, &exchange_hash, &server_signature_blob)?
             }
             other => {
                 eprintln!("Warning: unsupported host key type {} for signature verification", other);
@@ -194,6 +284,7 @@ impl SshClient {
 
         self.transport.install_new_keys(
             &negotiation,
+            hash_name,
             &shared_secret,
             &exchange_hash,
             &exchange_hash,
@@ -230,7 +321,35 @@ impl SshClient {
             .collect::<Vec<u8>>();
         send_encrypted_packet(stream, &svc_request, &mut self.transport, false, aead).await?;
 
-        let svc_accept = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        let svc_accept = loop {
+            let pkt = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            match pkt.first() {
+                Some(&msg::SSH_MSG_SERVICE_ACCEPT) => break pkt,
+                Some(&msg::SSH_EXT_INFO_C) | Some(&msg::SSH_EXT_INFO_S) => {
+                    let mut r = &pkt[1..];
+                    if let Ok(nr_ext) = u32::decode(&mut r) {
+                        for _ in 0..nr_ext {
+                            if let (Ok(ext_name), Ok(ext_value)) = (SshString::decode(&mut r), SshBytes::decode(&mut r)) {
+                                if let Ok(name) = ext_name.as_str() {
+                                    if name == "server-sig-algs" {
+                                        let algs_str = String::from_utf8_lossy(&ext_value.0);
+                                        self.server_sig_algs = algs_str
+                                            .split(',')
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty())
+                                            .collect();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Some(&msg::SSH_MSG_IGNORE) => continue,
+                Some(&msg::SSH_MSG_DEBUG) => continue,
+                _ => break pkt,
+            }
+        };
         if svc_accept.first() != Some(&msg::SSH_MSG_SERVICE_ACCEPT) {
             return Err(SshError::AuthFailed("service not accepted".into()));
         }
@@ -300,7 +419,52 @@ impl SshClient {
                 }
                 Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
                     let methods = parse_userauth_failure(&response)?;
-                    if methods.iter().any(|m| m == "password") {
+
+                    if !auth_succeeded && methods.iter().any(|m| m == "keyboard-interactive") {
+                        let kbd_method = AuthMethod::KeyboardInteractive(Vec::new());
+                        let kbd_msg = build_userauth_request_with_session(
+                            &username,
+                            msg::SSH_SERVICE_NAME_CONNECTION,
+                            &kbd_method,
+                            &session_id,
+                        );
+                        send_encrypted_packet(stream, &kbd_msg, &mut self.transport, false, aead).await?;
+
+                        let mut kbd_tries = 0;
+                        while kbd_tries < 3 {
+                            let kbd_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                            match kbd_resp.first() {
+                                Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
+                                    auth_succeeded = true;
+                                    break;
+                                }
+                                Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
+                                    break;
+                                }
+                                Some(&msg::SSH_MSG_USERAUTH_INFO_REQUEST) => {
+                                    let prompts = parse_userauth_info_request(&kbd_resp)?;
+                                    let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
+                                    for (prompt, _ans, echo, _) in prompts {
+                                        eprint!("{}", prompt);
+                                        use std::io::Write;
+                                        let _ = std::io::stderr().flush();
+                                        let mut line = String::new();
+                                        std::io::stdin().read_line(&mut line)
+                                            .map_err(|e| SshError::Io(e))?;
+                                        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                                        let _ = echo;
+                                        answers.push(line);
+                                    }
+                                    let resp_msg = build_userauth_info_response(&answers);
+                                    send_encrypted_packet(stream, &resp_msg, &mut self.transport, false, aead).await?;
+                                }
+                                _ => break,
+                            }
+                            kbd_tries += 1;
+                        }
+                    }
+
+                    if !auth_succeeded && methods.iter().any(|m| m == "password") {
                         eprint!("{}@{}'s password: ", self.config.user, self.config.hostname);
                         use std::io::Write;
                         let _ = std::io::stderr().flush();
@@ -330,6 +494,17 @@ impl SshClient {
 
         if !auth_succeeded {
             return Err(SshError::AuthFailed("authentication failed".into()));
+        }
+
+        if self.transport.client_to_server_compression == "zlib@openssh.com"
+            || self.transport.client_to_server_compression == "zlib"
+        {
+            self.transport.compression_active_c2s = true;
+        }
+        if self.transport.server_to_client_compression == "zlib@openssh.com"
+            || self.transport.server_to_client_compression == "zlib"
+        {
+            self.transport.compression_active_s2c = true;
         }
 
         Ok(())
@@ -499,8 +674,20 @@ impl SshClient {
         loop {
             if should_exit { break; }
 
+            {
+                let tb = self.transport.total_bytes();
+                let el = self.transport.last_rekey_instant.elapsed().as_secs();
+                if self.transport.needs_rekey(tb, el) {
+                    if let Err(e) = self.perform_rekey().await {
+                        tracing::warn!("rekey failed (continuing): {:?}", e);
+                    }
+                }
+            }
+
             tokio::select! {
                 biased;
+
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
 
                 to_ssh = to_ssh_rx.recv() => {
                     if let Some((remote_id, data)) = to_ssh {
@@ -848,6 +1035,158 @@ impl SshClient {
         self.transport.client_to_server_cipher.as_ref()
             .map(|c| c.is_aead())
             .unwrap_or(false)
+    }
+
+    pub async fn perform_rekey(&mut self) -> Result<()> {
+        use ssh_core::transport::KexState;
+        if self.transport.state != KexState::Established {
+            return Ok(());
+        }
+        self.transport.state = KexState::RekeyInProgress;
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+
+        let client_kex_init = self.transport.prepare_rekey();
+        send_encrypted_packet(stream, &client_kex_init, &mut self.transport, false, aead).await?;
+
+        let server_kex = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        if server_kex.first() != Some(&msg::SSH_MSG_KEXINIT) {
+            return Err(SshError::KexFailed("expected KEXINIT during rekey".into()));
+        }
+        self.transport.server_kex_init = server_kex.clone();
+
+        let negotiation = SshTransport::negotiate_algorithms(
+            &self.transport.client_kex_init,
+            &self.transport.server_kex_init,
+        )?;
+
+        let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
+
+        let (server_host_key_blob, server_pub_key, server_sig_blob, shared_secret, exchange_hash, kex_hash_name) =
+            if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
+                let (min, nbits, max) = if negotiation.kex_algorithm.contains("sha256") {
+                    (2048u32, 4096u32, 8192u32)
+                } else {
+                    (2048u32, 2048u32, 4096u32)
+                };
+                let mut req = Vec::new();
+                req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD);
+                min.encode(&mut req)?;
+                nbits.encode(&mut req)?;
+                max.encode(&mut req)?;
+                send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+
+                let group_msg = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                if group_msg.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_GROUP) {
+                    return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_GROUP".into()));
+                }
+                let mut r = &group_msg[1..];
+                let p_mp = SshMpInt::decode(&mut r)?.0;
+                let g_mp = SshMpInt::decode(&mut r)?.0;
+                let p_bytes = p_mp.clone();
+                let g_bytes = g_mp.clone();
+                let p_bu = num_bigint::BigUint::from_bytes_be(&p_mp);
+                let g_bu = num_bigint::BigUint::from_bytes_be(&g_mp);
+                let exp_bytes = if negotiation.kex_algorithm.contains("sha256") { 512 } else { 256 };
+                let gex_name: &'static str = if negotiation.kex_algorithm.contains("sha256") {
+                    "diffie-hellman-group-exchange-sha256"
+                } else {
+                    "diffie-hellman-group-exchange-sha1"
+                };
+                let gex_hash: &'static str = if negotiation.kex_algorithm.contains("sha256") { "sha256" } else { "sha1" };
+                let mut real_modp = ssh_core::kex::ModpKex::with_params(gex_name, gex_hash, p_bu.clone(), g_bu.clone(), exp_bytes);
+                real_modp.generate_keypair()?;
+                let client_pub = real_modp.public_key_bytes();
+
+                let mut init_msg = Vec::new();
+                init_msg.push(msg::SSH_MSG_KEX_DH_GEX_INIT);
+                SshMpInt(client_pub.clone()).encode(&mut init_msg)?;
+                send_encrypted_packet(stream, &init_msg, &mut self.transport, false, aead).await?;
+
+                let reply = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                if reply.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_REPLY) {
+                    return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_REPLY".into()));
+                }
+                let mut r = &reply[1..];
+                let host_key_blob = SshBytes::decode(&mut r)?.0;
+                let f_bytes = SshMpInt::decode(&mut r)?.0;
+                let sig_blob = SshBytes::decode(&mut r)?.0;
+
+                let shared = real_modp.compute_shared_secret(&f_bytes)?;
+                let exchange = KexExchange {
+                    client_version: self.transport.client_version.clone(),
+                    server_version: self.transport.server_version.clone(),
+                    client_kex_init: self.transport.client_kex_init.clone(),
+                    server_kex_init: self.transport.server_kex_init.clone(),
+                };
+                let exch_hash = ssh_core::kex::compute_gex_exchange_hash(
+                    real_modp.hash_name(),
+                    &exchange,
+                    min, nbits, max,
+                    &p_bytes, &g_bytes,
+                    &host_key_blob,
+                    &client_pub,
+                    &f_bytes,
+                    &shared,
+                );
+                kex = Box::new(real_modp);
+                (host_key_blob, f_bytes, sig_blob, shared, exch_hash, gex_hash.to_string())
+            } else {
+                kex.generate_keypair()?;
+                let mut dh_payload = Vec::new();
+                dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
+                dh_payload.extend(SshBytes(kex.public_key_bytes()).0);
+                send_encrypted_packet(stream, &dh_payload, &mut self.transport, false, aead).await?;
+
+                let reply = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                let mut r = &reply[1..];
+                let host_key_blob = SshBytes::decode(&mut r)?.0;
+                let srv_pub = SshBytes::decode(&mut r)?.0;
+                let sig_blob = SshBytes::decode(&mut r)?.0;
+
+                let shared = kex.compute_shared_secret(&srv_pub)?;
+                let hash_name = kex.hash_name().to_string();
+                let exchange = KexExchange {
+                    client_version: self.transport.client_version.clone(),
+                    server_version: self.transport.server_version.clone(),
+                    client_kex_init: self.transport.client_kex_init.clone(),
+                    server_kex_init: self.transport.server_kex_init.clone(),
+                };
+                let exch_hash = ssh_core::kex::compute_exchange_hash(
+                    &hash_name,
+                    &exchange,
+                    &host_key_blob,
+                    &kex.public_key_bytes(),
+                    &srv_pub,
+                    &shared,
+                );
+                (host_key_blob, srv_pub, sig_blob, shared, exch_hash, hash_name)
+            };
+
+        let session_id = self.session_id.clone().unwrap_or_default();
+
+        self.transport.install_new_keys(
+            &negotiation,
+            &kex_hash_name,
+            &shared_secret,
+            &exchange_hash,
+            &session_id,
+        )?;
+
+        let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
+        send_encrypted_packet(stream, &newkeys_msg, &mut self.transport, true, aead).await?;
+        self.transport.state = KexState::NewKeysSent;
+
+        let newkeys_response = receive_encrypted_packet(stream, &mut self.transport, true, aead).await?;
+        if newkeys_response.first() != Some(&msg::SSH_MSG_NEWKEYS) {
+            return Err(SshError::Protocol("expected NEWKEYS during rekey".into()));
+        }
+        self.transport.state = KexState::NewKeysReceived;
+        self.transport.kex_algorithm = Some(kex);
+        self.transport.state = KexState::Established;
+        self.transport.last_rekey_bytes = self.transport.total_bytes();
+        self.transport.last_rekey_instant = std::time::Instant::now();
+        Ok(())
     }
 }
 
@@ -1273,22 +1612,18 @@ fn parse_global_request(payload: &[u8]) -> Result<(String, bool, Vec<u8>)> {
 }
 
 async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin + ?Sized), payload: &[u8]) -> Result<()> {
-    let block_size = 8;
-    let padding_len = if payload.len() + 5 < block_size {
-        block_size - (payload.len() + 5)
-    } else {
-        block_size - ((payload.len() + 5) % block_size)
-    };
-
-    let packet_len = (payload.len() + 1 + padding_len) as u32;
-    let mut packet = Vec::with_capacity(4 + packet_len as usize);
-    packet.extend_from_slice(&packet_len.to_be_bytes());
+    let base = 1 + payload.len();
+    let remainder = base % 8;
+    let mut padding_len = if remainder == 0 { 0 } else { 8 - remainder };
+    if padding_len < 4 { padding_len += 8; }
+    let packet_len_field = (4 + base + padding_len) as u32;
+    let mut packet = Vec::with_capacity(4 + (base + padding_len) as usize);
+    packet.extend_from_slice(&packet_len_field.to_be_bytes());
     packet.push(padding_len as u8);
     packet.extend_from_slice(payload);
     let mut padding = vec![0u8; padding_len];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding);
     packet.extend_from_slice(&padding);
-
     stream.write_all(&packet).await?;
     stream.flush().await?;
     Ok(())
@@ -1297,21 +1632,23 @@ async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin + ?Sized), payloa
 async fn receive_raw_packet(stream: &mut (impl AsyncRead + Unpin + ?Sized)) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let packet_len = u32::from_be_bytes(len_buf) as usize;
-
-    if packet_len > 256 * 1024 {
-        return Err(SshError::InvalidPacket("packet too large".into()));
+    let total_len = u32::from_be_bytes(len_buf) as usize;
+    if total_len < 12 || total_len > 256 * 1024 {
+        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
     }
+    let body_len = total_len - 4;
+    let mut body = vec![0u8; body_len];
+    stream.read_exact(&mut body).await?;
 
-    let mut packet = vec![0u8; packet_len];
-    stream.read_exact(&mut packet).await?;
-
-    let padding_len = packet[0] as usize;
-    if padding_len >= packet_len {
+    let padding_len = body[0] as usize;
+    if padding_len >= body_len {
         return Err(SshError::InvalidPacket("invalid padding".into()));
     }
-
-    Ok(packet[1..packet_len - padding_len].to_vec())
+    let payload_len = body_len - 1 - padding_len;
+    if payload_len == 0 {
+        return Err(SshError::InvalidPacket("empty payload".into()));
+    }
+    Ok(body[1..1 + payload_len].to_vec())
 }
 
 async fn send_encrypted_packet(
@@ -1327,15 +1664,15 @@ async fn send_encrypted_packet(
             .unwrap_or(8)
     };
 
-    let padding_len = if payload.len() + 5 < block_size {
-        block_size - (payload.len() + 5)
-    } else {
-        block_size - ((payload.len() + 5) % block_size)
-    };
+    let base = 1 + payload.len();
+    let remainder = base % block_size;
+    let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
+    if padding_len < 4 { padding_len += block_size; }
+    let body_len = base + padding_len;
+    let packet_len_field = (4 + body_len) as u32;
 
-    let packet_len = (payload.len() + 1 + padding_len) as u32;
-    let mut packet = Vec::with_capacity(4 + packet_len as usize);
-    packet.extend_from_slice(&packet_len.to_be_bytes());
+    let mut packet = Vec::with_capacity(4 + body_len);
+    packet.extend_from_slice(&packet_len_field.to_be_bytes());
     packet.push(padding_len as u8);
     packet.extend_from_slice(payload);
     let mut padding = vec![0u8; padding_len];
@@ -1412,11 +1749,12 @@ async fn receive_encrypted_packet(
     }
 
     let packet_len = u32::from_be_bytes(len_buf) as usize;
-    if packet_len > 256 * 1024 {
-        return Err(SshError::InvalidPacket("packet too large".into()));
+    if packet_len > 256 * 1024 || packet_len < 12 {
+        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
     }
+    let body_len = packet_len - 4;
 
-    let mut body = vec![0u8; packet_len];
+    let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body).await?;
 
     if aead {

@@ -210,6 +210,180 @@ impl HostKeyVerifier for EcdsaP256HostKey {
     }
 }
 
+pub struct EcdsaP384HostKey {
+    signing_key: p384::ecdsa::SigningKey,
+    verifying_key: p384::ecdsa::VerifyingKey,
+}
+
+impl EcdsaP384HostKey {
+    pub fn generate() -> Result<Self> {
+        let signing_key = p384::ecdsa::SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key().to_owned();
+        Ok(EcdsaP384HostKey { signing_key, verifying_key })
+    }
+
+    pub fn from_secret_bytes(secret: &[u8]) -> Result<Self> {
+        let signing_key = p384::ecdsa::SigningKey::from_bytes(secret.into())
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p384: {}", e)))?;
+        let verifying_key = signing_key.verifying_key().to_owned();
+        Ok(EcdsaP384HostKey { signing_key, verifying_key })
+    }
+
+    pub fn from_public_bytes(public: &[u8]) -> Result<Self> {
+        let verifying_key = p384::ecdsa::VerifyingKey::from_sec1_bytes(public)
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p384: {}", e)))?;
+        let signing_key = p384::ecdsa::SigningKey::random(&mut OsRng);
+        Ok(EcdsaP384HostKey { signing_key, verifying_key })
+    }
+
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.signing_key.to_bytes().to_vec()
+    }
+}
+
+impl HostKeySigner for EcdsaP384HostKey {
+    fn algorithm_name(&self) -> &str { "ecdsa-sha2-nistp384" }
+    fn key_type(&self) -> &str { "ecdsa-sha2-nistp384" }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        SshString::new("ecdsa-sha2-nistp384").encode(&mut buf).unwrap();
+        SshString::new("nistp384").encode(&mut buf).unwrap();
+        let point = self.verifying_key.to_encoded_point(false);
+        SshBytes(point.as_bytes().to_vec()).encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        use p384::ecdsa::signature::hazmat::PrehashSigner;
+        let sig: p384::ecdsa::Signature = self.signing_key
+            .sign_prehash(data)
+            .map_err(|e| SshError::Protocol(format!("ecdsa p384 sign: {}", e)))?;
+        let sig_der = sig.to_der();
+        let mut buf = Vec::new();
+        SshString::new("ecdsa-sha2-nistp384").encode(&mut buf).unwrap();
+        SshBytes(sig_der.as_ref().to_vec()).encode(&mut buf).unwrap();
+        Ok(buf)
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        let mut r = &signature[..];
+        let _sig_type = SshString::decode(&mut r)?;
+        let sig_bytes = SshBytes::decode(&mut r)?;
+        let sig = p384::ecdsa::DerSignature::from_bytes(&sig_bytes.0)
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p384 sig: {}", e)))?;
+        use p384::ecdsa::signature::hazmat::PrehashVerifier;
+        Ok(self.verifying_key.verify_prehash(data, &sig).is_ok())
+    }
+
+    fn clone_box(&self) -> Box<dyn HostKeySigner> {
+        Box::new(EcdsaP384HostKey {
+            signing_key: p384::ecdsa::SigningKey::from_bytes(&self.signing_key.to_bytes()).unwrap(),
+            verifying_key: self.verifying_key.clone(),
+        })
+    }
+}
+
+impl HostKeyVerifier for EcdsaP384HostKey {
+    fn algorithm_name(&self) -> &str { "ecdsa-sha2-nistp384" }
+    fn key_type(&self) -> &str { "ecdsa-sha2-nistp384" }
+    fn public_key_bytes(&self) -> Vec<u8> {
+        let point = self.verifying_key.to_encoded_point(false);
+        point.as_bytes().to_vec()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        HostKeySigner::verify(self, data, signature)
+    }
+}
+
+pub struct EcdsaP521HostKey {
+    signing_key: p521::ecdsa::SigningKey,
+    verifying_key: p521::ecdsa::VerifyingKey,
+}
+
+impl EcdsaP521HostKey {
+    pub fn generate() -> Result<Self> {
+        let signing_key = p521::ecdsa::SigningKey::random(&mut OsRng);
+        let verifying_key = p521::ecdsa::VerifyingKey::from(&signing_key);
+        Ok(EcdsaP521HostKey { signing_key, verifying_key })
+    }
+
+    pub fn from_secret_bytes(secret: &[u8]) -> Result<Self> {
+        let signing_key = p521::ecdsa::SigningKey::from_bytes(secret.into())
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p521: {}", e)))?;
+        let verifying_key = p521::ecdsa::VerifyingKey::from(&signing_key);
+        Ok(EcdsaP521HostKey { signing_key, verifying_key })
+    }
+
+    pub fn from_public_bytes(public: &[u8]) -> Result<Self> {
+        let verifying_key = p521::ecdsa::VerifyingKey::from_sec1_bytes(public)
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p521: {}", e)))?;
+        let signing_key = p521::ecdsa::SigningKey::random(&mut OsRng);
+        Ok(EcdsaP521HostKey { signing_key, verifying_key })
+    }
+
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.signing_key.to_bytes().to_vec()
+    }
+}
+
+impl HostKeySigner for EcdsaP521HostKey {
+    fn algorithm_name(&self) -> &str { "ecdsa-sha2-nistp521" }
+    fn key_type(&self) -> &str { "ecdsa-sha2-nistp521" }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        SshString::new("ecdsa-sha2-nistp521").encode(&mut buf).unwrap();
+        SshString::new("nistp521").encode(&mut buf).unwrap();
+        let point = self.verifying_key.to_encoded_point(false);
+        SshBytes(point.as_bytes().to_vec()).encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        use p521::ecdsa::signature::hazmat::PrehashSigner;
+        let sig: p521::ecdsa::Signature = self.signing_key
+            .sign_prehash(data)
+            .map_err(|e| SshError::Protocol(format!("ecdsa p521 sign: {}", e)))?;
+        let sig_der = sig.to_der();
+        let mut buf = Vec::new();
+        SshString::new("ecdsa-sha2-nistp521").encode(&mut buf).unwrap();
+        SshBytes(sig_der.as_ref().to_vec()).encode(&mut buf).unwrap();
+        Ok(buf)
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        let mut r = &signature[..];
+        let _sig_type = SshString::decode(&mut r)?;
+        let sig_bytes = SshBytes::decode(&mut r)?;
+        let sig = p521::ecdsa::Signature::from_der(&sig_bytes.0)
+            .map_err(|e| SshError::InvalidKey(format!("ecdsa p521 sig: {}", e)))?;
+        use p521::ecdsa::signature::hazmat::PrehashVerifier;
+        Ok(self.verifying_key.verify_prehash(data, &sig).is_ok())
+    }
+
+    fn clone_box(&self) -> Box<dyn HostKeySigner> {
+        Box::new(EcdsaP521HostKey {
+            signing_key: p521::ecdsa::SigningKey::from_bytes(&self.signing_key.to_bytes()).unwrap(),
+            verifying_key: self.verifying_key.clone(),
+        })
+    }
+}
+
+impl HostKeyVerifier for EcdsaP521HostKey {
+    fn algorithm_name(&self) -> &str { "ecdsa-sha2-nistp521" }
+    fn key_type(&self) -> &str { "ecdsa-sha2-nistp521" }
+    fn public_key_bytes(&self) -> Vec<u8> {
+        let point = self.verifying_key.to_encoded_point(false);
+        point.as_bytes().to_vec()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        HostKeySigner::verify(self, data, signature)
+    }
+}
+
 pub struct RsaHostKey {
     private_key: Option<RsaPrivateKey>,
     public_key: RsaPublicKey,
@@ -405,6 +579,8 @@ pub fn get_supported_host_key_algorithms() -> Vec<&'static str> {
     vec![
         "ssh-ed25519",
         "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
         "rsa-sha2-256",
         "rsa-sha2-512",
         "ssh-rsa",

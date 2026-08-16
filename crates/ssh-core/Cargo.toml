@@ -11,9 +11,12 @@ ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 signature = "2"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
+p384 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
+p521 = { version = "0.13", features = ["ecdh", "ecdsa", "arithmetic"] }
 elliptic-curve = { version = "0.13", features = ["sec1"] }
 aes = "0.8"
 cipher = "0.4"
+des = "0.8"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -35,6 +38,7 @@ byteorder = "1"
 thiserror = "2"
 dirs = "6"
 libc = "0.2"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 
 [features]
 default = []
