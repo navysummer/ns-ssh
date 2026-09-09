@@ -30,6 +30,9 @@ pub const SSH_FXP_DATA: u8 = 103;
 pub const SSH_FXP_NAME: u8 = 104;
 pub const SSH_FXP_ATTRS: u8 = 105;
 
+pub const SSH_FXP_EXTENDED: u8 = 200;
+pub const SSH_FXP_EXTENDED_REPLY: u8 = 201;
+
 pub const SSH_FX_OK: u32 = 0;
 pub const SSH_FX_EOF: u32 = 1;
 pub const SSH_FX_NO_SUCH_FILE: u32 = 2;
@@ -81,7 +84,12 @@ impl SftpFileAttr {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend(self.flags.to_be_bytes());
+        let mut flags = self.flags;
+        if self.size.is_some() { flags |= SSH_FILEXFER_ATTR_SIZE; }
+        if self.uid.is_some() || self.gid.is_some() { flags |= SSH_FILEXFER_ATTR_UIDGID; }
+        if self.permissions.is_some() { flags |= SSH_FILEXFER_ATTR_PERMISSIONS; }
+        if self.atime.is_some() || self.mtime.is_some() { flags |= SSH_FILEXFER_ATTR_ACMODTIME; }
+        buf.extend(flags.to_be_bytes());
 
         if let Some(size) = self.size {
             buf.extend(size.to_be_bytes());
@@ -134,8 +142,8 @@ pub struct SftpNameEntry {
 impl SftpNameEntry {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend(SshString::new(&self.filename).0);
-        buf.extend(SshString::new(&self.longname).0);
+        SshString::new(&self.filename).encode(&mut buf).unwrap();
+        SshString::new(&self.longname).encode(&mut buf).unwrap();
         buf.extend(self.attrs.encode());
         buf
     }
@@ -154,7 +162,7 @@ pub fn build_sftp_open(id: u32, path: &str, pflags: u32, attrs: &SftpFileAttr) -
     let mut payload = Vec::new();
     payload.push(SSH_FXP_OPEN);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     payload.extend(pflags.to_be_bytes());
     payload.extend(attrs.encode());
     wrap_sftp_payload(&payload)
@@ -164,7 +172,7 @@ pub fn build_sftp_close(id: u32, handle: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_CLOSE);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshBytes(handle.to_vec()).0);
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -172,7 +180,7 @@ pub fn build_sftp_read(id: u32, handle: &[u8], offset: u64, len: u32) -> Vec<u8>
     let mut payload = Vec::new();
     payload.push(SSH_FXP_READ);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshBytes(handle.to_vec()).0);
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
     payload.extend(offset.to_be_bytes());
     payload.extend(len.to_be_bytes());
     wrap_sftp_payload(&payload)
@@ -182,9 +190,9 @@ pub fn build_sftp_write(id: u32, handle: &[u8], offset: u64, data: &[u8]) -> Vec
     let mut payload = Vec::new();
     payload.push(SSH_FXP_WRITE);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshBytes(handle.to_vec()).0);
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
     payload.extend(offset.to_be_bytes());
-    payload.extend(SshBytes(data.to_vec()).0);
+    SshBytes(data.to_vec()).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -192,7 +200,7 @@ pub fn build_sftp_opendir(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_OPENDIR);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -200,7 +208,7 @@ pub fn build_sftp_readdir(id: u32, handle: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_READDIR);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshBytes(handle.to_vec()).0);
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -208,7 +216,7 @@ pub fn build_sftp_remove(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_REMOVE);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -216,7 +224,7 @@ pub fn build_sftp_mkdir(id: u32, path: &str, attrs: &SftpFileAttr) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_MKDIR);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     payload.extend(attrs.encode());
     wrap_sftp_payload(&payload)
 }
@@ -225,7 +233,7 @@ pub fn build_sftp_rmdir(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_RMDIR);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -233,7 +241,7 @@ pub fn build_sftp_realpath(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_REALPATH);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -241,7 +249,105 @@ pub fn build_sftp_stat(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_STAT);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_lstat(id: u32, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_LSTAT);
+    payload.extend(id.to_be_bytes());
+    SshString::new(path).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_fstat(id: u32, handle: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_FSTAT);
+    payload.extend(id.to_be_bytes());
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_setstat(id: u32, path: &str, attrs: &SftpFileAttr) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_SETSTAT);
+    payload.extend(id.to_be_bytes());
+    SshString::new(path).encode(&mut payload).unwrap();
+    payload.extend(attrs.encode());
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_fsetstat(id: u32, handle: &[u8], attrs: &SftpFileAttr) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_FSETSTAT);
+    payload.extend(id.to_be_bytes());
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
+    payload.extend(attrs.encode());
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_extended(id: u32, ext_name: &str, data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new(ext_name).encode(&mut payload).unwrap();
+    payload.extend_from_slice(data);
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_posix_rename(id: u32, oldpath: &str, newpath: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("posix-rename@openssh.com").encode(&mut payload).unwrap();
+    SshString::new(oldpath).encode(&mut payload).unwrap();
+    SshString::new(newpath).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_statvfs(id: u32, path: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("statvfs@openssh.com").encode(&mut payload).unwrap();
+    SshString::new(path).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_fstatvfs(id: u32, handle: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("fstatvfs@openssh.com").encode(&mut payload).unwrap();
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_fsync(id: u32, handle: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("fsync@openssh.com").encode(&mut payload).unwrap();
+    SshBytes(handle.to_vec()).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_hardlink(id: u32, oldpath: &str, newpath: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("hardlink@openssh.com").encode(&mut payload).unwrap();
+    SshString::new(oldpath).encode(&mut payload).unwrap();
+    SshString::new(newpath).encode(&mut payload).unwrap();
+    wrap_sftp_payload(&payload)
+}
+
+pub fn build_sftp_limits(id: u32) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_FXP_EXTENDED);
+    payload.extend(id.to_be_bytes());
+    SshString::new("limits@openssh.com").encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -249,8 +355,8 @@ pub fn build_sftp_rename(id: u32, oldpath: &str, newpath: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_RENAME);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(oldpath).0);
-    payload.extend(SshString::new(newpath).0);
+    SshString::new(oldpath).encode(&mut payload).unwrap();
+    SshString::new(newpath).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -258,7 +364,7 @@ pub fn build_sftp_readlink(id: u32, path: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_READLINK);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(path).0);
+    SshString::new(path).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
@@ -266,14 +372,14 @@ pub fn build_sftp_symlink(id: u32, linkpath: &str, targetpath: &str) -> Vec<u8> 
     let mut payload = Vec::new();
     payload.push(SSH_FXP_SYMLINK);
     payload.extend(id.to_be_bytes());
-    payload.extend(SshString::new(linkpath).0);
-    payload.extend(SshString::new(targetpath).0);
+    SshString::new(linkpath).encode(&mut payload).unwrap();
+    SshString::new(targetpath).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 
 fn wrap_sftp_payload(payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend(((payload.len() + 4) as u32).to_be_bytes());
+    buf.extend((payload.len() as u32).to_be_bytes());
     buf.extend(payload);
     buf
 }

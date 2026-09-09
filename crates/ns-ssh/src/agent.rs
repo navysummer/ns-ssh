@@ -117,6 +117,19 @@ impl SshAgent {
     }
 }
 
+/// Extract the algorithm name from an SSH public key blob (first string field).
+pub fn blob_algorithm(blob: &[u8]) -> Option<String> {
+    if blob.is_empty() {
+        return None;
+    }
+    let len = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+    let start = 4usize;
+    if start + len > blob.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&blob[start..start + len]).to_string())
+}
+
 pub fn get_identity_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
 
@@ -148,30 +161,38 @@ pub fn load_private_key(path: &std::path::Path) -> Result<Box<dyn HostKeySigner>
 
     let content = content.trim();
 
-    let needs_password = content.contains("ENCRYPTED")
-        || content.contains("Proc-Type: 4,ENCRYPTED")
-        || (content.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
-            && !content.contains("none"));
-
-    let password: Option<String> = if needs_password {
-        eprintln!("Key {} is encrypted", path.display());
-        Some(prompt_password()?)
-    } else {
-        None
-    };
-
     if content.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
-        load_openssh_key(content, password.as_deref())
-    } else if content.starts_with("-----BEGIN RSA PRIVATE KEY-----") {
-        load_pkcs1_key(content, password.as_deref())
-    } else if content.starts_with("-----BEGIN EC PRIVATE KEY-----") {
-        load_ec_key(content, password.as_deref())
-    } else if content.starts_with("-----BEGIN PRIVATE KEY-----") {
-        load_pkcs8_key(content, password.as_deref())
-    } else if content.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
-        load_pkcs8_key(content, password.as_deref())
+        match load_openssh_key(content, None) {
+            Ok(k) => return Ok(k),
+            Err(SshError::InvalidKey(msg)) if msg.contains("need passphrase") => {
+                eprintln!("Key {} is encrypted", path.display());
+                let pw = prompt_password()?;
+                load_openssh_key(content, Some(&pw))
+            }
+            Err(e) => return Err(e),
+        }
     } else {
-        Err(SshError::InvalidKey("unsupported key format".into()))
+        let needs_password = content.contains("ENCRYPTED")
+            || content.contains("Proc-Type: 4,ENCRYPTED");
+
+        let password: Option<String> = if needs_password {
+            eprintln!("Key {} is encrypted", path.display());
+            Some(prompt_password()?)
+        } else {
+            None
+        };
+
+        if content.starts_with("-----BEGIN RSA PRIVATE KEY-----") {
+            load_pkcs1_key(content, password.as_deref())
+        } else if content.starts_with("-----BEGIN EC PRIVATE KEY-----") {
+            load_ec_key(content, password.as_deref())
+        } else if content.starts_with("-----BEGIN PRIVATE KEY-----") {
+            load_pkcs8_key(content, password.as_deref())
+        } else if content.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----") {
+            load_pkcs8_key(content, password.as_deref())
+        } else {
+            Err(SshError::InvalidKey("unsupported key format".into()))
+        }
     }
 }
 

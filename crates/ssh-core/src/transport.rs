@@ -9,6 +9,67 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 pub const MAX_PACKET_SIZE: usize = 256 * 1024;
 
+const DEFAULT_KEX: &[&str] = &[
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha256",
+    "diffie-hellman-group-exchange-sha1",
+    "ext-info-c",
+    "ext-info-s",
+];
+
+const DEFAULT_HOST_KEYS: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "ssh-rsa",
+];
+
+const DEFAULT_CIPHERS: &[&str] = &[
+    "aes256-ctr",
+    "aes192-ctr",
+    "aes128-ctr",
+    "chacha20-poly1305@openssh.com",
+    "aes256-gcm@openssh.com",
+    "aes128-gcm@openssh.com",
+    "aes256-cbc",
+    "aes192-cbc",
+    "aes128-cbc",
+    "3des-cbc",
+];
+
+const DEFAULT_MACS: &[&str] = &[
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha1-etm@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-512",
+    "hmac-sha1",
+    "hmac-sha1-96",
+    "none",
+];
+
+fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&[String]>) -> Vec<&'a str> {
+    match config {
+        Some(list) if !list.is_empty() => defaults
+            .iter()
+            .copied()
+            .filter(|d| list.iter().any(|c| c.as_str() == *d))
+            .collect(),
+        _ => defaults.to_vec(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KexState {
     Initial,
@@ -46,6 +107,7 @@ pub struct SshTransport {
     pub server_to_client_compression: String,
     pub compression_active_c2s: bool,
     pub compression_active_s2c: bool,
+    pub compression_enabled: bool,
     pub client_version: Vec<u8>,
     pub server_version: Vec<u8>,
     pub client_kex_init: Vec<u8>,
@@ -71,6 +133,7 @@ impl SshTransport {
             server_to_client_compression: "none".to_string(),
             compression_active_c2s: false,
             compression_active_s2c: false,
+            compression_enabled: true,
             client_version: msg::SSH_VERSION.as_bytes().to_vec(),
             server_version: Vec::new(),
             client_kex_init: Vec::new(),
@@ -83,88 +146,43 @@ impl SshTransport {
         }
     }
 
-    pub fn build_kex_init(&mut self) -> Vec<u8> {
+    pub fn build_kex_init(
+        &mut self,
+        host_key_algorithms: Option<&[String]>,
+        kex_algorithms: Option<&[String]>,
+        ciphers: Option<&[String]>,
+        macs: Option<&[String]>,
+    ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(msg::SSH_MSG_KEXINIT);
         let mut cookie = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
         payload.extend_from_slice(&cookie);
 
-        payload.extend(encode_name_list(&[
-            "curve25519-sha256",
-            "curve25519-sha256@libssh.org",
-            "ecdh-sha2-nistp256",
-            "ecdh-sha2-nistp384",
-            "ecdh-sha2-nistp521",
-            "diffie-hellman-group16-sha512",
-            "diffie-hellman-group18-sha512",
-            "diffie-hellman-group14-sha256",
-            "diffie-hellman-group14-sha1",
-            "diffie-hellman-group-exchange-sha256",
-            "diffie-hellman-group-exchange-sha1",
-            "ext-info-c",
-            "ext-info-s",
-        ]));
+        let kex_list: Vec<&str> = filter_algos(DEFAULT_KEX, kex_algorithms);
+        payload.extend(encode_name_list(&kex_list));
 
-        payload.extend(encode_name_list(&[
-            "ssh-ed25519",
-            "ecdsa-sha2-nistp256",
-            "ecdsa-sha2-nistp384",
-            "ecdsa-sha2-nistp521",
-            "rsa-sha2-512",
-            "rsa-sha2-256",
-            "ssh-rsa",
-        ]));
+        let host_key_list: Vec<&str> = match host_key_algorithms {
+            Some(algs) if !algs.is_empty() => algs.iter().map(|s| s.as_str()).collect(),
+            _ => DEFAULT_HOST_KEYS.to_vec(),
+        };
+        payload.extend(encode_name_list(&host_key_list));
 
-        payload.extend(encode_name_list(&[
-            "chacha20-poly1305@openssh.com",
-            "aes256-gcm@openssh.com",
-            "aes128-gcm@openssh.com",
-            "aes256-ctr",
-            "aes192-ctr",
-            "aes128-ctr",
-            "aes256-cbc",
-            "aes192-cbc",
-            "aes128-cbc",
-            "3des-cbc",
-        ]));
+        let cipher_list: Vec<&str> = filter_algos(DEFAULT_CIPHERS, ciphers);
+        payload.extend(encode_name_list(&cipher_list));
+        payload.extend(encode_name_list(&cipher_list));
 
-        payload.extend(encode_name_list(&[
-            "chacha20-poly1305@openssh.com",
-            "aes256-gcm@openssh.com",
-            "aes128-gcm@openssh.com",
-            "aes256-ctr",
-            "aes192-ctr",
-            "aes128-ctr",
-            "aes256-cbc",
-            "aes192-cbc",
-            "aes128-cbc",
-            "3des-cbc",
-        ]));
+        let mac_list: Vec<&str> = filter_algos(DEFAULT_MACS, macs);
+        payload.extend(encode_name_list(&mac_list));
+        payload.extend(encode_name_list(&mac_list));
 
-        payload.extend(encode_name_list(&[
-            "hmac-sha2-256-etm@openssh.com",
-            "hmac-sha2-512-etm@openssh.com",
-            "hmac-sha1-etm@openssh.com",
-            "hmac-sha2-256",
-            "hmac-sha2-512",
-            "hmac-sha1",
-            "hmac-sha1-96",
-            "none",
-        ]));
-        payload.extend(encode_name_list(&[
-            "hmac-sha2-256-etm@openssh.com",
-            "hmac-sha2-512-etm@openssh.com",
-            "hmac-sha1-etm@openssh.com",
-            "hmac-sha2-256",
-            "hmac-sha2-512",
-            "hmac-sha1",
-            "hmac-sha1-96",
-            "none",
-        ]));
-
-        payload.extend(encode_name_list(&["none", "zlib@openssh.com"]));
-        payload.extend(encode_name_list(&["none", "zlib@openssh.com"]));
+        let comp_list: Vec<&str> = if self.compression_enabled {
+            vec!["none", "zlib@openssh.com"]
+        } else {
+            vec!["none"]
+        };
+        payload.extend(encode_name_list(&comp_list));
+        payload.extend(encode_name_list(&comp_list));
 
         payload.extend(encode_name_list(&[]));
         payload.extend(encode_name_list(&[]));
@@ -203,7 +221,6 @@ impl SshTransport {
         server_kex: &[u8],
     ) -> Result<AlgorithmNegotiation> {
         let mut cr = &client_kex[17..];
-        cr = &cr[16..];
 
         let client_kex_algos = SshNameList::decode(&mut cr)?;
         let client_host_key = SshNameList::decode(&mut cr)?;
@@ -215,7 +232,6 @@ impl SshTransport {
         let client_comps_sc = SshNameList::decode(&mut cr)?;
 
         let mut sr = &server_kex[17..];
-        sr = &sr[16..];
 
         let server_kex_algos = SshNameList::decode(&mut sr)?;
         let server_host_key = SshNameList::decode(&mut sr)?;

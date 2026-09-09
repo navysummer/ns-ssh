@@ -30,6 +30,8 @@ pub struct HostConfig {
     #[serde(default)]
     pub strict_host_key_checking: Option<String>,
     #[serde(default)]
+    pub hash_known_hosts: Option<bool>,
+    #[serde(default)]
     pub user_known_hosts_file: Option<String>,
     #[serde(default)]
     pub global_known_hosts_file: Option<String>,
@@ -72,6 +74,8 @@ pub struct HostConfig {
     #[serde(default)]
     pub proxy_command: Option<String>,
     #[serde(default)]
+    pub bind_address: Option<String>,
+    #[serde(default)]
     pub local_forward: Option<Vec<String>>,
     #[serde(default)]
     pub remote_forward: Option<Vec<String>>,
@@ -89,6 +93,12 @@ pub struct HostConfig {
     pub enable_ssh_keysign: Option<bool>,
     #[serde(default)]
     pub verify_host_key_dns: Option<String>,
+    #[serde(default)]
+    pub address_family: Option<String>,
+    #[serde(default)]
+    pub escape_char: Option<String>,
+    #[serde(default)]
+    pub subsystem: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +112,7 @@ pub struct ResolvedConfig {
     pub forward_x11: bool,
     pub compression: bool,
     pub strict_host_key_checking: bool,
+    pub hash_known_hosts: bool,
     pub user_known_hosts_file: Option<PathBuf>,
     pub global_known_hosts_file: Option<PathBuf>,
     pub connect_timeout: Option<u32>,
@@ -129,7 +140,15 @@ pub struct ResolvedConfig {
     pub dynamic_forwards: Vec<u16>,
     pub proxy_jump: Option<String>,
     pub proxy_command: Option<String>,
+    pub bind_address: Option<String>,
     pub no_remote_command: bool,
+    pub prefer_ipv4: bool,
+    pub prefer_ipv6: bool,
+    pub quiet: bool,
+    pub escape_char: String,
+    pub verbosity: u8,
+    pub stdio_forward: Option<(String, u16)>,
+    pub subsystem: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -144,6 +163,7 @@ impl ResolvedConfig {
             forward_x11: false,
             compression: false,
             strict_host_key_checking: true,
+            hash_known_hosts: false,
             user_known_hosts_file: None,
             global_known_hosts_file: None,
             connect_timeout: None,
@@ -163,7 +183,7 @@ impl ResolvedConfig {
             exit_on_forward_failure: false,
             send_env: vec!["LANG".into(), "LC_*".into()],
             set_env: Vec::new(),
-            request_tty: true,
+            request_tty: false,
             remote_command: None,
             add_keys_to_agent: false,
             local_forwards: Vec::new(),
@@ -171,7 +191,15 @@ impl ResolvedConfig {
             dynamic_forwards: Vec::new(),
             proxy_jump: None,
             proxy_command: None,
+            bind_address: None,
             no_remote_command: false,
+            prefer_ipv4: false,
+            prefer_ipv6: false,
+            quiet: false,
+            escape_char: "~".to_string(),
+            verbosity: 0,
+            stdio_forward: None,
+            subsystem: None,
         }
     }
 }
@@ -211,6 +239,7 @@ impl SshConfig {
         let mut forward_x11 = None;
         let mut compression = None;
         let mut strict_host_key_checking = None;
+        let mut hash_known_hosts = None;
         let mut user_known_hosts_file = None;
         let mut global_known_hosts_file = None;
         let mut connect_timeout = None;
@@ -232,6 +261,7 @@ impl SshConfig {
         let mut set_env: Option<Vec<String>> = None;
         let mut proxy_jump = None;
         let mut proxy_command = None;
+        let mut bind_address = None;
         let mut local_forward = None;
         let mut remote_forward = None;
         let mut dynamic_forward = None;
@@ -241,6 +271,9 @@ impl SshConfig {
         let mut no_host_authentication_for_localhost = None;
         let mut enable_ssh_keysign = None;
         let mut verify_host_key_dns = None;
+        let mut address_family = None;
+        let mut escape_char = None;
+        let mut subsystem = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -272,6 +305,7 @@ impl SshConfig {
                             forward_x11: forward_x11.take(),
                             compression: compression.take(),
                             strict_host_key_checking: strict_host_key_checking.take(),
+                            hash_known_hosts: hash_known_hosts.take(),
                             user_known_hosts_file: user_known_hosts_file.take(),
                             global_known_hosts_file: global_known_hosts_file.take(),
                             connect_timeout: connect_timeout.take(),
@@ -293,16 +327,20 @@ impl SshConfig {
                             set_env: set_env.take(),
                             proxy_jump: proxy_jump.take(),
                             proxy_command: proxy_command.take(),
+                            bind_address: bind_address.take(),
                             local_forward: local_forward.take(),
                             remote_forward: remote_forward.take(),
                             dynamic_forward: dynamic_forward.take(),
                             request_tty: request_tty.take(),
                             remote_command: remote_command.take(),
                             add_keys_to_agent: add_keys_to_agent.take(),
-                            no_host_authentication_for_localhost: no_host_authentication_for_localhost.take(),
-                            enable_ssh_keysign: enable_ssh_keysign.take(),
-                            verify_host_key_dns: verify_host_key_dns.take(),
-                        });
+                             no_host_authentication_for_localhost: no_host_authentication_for_localhost.take(),
+                             enable_ssh_keysign: enable_ssh_keysign.take(),
+                             verify_host_key_dns: verify_host_key_dns.take(),
+                             address_family: address_family.take(),
+                             escape_char: escape_char.take(),
+                             subsystem: subsystem.take(),
+                         });
                     }
                     current_host = Some(value.to_string());
                 }
@@ -317,6 +355,7 @@ impl SshConfig {
                 "stricthostkeychecking" | "strict_host_key_checking" => {
                     strict_host_key_checking = Some(value.to_string())
                 }
+                "hashknownhosts" | "hash_known_hosts" => hash_known_hosts = Some(yes(value)),
                 "userknownhostsfile" | "user_known_hosts_file" => {
                     user_known_hosts_file = Some(value.to_string())
                 }
@@ -343,6 +382,7 @@ impl SshConfig {
                 "setenv" | "set_env" => for tok in value.split_whitespace() { push_list(&mut set_env, tok); },
                 "proxyjump" | "proxy_jump" => proxy_jump = Some(value.to_string()),
                 "proxycommand" | "proxy_command" => proxy_command = Some(value.to_string()),
+                "bindaddress" | "bind_address" => bind_address = Some(value.to_string()),
                 "localforward" | "local_forward" => {
                     local_forward.get_or_insert_with(Vec::new).push(value.to_string());
                 }
@@ -360,6 +400,9 @@ impl SshConfig {
                 }
                 "enablesshkeysign" | "enable_ssh_keysign" => enable_ssh_keysign = Some(yes(value)),
                 "verifyhostkeydns" | "verify_host_key_dns" => verify_host_key_dns = Some(value.to_string()),
+                "addressfamily" | "address_family" => address_family = Some(value.to_string()),
+                "escapechar" | "escape_char" => escape_char = Some(value.to_string()),
+                "subsystem" => subsystem = Some(value.to_string()),
                 "include" => { /* ignored */ }
                 _ => {}
             }
@@ -377,6 +420,7 @@ impl SshConfig {
                 forward_x11,
                 compression,
                 strict_host_key_checking,
+                hash_known_hosts,
                 user_known_hosts_file,
                 global_known_hosts_file,
                 connect_timeout,
@@ -398,6 +442,7 @@ impl SshConfig {
                 set_env,
                 proxy_jump,
                 proxy_command,
+                bind_address,
                 local_forward,
                 remote_forward,
                 dynamic_forward,
@@ -407,6 +452,9 @@ impl SshConfig {
                 no_host_authentication_for_localhost,
                 enable_ssh_keysign,
                 verify_host_key_dns,
+                address_family,
+                escape_char,
+                subsystem,
             });
         }
 
@@ -465,4 +513,13 @@ pub fn parse_forward_spec(spec: &str) -> Option<(u16, String, u16)> {
         }
         _ => None,
     }
+}
+
+pub fn parse_stdio_forward(spec: &str) -> Result<(String, u16), String> {
+    let (host, port) = spec.rsplit_once(':').ok_or_else(|| format!("invalid stdio forward: {}", spec))?;
+    let port: u16 = port.parse().map_err(|_| format!("invalid port: {}", port))?;
+    if host.is_empty() {
+        return Err("empty host in stdio forward".to_string());
+    }
+    Ok((host.to_string(), port))
 }

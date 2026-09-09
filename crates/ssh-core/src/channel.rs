@@ -13,7 +13,7 @@ pub struct Channel {
     pub channel_type: String,
     pub window_size: u32,
     pub max_packet_size: u32,
-    pub data_tx: mpsc::Sender<Vec<u8>>,
+    pub data_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub data_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pub ext_data_tx: Option<mpsc::Sender<(u32, Vec<u8>)>>,
     pub ext_data_rx: Option<mpsc::Receiver<(u32, Vec<u8>)>>,
@@ -62,7 +62,7 @@ impl ChannelManager {
             channel_type: channel_type.to_string(),
             window_size,
             max_packet_size,
-            data_tx,
+            data_tx: Some(data_tx),
             data_rx: Some(data_rx),
             ext_data_tx: ext_tx,
             ext_data_rx: ext_rx,
@@ -118,7 +118,7 @@ impl ChannelManager {
 pub fn build_channel_open(channel_type: &str, sender_channel: ChannelId, window_size: u32, max_packet_size: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(channel_type).0);
+    SshString::new(channel_type).encode(&mut payload).unwrap();
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
@@ -149,8 +149,8 @@ pub fn build_channel_open_failure(
     payload.push(msg::SSH_MSG_CHANNEL_OPEN_FAILURE);
     payload.extend(recipient_channel.to_be_bytes());
     payload.extend(reason.to_be_bytes());
-    payload.extend(SshString::new(message).0);
-    payload.extend(SshString::new("").0);
+    SshString::new(message).encode(&mut payload).unwrap();
+    SshString::new("").encode(&mut payload).unwrap();
     payload
 }
 
@@ -158,7 +158,7 @@ pub fn build_channel_data(channel_id: ChannelId, data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_DATA);
     payload.extend(channel_id.to_be_bytes());
-    payload.extend(SshBytes(data.to_vec()).0);
+    SshBytes(data.to_vec()).encode(&mut payload).unwrap();
     payload
 }
 
@@ -167,7 +167,7 @@ pub fn build_channel_extended_data(channel_id: ChannelId, data_type: u32, data: 
     payload.push(msg::SSH_MSG_CHANNEL_EXTENDED_DATA);
     payload.extend(channel_id.to_be_bytes());
     payload.extend(data_type.to_be_bytes());
-    payload.extend(SshBytes(data.to_vec()).0);
+    SshBytes(data.to_vec()).encode(&mut payload).unwrap();
     payload
 }
 
@@ -202,7 +202,7 @@ pub fn build_channel_request(
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_REQUEST);
     payload.extend(channel_id.to_be_bytes());
-    payload.extend(SshString::new(request_type).0);
+    SshString::new(request_type).encode(&mut payload).unwrap();
     payload.push(want_reply as u8);
     if let Some(data) = extra {
         payload.extend_from_slice(data);
@@ -219,7 +219,7 @@ pub fn build_pty_request(
     modes: &[(u8, u32)],
 ) -> Vec<u8> {
     let mut data = Vec::new();
-    data.extend(SshString::new(term).0);
+    SshString::new(term).encode(&mut data).unwrap();
     data.extend(width.to_be_bytes());
     data.extend(height.to_be_bytes());
     data.extend(pixel_width.to_be_bytes());
@@ -231,13 +231,15 @@ pub fn build_pty_request(
         mode_str.extend(value.to_be_bytes());
     }
     mode_str.push(0); // TTY_OP_END
-    data.extend(SshBytes(mode_str).0);
+    SshBytes(mode_str).encode(&mut data).unwrap();
 
     data
 }
 
 pub fn build_exec_request(command: &str) -> Vec<u8> {
-    SshString::new(command).0
+    let mut data = Vec::new();
+    SshString::new(command).encode(&mut data).unwrap();
+    data
 }
 
 pub fn build_shell_request() -> Vec<u8> {
@@ -245,13 +247,15 @@ pub fn build_shell_request() -> Vec<u8> {
 }
 
 pub fn build_subsystem_request(subsystem: &str) -> Vec<u8> {
-    SshString::new(subsystem).0
+    let mut data = Vec::new();
+    SshString::new(subsystem).encode(&mut data).unwrap();
+    data
 }
 
 pub fn build_env_request(name: &str, value: &str) -> Vec<u8> {
     let mut data = Vec::new();
-    data.extend(SshString::new(name).0);
-    data.extend(SshString::new(value).0);
+    SshString::new(name).encode(&mut data).unwrap();
+    SshString::new(value).encode(&mut data).unwrap();
     data
 }
 
@@ -265,7 +269,9 @@ pub fn build_window_change(width: u32, height: u32, pixel_width: u32, pixel_heig
 }
 
 pub fn build_signal_request(signal_name: &str) -> Vec<u8> {
-    SshString::new(signal_name).0
+    let mut data = Vec::new();
+    SshString::new(signal_name).encode(&mut data).unwrap();
+    data
 }
 
 pub fn parse_channel_open(payload: &[u8]) -> Result<(String, ChannelId, u32, u32)> {
@@ -320,13 +326,13 @@ pub fn build_direct_tcpip_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_DIRECT_TCPIP).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_DIRECT_TCPIP));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
-    payload.extend(SshString::new(host_to_connect).0);
+    payload.extend(encode_string(host_to_connect));
     payload.extend(port_to_connect.to_be_bytes());
-    payload.extend(SshString::new(originator_ip).0);
+    payload.extend(encode_string(originator_ip));
     payload.extend(originator_port.to_be_bytes());
     payload
 }
@@ -355,13 +361,13 @@ pub fn build_forwarded_tcpip_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
-    payload.extend(SshString::new(address_connected).0);
+    payload.extend(encode_string(address_connected));
     payload.extend(port_connected.to_be_bytes());
-    payload.extend(SshString::new(originator_ip).0);
+    payload.extend(encode_string(originator_ip));
     payload.extend(originator_port.to_be_bytes());
     payload
 }
@@ -388,11 +394,11 @@ pub fn build_x11_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_X11).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_X11));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
-    payload.extend(SshString::new(originator_address).0);
+    payload.extend(encode_string(originator_address));
     payload.extend(originator_port.to_be_bytes());
     payload
 }
@@ -405,11 +411,11 @@ pub fn build_direct_streamlocal_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_DIRECT_STREAMLOCAL).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_DIRECT_STREAMLOCAL));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
-    payload.extend(SshString::new(socket_path).0);
+    payload.extend(encode_string(socket_path));
     payload
 }
 
@@ -421,11 +427,11 @@ pub fn build_forwarded_streamlocal_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_FORWARDED_STREAMLOCAL).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_FORWARDED_STREAMLOCAL));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
-    payload.extend(SshString::new(socket_path).0);
+    payload.extend(encode_string(socket_path));
     payload
 }
 
@@ -436,7 +442,7 @@ pub fn build_auth_agent_open(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_CHANNEL_OPEN);
-    payload.extend(SshString::new(msg::SSH_CHANNEL_TYPE_AUTH_AGENT).0);
+    payload.extend(encode_string(msg::SSH_CHANNEL_TYPE_AUTH_AGENT));
     payload.extend(sender_channel.to_be_bytes());
     payload.extend(window_size.to_be_bytes());
     payload.extend(max_packet_size.to_be_bytes());
@@ -450,9 +456,9 @@ pub fn build_global_request_tcpip_forward(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_GLOBAL_REQUEST);
-    payload.extend(SshString::new(msg::SSH_GLOBAL_REQUEST_TCPIP_FORWARD).0);
+    payload.extend(encode_string(msg::SSH_GLOBAL_REQUEST_TCPIP_FORWARD));
     payload.push(want_reply as u8);
-    payload.extend(SshString::new(address_to_bind).0);
+    payload.extend(encode_string(address_to_bind));
     payload.extend(port_to_bind.to_be_bytes());
     payload
 }
@@ -464,9 +470,9 @@ pub fn build_global_request_cancel_tcpip_forward(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_GLOBAL_REQUEST);
-    payload.extend(SshString::new(msg::SSH_GLOBAL_REQUEST_CANCEL_TCPIP_FORWARD).0);
+    payload.extend(encode_string(msg::SSH_GLOBAL_REQUEST_CANCEL_TCPIP_FORWARD));
     payload.push(want_reply as u8);
-    payload.extend(SshString::new(address_to_bind).0);
+    payload.extend(encode_string(address_to_bind));
     payload.extend(port_to_bind.to_be_bytes());
     payload
 }
@@ -477,16 +483,16 @@ pub fn build_global_request_streamlocal_forward(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_GLOBAL_REQUEST);
-    payload.extend(SshString::new(msg::SSH_GLOBAL_REQUEST_STREAMLOCAL_FORWARD).0);
+    payload.extend(encode_string(msg::SSH_GLOBAL_REQUEST_STREAMLOCAL_FORWARD));
     payload.push(want_reply as u8);
-    payload.extend(SshString::new(socket_path).0);
+    payload.extend(encode_string(socket_path));
     payload
 }
 
 pub fn build_global_request_keepalive(want_reply: bool) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_GLOBAL_REQUEST);
-    payload.extend(SshString::new(msg::SSH_GLOBAL_REQUEST_KEEPALIVE).0);
+    payload.extend(encode_string(msg::SSH_GLOBAL_REQUEST_KEEPALIVE));
     payload.push(want_reply as u8);
     payload
 }
@@ -494,7 +500,7 @@ pub fn build_global_request_keepalive(want_reply: bool) -> Vec<u8> {
 pub fn build_global_request_no_more_sessions(want_reply: bool) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_GLOBAL_REQUEST);
-    payload.extend(SshString::new(msg::SSH_GLOBAL_REQUEST_NO_MORE_SESSIONS).0);
+    payload.extend(encode_string(msg::SSH_GLOBAL_REQUEST_NO_MORE_SESSIONS));
     payload.push(want_reply as u8);
     payload
 }
@@ -527,6 +533,13 @@ pub fn build_request_failure() -> Vec<u8> {
     vec![msg::SSH_MSG_REQUEST_FAILURE]
 }
 
+pub fn build_unimplemented(sequence: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(5);
+    payload.push(msg::SSH_MSG_UNIMPLEMENTED);
+    sequence.encode(&mut payload);
+    payload
+}
+
 pub fn build_x11_request(
     single_connection: bool,
     x11_auth_protocol: &str,
@@ -535,8 +548,8 @@ pub fn build_x11_request(
 ) -> Vec<u8> {
     let mut data = Vec::new();
     data.push(single_connection as u8);
-    data.extend(SshString::new(x11_auth_protocol).0);
-    data.extend(SshString::new(x11_auth_cookie).0);
+    data.extend(encode_string(x11_auth_protocol));
+    data.extend(encode_string(x11_auth_cookie));
     data.extend(x11_screen_number.to_be_bytes());
     data
 }
@@ -559,8 +572,8 @@ pub fn build_disconnect(reason_code: u32, description: &str, language: &str) -> 
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_DISCONNECT);
     payload.extend(reason_code.to_be_bytes());
-    payload.extend(SshString::new(description).0);
-    payload.extend(SshString::new(language).0);
+    SshString::new(description).encode(&mut payload).unwrap();
+    SshString::new(language).encode(&mut payload).unwrap();
     payload
 }
 
@@ -569,8 +582,8 @@ pub fn build_ext_info(entries: &[(String, String)]) -> Vec<u8> {
     payload.push(msg::SSH_MSG_EXT_INFO);
     payload.extend((entries.len() as u32).to_be_bytes());
     for (k, v) in entries {
-        payload.extend(SshString::new(k).0);
-        payload.extend(SshString::new(v).0);
+        SshString::new(k).encode(&mut payload).unwrap();
+        SshString::new(v).encode(&mut payload).unwrap();
     }
     payload
 }

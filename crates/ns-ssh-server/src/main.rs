@@ -97,7 +97,9 @@ fn main() {
                     config.pubkey_auth = value == "yes";
                 }
                 "permitrootlogin" | "permit_root_login" => {
-                    config.permit_root_login = value == "yes";
+                    let v = value.to_lowercase();
+                    config.permit_root_login_mode = v.clone();
+                    config.permit_root_login = v == "yes";
                 }
                 "authorizedkeysfile" | "authorized_keys_file" => {
                     config.authorized_keys_files.push(value.to_string());
@@ -165,8 +167,26 @@ fn main() {
                 "acceptenv" | "accept_env" => {
                     config.accept_env.push(value.to_string());
                 }
+                "allowtcpforwarding" | "allow_tcp_forwarding" => {
+                    config.allow_tcp_forwarding_mode = value.to_lowercase();
+                }
+                "permitopen" | "permit_open" => {
+                    config.permit_open.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
+                }
+                "permitlisten" | "permit_listen" => {
+                    config.permit_listen.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
+                }
+                "gatewayports" | "gateway_ports" => {
+                    config.gateway_ports = value.to_lowercase();
+                }
                 _ => {}
             }
+        }
+
+        if args.gateway_ports && config.gateway_ports != "no" {
+            // -g is a no-op unless the config already allows remote forwards;
+            // when set, permit binding to all interfaces like "yes".
+            config.gateway_ports = "yes".to_string();
         }
     }
 

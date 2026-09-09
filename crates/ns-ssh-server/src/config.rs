@@ -26,6 +26,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub permit_root_login: bool,
 
+    /// Raw PermitRootLogin value: yes/no/without-password/forced-commands-only/prohibit-password.
+    #[serde(default)]
+    pub permit_root_login_mode: String,
+
     #[serde(default)]
     pub authorized_keys_files: Vec<String>,
 
@@ -82,6 +86,22 @@ pub struct ServerConfig {
 
     #[serde(default = "default_x11_display_offset")]
     pub x11_display_offset: u32,
+
+    /// AllowTcpForwarding value: yes/no/local/remote/all.
+    #[serde(default = "default_forwarding_mode")]
+    pub allow_tcp_forwarding_mode: String,
+
+    /// PermitOpen: "any" or a list of "host:port" (port 0 = any port).
+    #[serde(default)]
+    pub permit_open: Vec<String>,
+
+    /// PermitListen: "any" or a list of "host:port" bind addresses.
+    #[serde(default)]
+    pub permit_listen: Vec<String>,
+
+    /// GatewayPorts: yes/no/clientspecified.
+    #[serde(default)]
+    pub gateway_ports: String,
 }
 
 fn default_port() -> u16 { 22 }
@@ -104,6 +124,8 @@ fn default_accept_env() -> Vec<String> {
 
 fn default_x11_display_offset() -> u32 { 10 }
 
+fn default_forwarding_mode() -> String { "yes".to_string() }
+
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
@@ -118,6 +140,7 @@ impl Default for ServerConfig {
             kbd_interactive_auth: default_true(),
             pubkey_auth: default_true(),
             permit_root_login: false,
+            permit_root_login_mode: "no".to_string(),
             authorized_keys_files: vec![
                 "~/.ssh/authorized_keys".to_string(),
                 "~/.ssh/authorized_keys2".to_string(),
@@ -144,6 +167,10 @@ impl Default for ServerConfig {
             allow_agent_forwarding: default_true(),
             x11_forwarding: false,
             x11_display_offset: default_x11_display_offset(),
+            allow_tcp_forwarding_mode: default_forwarding_mode(),
+            permit_open: Vec::new(),
+            permit_listen: Vec::new(),
+            gateway_ports: "no".to_string(),
         }
     }
 }
@@ -207,7 +234,9 @@ impl ServerConfig {
                     config.pubkey_auth = value == "yes";
                 }
                 "permitrootlogin" | "permit_root_login" => {
-                    config.permit_root_login = value == "yes";
+                    let v = value.to_lowercase();
+                    config.permit_root_login_mode = v.clone();
+                    config.permit_root_login = v == "yes";
                 }
                 "authorizedkeysfile" | "authorized_keys_file" => {
                     config.authorized_keys_files.push(value.to_string());
@@ -240,6 +269,26 @@ impl ServerConfig {
                 }
                 "usedns" | "use_dns" => {
                     config.use_dns = value == "yes";
+                }
+                "allowtcpforwarding" | "allow_tcp_forwarding" => {
+                    config.allow_tcp_forwarding_mode = value.to_lowercase();
+                }
+                "x11forwarding" | "x11_forwarding" => {
+                    config.x11_forwarding = value == "yes";
+                }
+                "x11displayoffset" | "x11_display_offset" => {
+                    if let Ok(n) = value.parse() {
+                        config.x11_display_offset = n;
+                    }
+                }
+                "permitopen" | "permit_open" => {
+                    config.permit_open.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
+                }
+                "permitlisten" | "permit_listen" => {
+                    config.permit_listen.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
+                }
+                "gatewayports" | "gateway_ports" => {
+                    config.gateway_ports = value.to_lowercase();
                 }
                 "subsystem" => {
                     let mut sub_parts = value.splitn(2, |c: char| c.is_whitespace());

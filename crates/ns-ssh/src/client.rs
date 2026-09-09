@@ -19,6 +19,47 @@ pub trait IoStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> IoStream for T {}
 pub type BoxedStream = Pin<Box<dyn IoStream>>;
 
+#[cfg(unix)]
+fn terminal_size() -> std::io::Result<(u32, u32)> {
+    use std::os::unix::io::AsRawFd;
+    let winsize: libc::winsize = unsafe { std::mem::zeroed() };
+    let mut ws = winsize;
+    let r = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if ws.ws_col == 0 || ws.ws_row == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "no tty size"));
+    }
+    Ok((ws.ws_col as u32, ws.ws_row as u32))
+}
+
+#[cfg(not(unix))]
+fn terminal_size() -> std::io::Result<(u32, u32)> {
+    Err(std::io::Error::new(std::io::ErrorKind::Other, "no tty size"))
+}
+
+fn env_pattern_match(name: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    if !name.starts_with(first) {
+        return false;
+    }
+    let mut rest = name[first.len()..].to_string();
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(idx) => {
+                rest = rest[idx + part.len()..].to_string();
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 pub struct SshClient {
     pub config: ResolvedConfig,
     pub stream: Option<BoxedStream>,
@@ -52,6 +93,14 @@ impl SshClient {
         let target_host = self.config.hostname.clone();
         let target_port = self.config.port;
 
+        if let Some(ref pc) = self.config.proxy_command.clone() {
+            if !pc.is_empty() && pc != "none" {
+                let stream = connect_proxy_command(&self.config, pc, &target_host, target_port)?;
+                self.stream = Some(stream);
+                return Ok(());
+            }
+        }
+
         if let Some(ref proxy_spec) = self.config.proxy_jump.clone() {
             if !proxy_spec.is_empty() && proxy_spec != "none" {
                 let stream = connect_via_proxy_jump(
@@ -72,8 +121,18 @@ impl SshClient {
         let target_host = self.config.hostname.clone();
         let target_port = self.config.port;
         let addr = format!("{}:{}", target_host, target_port);
-        let stream = TcpStream::connect(&addr).await
-            .map_err(SshError::Io)?;
+        let stream = if let Some(bind) = self.config.bind_address.clone() {
+            let socket = tokio::net::TcpSocket::new_v4().map_err(SshError::Io)?;
+            let bind_addr = format!("{}:0", bind);
+            let bind_addr: std::net::SocketAddr = bind_addr.parse().map_err(|_| SshError::Protocol("invalid BindAddress".into()))?;
+            socket.bind(bind_addr).map_err(SshError::Io)?;
+            let target_addr = tokio::net::lookup_host(addr.as_str()).await
+                .map_err(SshError::Io)?
+                .next().ok_or_else(|| SshError::Protocol("cannot resolve target".into()))?;
+            socket.connect(target_addr).await.map_err(SshError::Io)?
+        } else {
+            TcpStream::connect(&addr).await.map_err(SshError::Io)?
+        };
         self.stream = Some(Box::pin(stream));
         Ok(())
     }
@@ -87,7 +146,12 @@ impl SshClient {
         let server_version = read_version_string(stream).await?;
         self.transport.server_version = server_version;
 
-        let kex_init = self.transport.build_kex_init();
+        let kex_init = self.transport.build_kex_init(
+            self.config.host_key_algorithms.as_deref(),
+            self.config.kex_algorithms.as_deref(),
+            self.config.ciphers.as_deref(),
+            self.config.macs.as_deref(),
+        );
         send_raw_packet(stream, &kex_init).await?;
         self.transport.state = KexState::KexInitSent;
 
@@ -175,7 +239,7 @@ impl SshClient {
             kex.generate_keypair()?;
             let mut dh_payload = Vec::new();
             dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-            dh_payload.extend(SshBytes(kex.public_key_bytes()).0);
+            SshBytes(kex.public_key_bytes()).encode(&mut dh_payload)?;
             send_raw_packet(stream, &dh_payload).await?;
             self.transport.state = KexState::KexDhInitSent;
 
@@ -213,14 +277,19 @@ impl SshClient {
 
         let mut r2 = &server_host_key_blob[..];
         let host_key_type = SshString::decode(&mut r2)?.as_str()?.to_string();
-        let host_key_bytes = SshBytes::decode(&mut r2)?.0;
+        let host_key_bytes = if host_key_type.starts_with("ecdsa-") {
+            let _curve = SshString::decode(&mut r2)?;
+            SshBytes::decode(&mut r2)?.0
+        } else {
+            SshBytes::decode(&mut r2)?.0
+        };
 
         let known_hosts = KnownHosts::new(KnownHosts::default_client_path());
         let status = known_hosts.check(
             &self.config.hostname,
             self.config.port,
             &host_key_type,
-            &host_key_bytes,
+            &server_host_key_blob,
         );
 
         match status {
@@ -236,7 +305,7 @@ impl SshClient {
                     &self.config.hostname,
                     self.config.port,
                     &host_key_type,
-                    &host_key_bytes,
+                    &server_host_key_blob,
                 )?;
             }
             HostKeyStatus::Changed => {
@@ -258,10 +327,13 @@ impl SshClient {
                 let verifier = EcdsaP256HostKey::from_public_bytes(&host_key_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
-            "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
-                // Fall through: try generic ECDSA not yet fully supported, skip verify
-                eprintln!("Warning: {} hostkey verify not implemented, skipping", host_key_type);
-                true
+            "ecdsa-sha2-nistp384" => {
+                let verifier = EcdsaP384HostKey::from_public_bytes(&host_key_bytes)?;
+                HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
+            }
+            "ecdsa-sha2-nistp521" => {
+                let verifier = EcdsaP521HostKey::from_public_bytes(&host_key_bytes)?;
+                HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
                 let verifier = RsaHostKey::from_public_bytes(&host_key_bytes)?;
@@ -315,10 +387,8 @@ impl SshClient {
         let aead = self.is_aead();
         let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
 
-        let svc_request = vec![msg::SSH_MSG_SERVICE_REQUEST]
-            .into_iter()
-            .chain(SshString::new(msg::SSH_SERVICE_NAME_USERAUTH).0)
-            .collect::<Vec<u8>>();
+        let mut svc_request = vec![msg::SSH_MSG_SERVICE_REQUEST];
+        SshString::new(msg::SSH_SERVICE_NAME_USERAUTH).encode(&mut svc_request)?;
         send_encrypted_packet(stream, &svc_request, &mut self.transport, false, aead).await?;
 
         let svc_accept = loop {
@@ -357,7 +427,35 @@ impl SshClient {
         let username = self.config.user.clone();
         let mut auth_succeeded = false;
 
-        let identity_files = crate::agent::get_identity_files();
+        let mut method_order: Vec<String> = Vec::new();
+        if let Some(pref) = &self.config.preferred_authentications {
+            for m in pref {
+                let ok = match m.as_str() {
+                    "publickey" => self.config.pubkey_authentication,
+                    "keyboard-interactive" => self.config.kbd_interactive_authentication,
+                    "password" => self.config.password_authentication,
+                    _ => false,
+                };
+                if ok && !method_order.contains(m) {
+                    method_order.push(m.clone());
+                }
+            }
+            if method_order.is_empty() {
+                return Err(SshError::AuthFailed("no authentication methods enabled".into()));
+            }
+        } else {
+            if self.config.pubkey_authentication { method_order.push("publickey".into()); }
+            if self.config.kbd_interactive_authentication { method_order.push("keyboard-interactive".into()); }
+            if self.config.password_authentication { method_order.push("password".into()); }
+        }
+
+        let mut identity_files: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(id) = &self.config.identity_file {
+            identity_files.push(id.clone());
+        }
+        if !self.config.identities_only {
+            identity_files.extend(crate::agent::get_identity_files());
+        }
         for key_path in &identity_files {
             match crate::agent::load_private_key(key_path) {
                 Ok(signer) => {
@@ -367,126 +465,124 @@ impl SshClient {
             }
         }
 
-        for i in 0..self.loaded_signers.len() {
-            let method = AuthMethod::PublicKey(self.loaded_signers[i].clone());
-            let auth_msg = build_userauth_request_with_session(
-                &username,
-                msg::SSH_SERVICE_NAME_CONNECTION,
-                &method,
-                &session_id,
-            );
-            send_encrypted_packet(stream, &auth_msg, &mut self.transport, false, aead).await?;
+        let has_sig_algs = !self.server_sig_algs.is_empty();
 
-            let response = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-            match response.first() {
-                Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
-                    auth_succeeded = true;
-                    break;
-                }
-                Some(&msg::SSH_MSG_USERAUTH_PK_OK) => {
-                    let method2 = AuthMethod::PublicKey(self.loaded_signers[i].clone());
-                    let auth_msg2 = build_userauth_request_with_session(
-                        &username,
-                        msg::SSH_SERVICE_NAME_CONNECTION,
-                        &method2,
-                        &session_id,
-                    );
-                    send_encrypted_packet(stream, &auth_msg2, &mut self.transport, false, aead).await?;
-                    let resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-                    if resp.first() == Some(&msg::SSH_MSG_USERAUTH_SUCCESS) {
-                        auth_succeeded = true;
-                        break;
-                    }
-                }
-                _ => continue,
-            }
-        }
-
-        if !auth_succeeded {
-            let none_method = AuthMethod::None;
-            let auth_msg = build_userauth_request_with_session(
-                &username,
-                msg::SSH_SERVICE_NAME_CONNECTION,
-                &none_method,
-                &session_id,
-            );
-            send_encrypted_packet(stream, &auth_msg, &mut self.transport, false, aead).await?;
-
-            let response = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-            match response.first() {
-                Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
-                    auth_succeeded = true;
-                }
-                Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
-                    let methods = parse_userauth_failure(&response)?;
-
-                    if !auth_succeeded && methods.iter().any(|m| m == "keyboard-interactive") {
-                        let kbd_method = AuthMethod::KeyboardInteractive(Vec::new());
-                        let kbd_msg = build_userauth_request_with_session(
+        for method in &method_order {
+            match method.as_str() {
+                "publickey" => {
+                    for i in 0..self.loaded_signers.len() {
+                        let alg = self.loaded_signers[i].algorithm_name().to_string();
+                        if has_sig_algs && !self.server_sig_algs.iter().any(|a| a == &alg) {
+                            continue;
+                        }
+                        let method = AuthMethod::PublicKey(self.loaded_signers[i].clone());
+                        let auth_msg = build_userauth_request_with_session(
                             &username,
                             msg::SSH_SERVICE_NAME_CONNECTION,
-                            &kbd_method,
+                            &method,
                             &session_id,
                         );
-                        send_encrypted_packet(stream, &kbd_msg, &mut self.transport, false, aead).await?;
+                        send_encrypted_packet(stream, &auth_msg, &mut self.transport, false, aead).await?;
 
-                        let mut kbd_tries = 0;
-                        while kbd_tries < 3 {
-                            let kbd_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-                            match kbd_resp.first() {
-                                Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
+                        let response = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                        match response.first() {
+                            Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
+                                auth_succeeded = true;
+                                break;
+                            }
+                            Some(&msg::SSH_MSG_USERAUTH_PK_OK) => {
+                                let method2 = AuthMethod::PublicKey(self.loaded_signers[i].clone());
+                                let auth_msg2 = build_userauth_request_with_session(
+                                    &username,
+                                    msg::SSH_SERVICE_NAME_CONNECTION,
+                                    &method2,
+                                    &session_id,
+                                );
+                                send_encrypted_packet(stream, &auth_msg2, &mut self.transport, false, aead).await?;
+                                let resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                                if resp.first() == Some(&msg::SSH_MSG_USERAUTH_SUCCESS) {
                                     auth_succeeded = true;
                                     break;
                                 }
-                                Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
-                                    break;
-                                }
-                                Some(&msg::SSH_MSG_USERAUTH_INFO_REQUEST) => {
-                                    let prompts = parse_userauth_info_request(&kbd_resp)?;
-                                    let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
-                                    for (prompt, _ans, echo, _) in prompts {
-                                        eprint!("{}", prompt);
-                                        use std::io::Write;
-                                        let _ = std::io::stderr().flush();
-                                        let mut line = String::new();
-                                        std::io::stdin().read_line(&mut line)
-                                            .map_err(|e| SshError::Io(e))?;
-                                        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
-                                        let _ = echo;
-                                        answers.push(line);
-                                    }
-                                    let resp_msg = build_userauth_info_response(&answers);
-                                    send_encrypted_packet(stream, &resp_msg, &mut self.transport, false, aead).await?;
-                                }
-                                _ => break,
                             }
-                            kbd_tries += 1;
+                            _ => continue,
                         }
                     }
-
-                    if !auth_succeeded && methods.iter().any(|m| m == "password") {
-                        eprint!("{}@{}'s password: ", self.config.user, self.config.hostname);
-                        use std::io::Write;
-                        let _ = std::io::stderr().flush();
-                        let mut password = String::new();
-                        std::io::stdin().read_line(&mut password)
-                            .map_err(|e| SshError::Io(e))?;
-                        let password = password.trim_end().to_string();
-
-                        let pwd_method = AuthMethod::Password(password);
-                        let pwd_msg = build_userauth_request_with_session(
-                            &username,
-                            msg::SSH_SERVICE_NAME_CONNECTION,
-                            &pwd_method,
-                            &session_id,
-                        );
-                        send_encrypted_packet(stream, &pwd_msg, &mut self.transport, false, aead).await?;
-
-                        let pwd_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-                        if pwd_resp.first() == Some(&msg::SSH_MSG_USERAUTH_SUCCESS) {
-                            auth_succeeded = true;
-                        }
+                    if auth_succeeded { break; }
+                }
+                "keyboard-interactive" => {
+                    if self.config.batch_mode {
+                        continue;
                     }
+                    let kbd_method = AuthMethod::KeyboardInteractive(Vec::new());
+                    let kbd_msg = build_userauth_request_with_session(
+                        &username,
+                        msg::SSH_SERVICE_NAME_CONNECTION,
+                        &kbd_method,
+                        &session_id,
+                    );
+                    send_encrypted_packet(stream, &kbd_msg, &mut self.transport, false, aead).await?;
+
+                    let mut kbd_tries = 0;
+                    while kbd_tries < 3 {
+                        let kbd_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                        match kbd_resp.first() {
+                            Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
+                                auth_succeeded = true;
+                                break;
+                            }
+                            Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
+                                break;
+                            }
+                            Some(&msg::SSH_MSG_USERAUTH_INFO_REQUEST) => {
+                                let prompts = parse_userauth_info_request(&kbd_resp)?;
+                                let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
+                                for (prompt, _ans, echo, _) in prompts {
+                                    eprint!("{}", prompt);
+                                    use std::io::Write;
+                                    let _ = std::io::stderr().flush();
+                                    let mut line = String::new();
+                                    std::io::stdin().read_line(&mut line)
+                                        .map_err(|e| SshError::Io(e))?;
+                                    let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                                    let _ = echo;
+                                    answers.push(line);
+                                }
+                                let resp_msg = build_userauth_info_response(&answers);
+                                send_encrypted_packet(stream, &resp_msg, &mut self.transport, false, aead).await?;
+                            }
+                            _ => break,
+                        }
+                        kbd_tries += 1;
+                    }
+                    if auth_succeeded { break; }
+                }
+                "password" => {
+                    if self.config.batch_mode {
+                        continue;
+                    }
+                    eprint!("{}@{}'s password: ", self.config.user, self.config.hostname);
+                    use std::io::Write;
+                    let _ = std::io::stderr().flush();
+                    let mut password = String::new();
+                    std::io::stdin().read_line(&mut password)
+                        .map_err(|e| SshError::Io(e))?;
+                    let password = password.trim_end().to_string();
+
+                    let pwd_method = AuthMethod::Password(password);
+                    let pwd_msg = build_userauth_request_with_session(
+                        &username,
+                        msg::SSH_SERVICE_NAME_CONNECTION,
+                        &pwd_method,
+                        &session_id,
+                    );
+                    send_encrypted_packet(stream, &pwd_msg, &mut self.transport, false, aead).await?;
+
+                    let pwd_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                    if pwd_resp.first() == Some(&msg::SSH_MSG_USERAUTH_SUCCESS) {
+                        auth_succeeded = true;
+                    }
+                    if auth_succeeded { break; }
                 }
                 _ => {}
             }
@@ -551,11 +647,52 @@ impl SshClient {
             _ => return Err(SshError::Protocol("unexpected response to channel open".into())),
         }
 
+        if self.config.forward_agent {
+            let req = build_channel_request(local_id, msg::SSH_REQUEST_AUTH_AGENT, false, None);
+            send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+        }
+
         if pty {
             let pty_data = build_pty_request(term, width, height, width * 8, height * 16, &[]);
             let pty_msg = build_channel_request(local_id, msg::SSH_REQUEST_PTY, true, Some(&pty_data));
             send_encrypted_packet(stream, &pty_msg, &mut self.transport, false, aead).await?;
             let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        }
+
+        if self.config.forward_x11 {
+            let mut cookie = [0u8; 16];
+            let mut seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            for b in cookie.iter_mut() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (seed >> 33) as u8;
+            }
+            let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
+            let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
+            let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
+            send_encrypted_packet(stream, &x11_msg, &mut self.transport, false, aead).await?;
+            let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        }
+
+        for (name, value) in &self.config.set_env {
+            let env_data = build_env_request(name, value);
+            let env_msg = build_channel_request(local_id, msg::SSH_REQUEST_ENV, false, Some(&env_data));
+            send_encrypted_packet(stream, &env_msg, &mut self.transport, false, aead).await?;
+        }
+        if !self.config.send_env.is_empty() {
+            let envs: Vec<(String, String)> = std::env::vars().collect();
+            for pattern in &self.config.send_env {
+                for (name, value) in &envs {
+                    if env_pattern_match(name, pattern) {
+                        let env_data = build_env_request(name, value);
+                        let env_msg = build_channel_request(local_id, msg::SSH_REQUEST_ENV, false, Some(&env_data));
+                        send_encrypted_packet(stream, &env_msg, &mut self.transport, false, aead).await?;
+                    }
+                }
+            }
         }
 
         if let Some(cmd) = command {
@@ -572,6 +709,43 @@ impl SshClient {
         Ok(local_id)
     }
 
+    pub async fn request_session_subsystem(&mut self, subsystem: &str) -> Result<ChannelId> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        let local_id = self.channel_manager.alloc_channel(
+            msg::SSH_CHANNEL_TYPE_SESSION,
+            msg::CHANNEL_PACKET_WINDOW_SIZE,
+            msg::CHANNEL_MAX_PACKET_SIZE,
+        );
+        let open_msg = build_channel_open(
+            msg::SSH_CHANNEL_TYPE_SESSION,
+            local_id,
+            msg::CHANNEL_PACKET_WINDOW_SIZE,
+            msg::CHANNEL_MAX_PACKET_SIZE,
+        );
+        send_encrypted_packet(stream, &open_msg, &mut self.transport, false, aead).await?;
+        let open_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        match open_resp.first() {
+            Some(&msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
+                let (recipient, sender, _w, _m) = parse_channel_open_confirmation(&open_resp)?;
+                if recipient != local_id {
+                    return Err(SshError::Protocol("unexpected recipient in open confirmation".into()));
+                }
+                self.channel_manager.set_remote_id(local_id, sender);
+            }
+            Some(&msg::SSH_MSG_CHANNEL_OPEN_FAILURE) => {
+                let (_, reason, message) = parse_channel_open_failure(&open_resp)?;
+                return Err(SshError::Channel(format!("session open failed: {} ({})", message, reason)));
+            }
+            _ => return Err(SshError::Protocol("unexpected response to channel open".into())),
+        }
+        let sub_data = build_subsystem_request(subsystem);
+        let sub_msg = build_channel_request(local_id, msg::SSH_REQUEST_SUBSYSTEM, true, Some(&sub_data));
+        send_encrypted_packet(stream, &sub_msg, &mut self.transport, false, aead).await?;
+        let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        Ok(local_id)
+    }
+
     pub async fn run_event_loop(
         &mut self,
         session_id: Option<ChannelId>,
@@ -580,22 +754,21 @@ impl SshClient {
         let aead = self.is_aead();
         let mut exit_code: i32 = 0;
         let mut should_exit = false;
+        let mut stdin_active = true;
 
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
             loop {
-                let mut buf = [0u8; 4096];
                 let n = tokio::task::spawn_blocking(move || {
                     use std::io::Read;
-                    std::io::stdin().read(&mut buf)
-                }).await.unwrap_or(Ok(0));
-                match n {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdin_tx.send(buf[..n].to_vec()).is_err() { break; }
+                    let mut buf = [0u8; 4096];
+                    match std::io::stdin().read(&mut buf) {
+                        Ok(n) => (n, buf),
+                        Err(_) => (0, [0u8; 4096]),
                     }
-                    Err(_) => break,
-                }
+                }).await.unwrap_or((0, [0u8; 4096]));
+                if n.0 == 0 { break; }
+                if stdin_tx.send(n.1[..n.0].to_vec()).is_err() { break; }
             }
         });
 
@@ -671,6 +844,53 @@ impl SshClient {
             session_ext_rx = self.channel_manager.take_ext_data_rx(sid);
         }
 
+        // For -W: send direct-tcpip open now, handle confirmation in event loop
+        let mut stdio_forward_channel_id: Option<ChannelId> = None;
+        let mut stdio_forward_remote_id: Option<u32> = None;
+        let mut stdio_forward_pending_data: Vec<Vec<u8>> = Vec::new();
+        let mut stdio_forward_eof_pending = false;
+        if session_id.is_none() {
+            if let Some((ref host, port)) = self.config.stdio_forward {
+                let host = host.clone();
+                let aead = self.is_aead();
+                let local_id = self.channel_manager.alloc_channel(
+                    msg::SSH_CHANNEL_TYPE_DIRECT_TCPIP,
+                    msg::CHANNEL_PACKET_WINDOW_SIZE,
+                    msg::CHANNEL_MAX_PACKET_SIZE,
+                );
+                let msg_bytes = build_direct_tcpip_open(
+                    local_id,
+                    msg::CHANNEL_PACKET_WINDOW_SIZE,
+                    msg::CHANNEL_MAX_PACKET_SIZE,
+                    &host,
+                    port as u32,
+                    "127.0.0.1",
+                    0,
+                );
+                let (tx, _rx) = oneshot::channel();
+                self.pending_open.insert(local_id, tx);
+                let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+                send_encrypted_packet(stream, &msg_bytes, &mut self.transport, false, aead).await?;
+                stdio_forward_channel_id = Some(local_id);
+            }
+        }
+
+        let alive_interval_ms = self.config.server_alive_interval.unwrap_or(0) as u64 * 1000;
+        let alive_max = self.config.server_alive_count_max.unwrap_or(3).max(1) as u32;
+        let mut alive_sleep = if alive_interval_ms > 0 {
+            Some(Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(alive_interval_ms))))
+        } else {
+            None
+        };
+        let mut last_any_packet = std::time::Instant::now();
+        let mut pending_forward_sockets: HashMap<ChannelId, TcpStream> = HashMap::new();
+
+        #[cfg(unix)]
+        let mut winch_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .ok();
+        #[cfg(not(unix))]
+        let winch_sig: Option<tokio::signal::unix::Signal> = None;
+
         loop {
             if should_exit { break; }
 
@@ -687,8 +907,6 @@ impl SshClient {
             tokio::select! {
                 biased;
 
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
-
                 to_ssh = to_ssh_rx.recv() => {
                     if let Some((remote_id, data)) = to_ssh {
                         let msg = build_channel_data(remote_id, &data);
@@ -698,16 +916,38 @@ impl SshClient {
                     }
                 }
 
+                _ = async {
+                    if let Some(ref mut s) = alive_sleep { s.as_mut().await; } else { std::future::pending().await }
+                }, if alive_interval_ms > 0 => {
+                    if last_any_packet.elapsed().as_secs() as u32 >= alive_interval_ms as u32 / 1000 * alive_max {
+                        tracing::warn!("ServerAliveCountMax exceeded, disconnecting");
+                        should_exit = true;
+                    } else {
+                        let _ = self.send_keepalive().await;
+                    }
+                    alive_sleep = Some(Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(alive_interval_ms))));
+                }
+
+                _ = async {
+                    if let Some(ref mut s) = winch_sig { let _ = s.recv().await; } else { std::future::pending().await }
+                }, if winch_sig.is_some() => {
+                    if let Some(sid) = session_id {
+                        if let Ok((w, h)) = terminal_size() {
+                            let _ = self.send_window_change(sid, w, h).await;
+                        }
+                    }
+                }
+
                 ev = accept_rx.recv(), if self.config.local_forwards.len() + self.config.dynamic_forwards.len() > 0 => {
                     match ev {
                         Some(AcceptEvent::Local(idx, local_stream)) => {
                             if idx >= local_meta.len() { continue; }
                             let (ref host, connect_port, bind_port) = local_meta[idx];
-                            if let Ok(chan) = self.open_direct_tcpip(host, connect_port as u32, "127.0.0.1", bind_port as u32).await {
-                                let remote_id = self.channel_manager.get_channel(chan).and_then(|c| c.remote_id).unwrap_or(0);
-                                let rx = self.channel_manager.take_data_rx(chan).unwrap();
-                                pump_socket_with_channel(local_stream, rx, remote_id, to_ssh_tx.clone());
-                            }
+                            let _ = self.open_direct_tcpip_queued(
+                                &mut pending_forward_sockets,
+                                host, connect_port as u32, "127.0.0.1", bind_port as u32,
+                                local_stream, to_ssh_tx.clone(),
+                            ).await;
                         }
                         Some(AcceptEvent::Dynamic(mut local_stream)) => {
                             let mut handshake = [0u8; 2];
@@ -754,20 +994,27 @@ impl SshClient {
                             let reply = [5, 0, 0, 1, 0,0,0,0, 0,0];
                             let _ = local_stream.write_all(&reply).await;
                             tracing::info!("SOCKS5: connect {}:{}", host, port);
-                            if let Ok(chan) = self.open_direct_tcpip(&host, port as u32, "127.0.0.1", 0).await {
-                                let remote_id = self.channel_manager.get_channel(chan).and_then(|c| c.remote_id).unwrap_or(0);
-                                let rx = self.channel_manager.take_data_rx(chan).unwrap();
-                                pump_socket_with_channel(local_stream, rx, remote_id, to_ssh_tx.clone());
-                            }
+                            let _ = self.open_direct_tcpip_queued(
+                                &mut pending_forward_sockets,
+                                &host, port as u32, "127.0.0.1", 0,
+                                local_stream, to_ssh_tx.clone(),
+                            ).await;
                         }
                         None => {}
                     }
                 }
 
-                stdin_data = stdin_rx.recv() => {
+                stdin_data = stdin_rx.recv(), if stdin_active => {
                     match stdin_data {
                         Some(data) => {
-                            if let Some(sid) = session_id {
+                            if let Some(rid) = stdio_forward_remote_id {
+                                let msg = build_channel_data(rid, &data);
+                                if let Some(stream) = self.stream.as_mut() {
+                                    let _ = send_encrypted_packet(stream, &msg, &mut self.transport, false, aead).await;
+                                }
+                            } else if self.config.stdio_forward.is_some() {
+                                stdio_forward_pending_data.push(data);
+                            } else if let Some(sid) = session_id {
                                 if let Some(ch) = self.channel_manager.get_channel(sid) {
                                     if let Some(remote_id) = ch.remote_id {
                                         let msg = build_channel_data(remote_id, &data);
@@ -779,7 +1026,15 @@ impl SshClient {
                             }
                         }
                         None => {
-                            if let Some(sid) = session_id {
+                            stdin_active = false;
+                            if let Some(rid) = stdio_forward_remote_id {
+                                let eof = build_channel_eof(rid);
+                                if let Some(stream) = self.stream.as_mut() {
+                                    let _ = send_encrypted_packet(stream, &eof, &mut self.transport, false, aead).await;
+                                }
+                            } else if self.config.stdio_forward.is_some() {
+                                stdio_forward_eof_pending = true;
+                            } else if let Some(sid) = session_id {
                                 if let Some(ch) = self.channel_manager.get_channel(sid) {
                                     if let Some(remote_id) = ch.remote_id {
                                         let eof = build_channel_eof(remote_id);
@@ -817,14 +1072,23 @@ impl SshClient {
                     let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
                     receive_encrypted_packet(stream, &mut self.transport, false, aead).await
                 } => {
+                    last_any_packet = std::time::Instant::now();
                     match packet {
                         Ok(payload) if !payload.is_empty() => {
                             match payload[0] {
                                 msg::SSH_MSG_CHANNEL_DATA => {
                                     if let Ok((remote_id, data)) = parse_channel_data(&payload) {
+                                        if let Some(rid) = stdio_forward_remote_id {
+                                            if rid == remote_id {
+                                                use std::io::Write;
+                                                let _ = std::io::stdout().write_all(&data);
+                                                let _ = std::io::stdout().flush();
+                                                continue;
+                                            }
+                                        }
                                         if let Some(local_id) = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
                                             if let Some(ch) = self.channel_manager.get_channel(local_id) {
-                                                let _ = ch.data_tx.try_send(data);
+                                                if let Some(tx) = &ch.data_tx { let _ = tx.try_send(data); }
                                             }
                                         }
                                     }
@@ -845,8 +1109,8 @@ impl SshClient {
                                 msg::SSH_MSG_CHANNEL_REQUEST => {
                                     if let Ok((remote_id, req_type, want_reply)) = parse_channel_request(&payload) {
                                         let local_id = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id);
-                                        let mut r = &payload[9..];
                                         if req_type == "exit-status" {
+                                            let mut r = &payload[10 + req_type.len()..];
                                             exit_code = u32::decode(&mut r)? as i32;
                                         }
                                         if want_reply {
@@ -872,12 +1136,38 @@ impl SshClient {
                                             self.channel_manager.set_remote_id(recipient, sender);
                                             let _ = tx.send(Ok((sender, w, m)));
                                         }
+                                        // Handle -W stdio forward confirmation
+                                        if stdio_forward_channel_id == Some(recipient) {
+                                            stdio_forward_remote_id = Some(sender);
+                                            for data in stdio_forward_pending_data.drain(..) {
+                                                let msg = build_channel_data(sender, &data);
+                                                if let Some(stream) = self.stream.as_mut() {
+                                                    let _ = send_encrypted_packet(stream, &msg, &mut self.transport, false, aead).await;
+                                                }
+                                            }
+                                            if stdio_forward_eof_pending {
+                                                let eof = build_channel_eof(sender);
+                                                if let Some(stream) = self.stream.as_mut() {
+                                                    let _ = send_encrypted_packet(stream, &eof, &mut self.transport, false, aead).await;
+                                                }
+                                            }
+                                        }
+                                        if let Some(sock) = pending_forward_sockets.remove(&recipient) {
+                                            if let Some(rx) = self.channel_manager.take_data_rx(recipient) {
+                                                pump_socket_with_channel(sock, rx, sender, to_ssh_tx.clone());
+                                            }
+                                        }
                                     }
                                 }
                                 msg::SSH_MSG_CHANNEL_OPEN_FAILURE => {
                                     if let Ok((recipient, reason, message)) = parse_channel_open_failure(&payload) {
+                                        pending_forward_sockets.remove(&recipient);
                                         if let Some(tx) = self.pending_open.remove(&recipient) {
                                             let _ = tx.send(Err(SshError::Channel(format!("open failed: {} ({})", message, reason))));
+                                        }
+                                        if stdio_forward_channel_id == Some(recipient) {
+                                            eprintln!("ns-ssh: -W direct-tcpip open failed: {} ({})", message, reason);
+                                            should_exit = true;
                                         }
                                     }
                                 }
@@ -887,11 +1177,11 @@ impl SshClient {
                                         Err(_) => continue,
                                     };
                                     if channel_type == msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP {
-                                        let (s, _w, _m, _addr, _p, _orig_ip, orig_port) = match parse_forwarded_tcpip_open(&payload) {
+                                        let (s, _w, _m, _addr, p, _orig_ip, _orig_port) = match parse_forwarded_tcpip_open(&payload) {
                                             Ok(v) => v,
                                             Err(_) => continue,
                                         };
-                                        let bind_port = orig_port as u16;
+                                        let bind_port = p as u16;
                                         let local_target = remote_forward_map.get(&bind_port).cloned();
                                         if let Some((lh, lp)) = local_target {
                                             let local_id = self.channel_manager.alloc_channel(msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
@@ -933,6 +1223,30 @@ impl SshClient {
                                             let rx = self.channel_manager.take_data_rx(local_id).unwrap();
                                             pump_socket_with_channel(sock, rx, sender_channel, to_ssh_tx.clone());
                                         }
+                                    } else if channel_type == msg::SSH_CHANNEL_TYPE_X11 && self.config.forward_x11 {
+                                        let local_id = self.channel_manager.alloc_channel(msg::SSH_CHANNEL_TYPE_X11, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
+                                        self.channel_manager.set_remote_id(local_id, sender_channel);
+                                        let confirm = build_channel_open_confirmation(sender_channel, local_id, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
+                                        if let Some(stream) = self.stream.as_mut() {
+                                            let _ = send_encrypted_packet(stream, &confirm, &mut self.transport, false, aead).await;
+                                        }
+                                        let display = std::env::var("DISPLAY").unwrap_or_default();
+                                        match connect_x11_display(&display).await {
+                                            Ok(socket) => {
+                                                let rx = self.channel_manager.take_data_rx(local_id).unwrap();
+                                                pump_socket_with_channel(socket, rx, sender_channel, to_ssh_tx.clone());
+                                            }
+                                            Err(_) => {
+                                                if let Some(ch) = self.channel_manager.get_channel(local_id) {
+                                                    if let Some(rid) = ch.remote_id {
+                                                        let close = build_channel_close(rid);
+                                                        if let Some(stream) = self.stream.as_mut() {
+                                                            let _ = send_encrypted_packet(stream, &close, &mut self.transport, false, aead).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     } else {
                                         let fail = build_channel_open_failure(sender_channel, 1, "channel type not supported");
                                         if let Some(stream) = self.stream.as_mut() {
@@ -945,6 +1259,13 @@ impl SshClient {
                                         let mut r = &payload[1..];
                                         if let Ok(rid) = u32::decode(&mut r) {
                                             if self.channel_manager.find_by_remote_id(rid).map(|c| c.local_id) == Some(sid) {
+                                                should_exit = true;
+                                            }
+                                        }
+                                    } else if let Some(rid) = stdio_forward_remote_id {
+                                        let mut r = &payload[1..];
+                                        if let Ok(remote_id) = u32::decode(&mut r) {
+                                            if rid == remote_id {
                                                 should_exit = true;
                                             }
                                         }
@@ -963,6 +1284,12 @@ impl SshClient {
                                     if let Some(tx) = self.pending_global.pop_front() {
                                         let _ = tx.send(Err(SshError::Channel("request failure".into())));
                                     }
+                                }
+                                msg::SSH_MSG_UNIMPLEMENTED => {
+                                    if let Some(tx) = self.pending_global.pop_front() {
+                                        let _ = tx.send(Err(SshError::Channel("unimplemented".into())));
+                                    }
+                                    tracing::debug!("server returned SSH_MSG_UNIMPLEMENTED");
                                 }
                                 msg::SSH_MSG_GLOBAL_REQUEST => {
                                     if let Ok((_name, want_reply, _)) = parse_global_request(&payload) {
@@ -985,15 +1312,10 @@ impl SshClient {
         }
 
         if let Some(sid) = session_id {
-            if let Some(ch) = self.channel_manager.get_channel(sid) {
-                if let Some(rid) = ch.remote_id {
-                    let close = build_channel_close(rid);
-                    if let Some(stream) = self.stream.as_mut() {
-                        let _ = send_encrypted_packet(stream, &close, &mut self.transport, false, aead).await;
-                    }
-                }
-            }
+            let _ = self.send_channel_close(sid).await;
         }
+
+        let _ = self.send_disconnect().await;
 
         Ok(exit_code)
     }
@@ -1022,8 +1344,29 @@ impl SshClient {
         }
     }
 
-    pub async fn send_global_request(&mut self, req: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn open_direct_tcpip_queued(
+        &mut self,
+        pending_forward_sockets: &mut HashMap<ChannelId, TcpStream>,
+        host: &str,
+        port: u32,
+        orig_ip: &str,
+        orig_port: u32,
+        socket: TcpStream,
+        to_ssh_tx: tokio::sync::mpsc::UnboundedSender<(ChannelId, Vec<u8>)>,
+    ) -> Result<ChannelId> {
         let aead = self.is_aead();
+        let local_id = self.channel_manager.alloc_channel(msg::SSH_CHANNEL_TYPE_DIRECT_TCPIP, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
+        let msg_bytes = build_direct_tcpip_open(local_id, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE, host, port, orig_ip, orig_port);
+        let (tx, _rx) = oneshot::channel();
+        self.pending_open.insert(local_id, tx);
+        pending_forward_sockets.insert(local_id, socket);
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        send_encrypted_packet(stream, &msg_bytes, &mut self.transport, false, aead).await?;
+        let _ = to_ssh_tx;
+        Ok(local_id)
+    }
+
+    pub async fn send_global_request(&mut self, req: &[u8]) -> Result<Option<Vec<u8>>> {        let aead = self.is_aead();
         let (tx, rx) = oneshot::channel();
         self.pending_global.push_back(tx);
         let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
@@ -1231,6 +1574,23 @@ fn pump_socket_with_channel<S>(
 async fn connect_agent_socket() -> Result<tokio::net::UnixStream> {
     let path = std::env::var("SSH_AUTH_SOCK").map_err(|_| SshError::Protocol("SSH_AUTH_SOCK not set".into()))?;
     tokio::net::UnixStream::connect(path).await.map_err(SshError::Io)
+}
+
+async fn connect_x11_display(display: &str) -> std::io::Result<tokio::net::TcpStream> {
+    let (host, num) = if display.is_empty() {
+        ("localhost".to_string(), 0)
+    } else if let Some(rest) = display.strip_prefix("unix:") {
+        let n: u16 = rest.parse().unwrap_or(0);
+        return tokio::net::TcpStream::connect(format!("127.0.0.1:{}", 6000 + n)).await;
+    } else {
+        let (h, n) = match display.rsplit_once(':') {
+            Some((h, n)) => (h.to_string(), n.split('.').next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)),
+            None => (display.to_string(), 0),
+        };
+        let host = if h.is_empty() { "localhost".to_string() } else { h };
+        (host, n)
+    };
+    tokio::net::TcpStream::connect(format!("{}:{}", host, 6000 + num)).await
 }
 
 fn parse_jump_spec(spec: &str) -> Result<(Option<String>, String, u16)> {
@@ -1567,6 +1927,109 @@ impl<R, W> CombinedStream<R, W> {
     }
 }
 
+struct ProxyStream {
+    child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stdin: tokio::process::ChildStdin,
+}
+
+impl tokio::io::AsyncRead for ProxyStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.stdout), cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ProxyStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.stdin), cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.stdin), cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.stdin), cx)
+    }
+}
+
+fn split_command(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => {
+                    if let Some(&n) = chars.peek() {
+                        cur.push(n);
+                        chars.next();
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !cur.is_empty() {
+                        args.push(std::mem::take(&mut cur));
+                    }
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    if !cur.is_empty() {
+        args.push(cur);
+    }
+    args
+}
+
+fn connect_proxy_command(config: &ResolvedConfig, cmd: &str, target_host: &str, target_port: u16) -> Result<BoxedStream> {
+    use tokio::process::Command;
+    use std::process::Stdio;
+    let expanded = cmd
+        .replace("%%", "\u{0}")
+        .replace("%h", target_host)
+        .replace("%p", &target_port.to_string())
+        .replace("%r", &config.user)
+        .replace("%n", target_host)
+        .replace("%u", &config.user)
+        .replace('\u{0}', "%");
+    let argv = split_command(&expanded);
+    if argv.is_empty() {
+        return Err(SshError::Protocol("empty ProxyCommand".into()));
+    }
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| SshError::Io(e))?;
+    let stdout = child.stdout.take().ok_or_else(|| SshError::Protocol("proxy stdout not captured".into()))?;
+    let stdin = child.stdin.take().ok_or_else(|| SshError::Protocol("proxy stdin not captured".into()))?;
+    Ok(Box::pin(ProxyStream { child, stdout, stdin }))
+}
+
 impl<R: tokio::io::AsyncRead + Unpin, W: Unpin> tokio::io::AsyncRead for CombinedStream<R, W> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -1730,24 +2193,6 @@ async fn receive_encrypted_packet(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
 
-    if aead {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
-            let mut len_buf_copy = len_buf.to_vec();
-            let decrypted = cipher.decrypt(seq, &mut len_buf_copy)?;
-            if decrypted.len() >= 4 {
-                len_buf.copy_from_slice(&decrypted[..4]);
-            }
-        }
-    } else {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
-            let mut len_buf_copy = len_buf.to_vec();
-            let decrypted = cipher.decrypt(seq, &mut len_buf_copy)?;
-            if decrypted.len() >= 4 {
-                len_buf.copy_from_slice(&decrypted[..4]);
-            }
-        }
-    }
-
     let packet_len = u32::from_be_bytes(len_buf) as usize;
     if packet_len > 256 * 1024 || packet_len < 12 {
         return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
@@ -1756,11 +2201,22 @@ async fn receive_encrypted_packet(
 
     let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body).await?;
+    let ciphertext = body.clone();
 
     if aead {
         if let Some(ref mut cipher) = transport.server_to_client_cipher {
             let decrypted = cipher.decrypt(seq, &body)?;
             body = decrypted;
+        }
+
+        if let Some(ref mac) = transport.server_to_client_mac {
+            if mac.tag_len() > 0 {
+                let mut tag_buf = vec![0u8; mac.tag_len()];
+                stream.read_exact(&mut tag_buf).await?;
+                if !mac.verify_tag(seq, &ciphertext, &tag_buf)? {
+                    return Err(SshError::DecryptionFailed);
+                }
+            }
         }
     } else {
         if let Some(ref mut cipher) = transport.server_to_client_cipher {
@@ -1772,7 +2228,7 @@ async fn receive_encrypted_packet(
             if mac.tag_len() > 0 {
                 let mut tag_buf = vec![0u8; mac.tag_len()];
                 stream.read_exact(&mut tag_buf).await?;
-                if !mac.verify_tag(seq, &body, &tag_buf)? {
+                if !mac.verify_tag(seq, &ciphertext, &tag_buf)? {
                     return Err(SshError::DecryptionFailed);
                 }
             }
@@ -1819,6 +2275,85 @@ impl SshClient {
         send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
         Ok(())
     }
+
+    pub async fn send_channel_data(&mut self, session_local_id: ChannelId, data: &[u8]) -> Result<()> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        let remote_id = self.channel_manager.get_channel(session_local_id)
+            .and_then(|c| c.remote_id)
+            .unwrap_or(0);
+        let msg_data = build_channel_data(remote_id, data);
+        send_encrypted_packet(stream, &msg_data, &mut self.transport, false, aead).await?;
+        Ok(())
+    }
+
+    pub async fn send_window_change(&mut self, local_id: ChannelId, width: u32, height: u32) -> Result<()> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        let remote_id = self.channel_manager.get_channel(local_id)
+            .and_then(|c| c.remote_id)
+            .unwrap_or(0);
+        let data = build_window_change(width, height, width * 8, height * 16);
+        let req = build_channel_request(remote_id, msg::SSH_REQUEST_WINDOW_CHANGE, false, Some(&data));
+        send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+        Ok(())
+    }
+
+    pub async fn send_keepalive(&mut self) -> Result<()> {
+        let aead = self.is_aead();
+        if let Some(stream) = self.stream.as_mut() {
+            let mut req = vec![msg::SSH_MSG_GLOBAL_REQUEST];
+            SshString::new("keepalive@openssh.com").encode(&mut req)?;
+            true.encode(&mut req)?;
+            send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_channel_close(&mut self, local_id: ChannelId) -> Result<()> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        if let Some(rid) = self.channel_manager.get_channel(local_id).and_then(|c| c.remote_id) {
+            let close = build_channel_close(rid);
+            send_encrypted_packet(stream, &close, &mut self.transport, false, aead).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn send_disconnect(&mut self) -> Result<()> {
+        let aead = self.is_aead();
+        if let Some(stream) = self.stream.as_mut() {
+            let mut disconnect = vec![msg::SSH_MSG_DISCONNECT];
+            (1u32).encode(&mut disconnect)?; // SSH_DISCONNECT_BY_APPLICATION
+            SshString::new("client exiting").encode(&mut disconnect)?;
+            SshString::new("").encode(&mut disconnect)?;
+            send_encrypted_packet(stream, &disconnect, &mut self.transport, false, aead).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn recv_channel_data(&mut self, local_id: ChannelId) -> Result<Option<Vec<u8>>> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        loop {
+            let packet = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            if packet.is_empty() { continue; }
+            match packet[0] {
+                msg::SSH_MSG_CHANNEL_DATA => {
+                    let mut r = &packet[1..];
+                    let remote_id = u32::decode(&mut r)?;
+                    let data = SshBytes::decode(&mut r)?.0;
+                    if self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) == Some(local_id) {
+                        return Ok(Some(data));
+                    }
+                }
+                msg::SSH_MSG_CHANNEL_EOF | msg::SSH_MSG_CHANNEL_CLOSE => {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, force_tty: bool) -> i32 {
@@ -1830,8 +2365,8 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
             eprintln!("ns-ssh: connect to {}:{} failed", config.hostname, config.port);
             return 1;
         }
-        if client.handshake().await.is_err() {
-            eprintln!("ns-ssh: handshake failed");
+        if let Err(e) = client.handshake().await {
+            eprintln!("ns-ssh: handshake failed: {}", e);
             return 1;
         }
         if client.authenticate().await.is_err() {
@@ -1843,17 +2378,27 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
             return 1;
         }
 
-        let use_pty = force_tty || (cmd.is_none() && atty::is(atty::Stream::Stdout));
+        let use_pty = config.request_tty || force_tty || (cmd.is_none() && atty::is(atty::Stream::Stdout));
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
         let final_cmd = config.remote_command.clone().or(cmd);
 
-        let has_session = !config.no_remote_command;
+        let has_session = !config.no_remote_command && config.stdio_forward.is_none();
+
+        // -s subsystem request
+        if let Some(ref sub) = config.subsystem {
+            let sid = match client.request_session_subsystem(sub).await {
+                Ok(sid) => sid,
+                Err(e) => { eprintln!("ns-ssh: subsystem request failed: {}", e); return 1; }
+            };
+            return client.run_event_loop(Some(sid)).await.unwrap_or(1);
+        }
+
+        // -W host:port stdio forwarding
+        // Handled inside run_event_loop
+
         let session_id = if has_session {
             match client.request_session(final_cmd.as_deref(), use_pty, &term, 80, 24).await {
                 Ok(sid) => {
-                    if config.forward_agent {
-                        let _ = client.enable_agent_forwarding(sid).await;
-                    }
                     Some(sid)
                 }
                 Err(e) => {

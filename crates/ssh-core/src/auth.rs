@@ -22,7 +22,6 @@ pub fn build_userauth_request(
 
     match method {
         AuthMethod::Password(password) => {
-            payload.extend(SshString::new(service).0);
             payload.extend(SshString::new("password").0);
             payload.push(0);
             payload.extend(SshString::new(password).0);
@@ -39,9 +38,8 @@ pub fn build_userauth_request(
             payload.extend(SshBytes(signature).0);
         }
         AuthMethod::KeyboardInteractive(_) => {
-            payload.extend(SshString::new("ssh-connection").0);
             payload.extend(SshString::new("keyboard-interactive").0);
-            payload.extend(SshString::new("en").0);
+            payload.extend(SshString::new("").0);
             payload.extend(SshString::new("").0);
         }
         AuthMethod::None => {
@@ -77,35 +75,33 @@ pub fn build_userauth_request_with_session(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_USERAUTH_REQUEST);
-    payload.extend(SshString::new(username).0);
-    payload.extend(SshString::new(service).0);
+    SshString::new(username).encode(&mut payload).unwrap();
+    SshString::new(service).encode(&mut payload).unwrap();
 
     match method {
         AuthMethod::Password(password) => {
-            payload.extend(SshString::new(service).0);
-            payload.extend(SshString::new("password").0);
+            SshString::new("password").encode(&mut payload).unwrap();
             payload.push(0);
-            payload.extend(SshString::new(password).0);
+            SshString::new(password).encode(&mut payload).unwrap();
         }
         AuthMethod::PublicKey(signer) => {
-            payload.extend(SshString::new("publickey").0);
+            SshString::new("publickey").encode(&mut payload).unwrap();
             payload.push(1);
-            payload.extend(SshString::new(signer.algorithm_name()).0);
+            SshString::new(signer.algorithm_name()).encode(&mut payload).unwrap();
             let pub_key = signer.public_key_bytes();
-            payload.extend(SshBytes(pub_key).0);
+            SshBytes(pub_key).encode(&mut payload).unwrap();
 
             let sign_data = build_sign_data_with_session(username, service, signer.as_ref(), session_id);
             let signature = signer.sign(&sign_data).unwrap_or_default();
-            payload.extend(SshBytes(signature).0);
+            SshBytes(signature).encode(&mut payload).unwrap();
         }
         AuthMethod::KeyboardInteractive(_) => {
-            payload.extend(SshString::new("ssh-connection").0);
-            payload.extend(SshString::new("keyboard-interactive").0);
-            payload.extend(SshString::new("en").0);
-            payload.extend(SshString::new("").0);
+            SshString::new("keyboard-interactive").encode(&mut payload).unwrap();
+            SshString::new("").encode(&mut payload).unwrap();
+            SshString::new("").encode(&mut payload).unwrap();
         }
         AuthMethod::None => {
-            payload.extend(SshString::new("none").0);
+            SshString::new("none").encode(&mut payload).unwrap();
         }
     }
 
@@ -133,6 +129,30 @@ fn build_sign_data_with_session(
     data
 }
 
+/// Build the string to be signed when authenticating with a key that is
+/// managed by an SSH agent (only the public blob is available).
+pub fn build_sign_data_for_agent(
+    username: &str,
+    service: &str,
+    algorithm: &str,
+    public_key: &[u8],
+    session_id: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::new();
+
+    SshBytes(session_id.to_vec()).encode(&mut data).unwrap();
+
+    data.push(msg::SSH_MSG_USERAUTH_REQUEST);
+    SshString::new(username).encode(&mut data).unwrap();
+    SshString::new(service).encode(&mut data).unwrap();
+    SshString::new("publickey").encode(&mut data).unwrap();
+    data.push(1);
+    SshString::new(algorithm).encode(&mut data).unwrap();
+    SshBytes(public_key.to_vec()).encode(&mut data).unwrap();
+
+    data
+}
+
 pub fn parse_userauth_failure(payload: &[u8]) -> Result<Vec<String>> {
     let mut r = &payload[1..];
     let name_list = SshNameList::decode(&mut r)?;
@@ -154,6 +174,42 @@ pub fn parse_userauth_info_request(payload: &[u8]) -> Result<Vec<(String, String
     }
 
     Ok(prompts)
+}
+
+pub fn build_userauth_pubkey_query(
+    username: &str,
+    service: &str,
+    algorithm: &str,
+    public_key: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(msg::SSH_MSG_USERAUTH_REQUEST);
+    SshString::new(username).encode(&mut payload).unwrap();
+    SshString::new(service).encode(&mut payload).unwrap();
+    SshString::new("publickey").encode(&mut payload).unwrap();
+    payload.push(0);
+    SshString::new(algorithm).encode(&mut payload).unwrap();
+    SshBytes(public_key.to_vec()).encode(&mut payload).unwrap();
+    payload
+}
+
+pub fn build_userauth_pubkey_signed(
+    username: &str,
+    service: &str,
+    algorithm: &str,
+    public_key: &[u8],
+    signature: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(msg::SSH_MSG_USERAUTH_REQUEST);
+    SshString::new(username).encode(&mut payload).unwrap();
+    SshString::new(service).encode(&mut payload).unwrap();
+    SshString::new("publickey").encode(&mut payload).unwrap();
+    payload.push(1);
+    SshString::new(algorithm).encode(&mut payload).unwrap();
+    SshBytes(public_key.to_vec()).encode(&mut payload).unwrap();
+    SshBytes(signature.to_vec()).encode(&mut payload).unwrap();
+    payload
 }
 
 pub fn build_userauth_info_response(answers: &[String]) -> Vec<u8> {
