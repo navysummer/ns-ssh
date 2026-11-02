@@ -21,8 +21,6 @@ const DEFAULT_KEX: &[&str] = &[
     "diffie-hellman-group14-sha1",
     "diffie-hellman-group-exchange-sha256",
     "diffie-hellman-group-exchange-sha1",
-    "ext-info-c",
-    "ext-info-s",
 ];
 
 const DEFAULT_HOST_KEYS: &[&str] = &[
@@ -59,13 +57,58 @@ const DEFAULT_MACS: &[&str] = &[
     "none",
 ];
 
-fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&[String]>) -> Vec<&'a str> {
+/// Return the default supported algorithms for a `-Q` query (key/cipher/mac/kex).
+pub fn supported_algorithms(query: &str) -> Option<&'static [&'static str]> {
+    match query.to_lowercase().as_str() {
+        "key" | "hostkey" | "host-key" => Some(DEFAULT_HOST_KEYS),
+        "cipher" | "ciphers" => Some(DEFAULT_CIPHERS),
+        "mac" | "macs" => Some(DEFAULT_MACS),
+        "kex" | "key-exchange" | "key-exchange-algorithm" => Some(DEFAULT_KEX),
+        _ => None,
+    }
+}
+
+fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&'a [String]>) -> Vec<&'a str> {
     match config {
-        Some(list) if !list.is_empty() => defaults
-            .iter()
-            .copied()
-            .filter(|d| list.iter().any(|c| c.as_str() == *d))
-            .collect(),
+        Some(list) if !list.is_empty() => {
+            // OpenSSH supports leading `+`/`-`/`^` on the whole comma list to
+            // modify the built-in default set:
+            //   `KexAlgorithms +curve25519-sha256`   (append to default)
+            //   `KexAlgorithms -diffie-hellman-group14-sha1` (remove from default)
+            //   `KexAlgorithms ^ecdh-sha2-nistp256`   (remove from default)
+            let first = list.first().map(|s| s.trim()).unwrap_or("");
+            let items: Vec<&str> = std::iter::once(
+                first.trim_start_matches(|c| c == '+' || c == '-' || c == '^'),
+            )
+            .chain(list.iter().skip(1).map(|s| s.trim()))
+            .collect();
+
+            if let Some(rest) = first.strip_prefix('+') {
+                // Append the listed algorithms to the defaults (dedup, keep order).
+                let mut out: Vec<&str> = defaults.to_vec();
+                for item in items {
+                    if !out.contains(&item) {
+                        out.push(item);
+                    }
+                }
+                out
+            } else if first.starts_with('-') || first.starts_with('^') {
+                // Remove the listed algorithms from the defaults.
+                defaults
+                    .iter()
+                    .copied()
+                    .filter(|d| !items.iter().any(|n| *n == *d))
+                    .collect()
+            } else {
+                // Explicit list: keep only algorithms we support, preserving order.
+                list.iter()
+                    .filter_map(|item| {
+                        let item = item.trim();
+                        defaults.iter().find(|d| **d == item).copied()
+                    })
+                    .collect()
+            }
+        }
         _ => defaults.to_vec(),
     }
 }
@@ -117,6 +160,10 @@ pub struct SshTransport {
     pub exchange: Option<KexExchange>,
     pub last_rekey_bytes: u64,
     pub last_rekey_instant: std::time::Instant,
+    /// Rekey when this many bytes have been sent+received since the last rekey.
+    pub rekey_bytes: u64,
+    /// Rekey when this many seconds have elapsed since the last rekey.
+    pub rekey_seconds: u64,
 }
 
 impl SshTransport {
@@ -143,6 +190,8 @@ impl SshTransport {
             exchange: None,
             last_rekey_bytes: 0,
             last_rekey_instant: std::time::Instant::now(),
+            rekey_bytes: Self::REKEY_BYTES,
+            rekey_seconds: Self::REKEY_SECONDS,
         }
     }
 
@@ -176,10 +225,13 @@ impl SshTransport {
         payload.extend(encode_name_list(&mac_list));
         payload.extend(encode_name_list(&mac_list));
 
+        // RFC 4253 §7.1: the first algorithm on the client's list that the
+        // server also supports is chosen. Put zlib first when compression is
+        // enabled so it is actually negotiated; otherwise "none" wins.
         let comp_list: Vec<&str> = if self.compression_enabled {
-            vec!["none", "zlib@openssh.com"]
+            vec!["zlib@openssh.com", "none"]
         } else {
-            vec!["none"]
+            vec!["none", "zlib@openssh.com"]
         };
         payload.extend(encode_name_list(&comp_list));
         payload.extend(encode_name_list(&comp_list));
@@ -208,8 +260,8 @@ impl SshTransport {
     pub const REKEY_SECONDS: u64 = 3600;
 
     pub fn needs_rekey(&self, total_bytes: u64, elapsed_secs: u64) -> bool {
-        total_bytes.saturating_sub(self.last_rekey_bytes) >= Self::REKEY_BYTES
-            || elapsed_secs >= Self::REKEY_SECONDS
+        total_bytes.saturating_sub(self.last_rekey_bytes) >= self.rekey_bytes
+            || elapsed_secs >= self.rekey_seconds
     }
 
     pub fn total_bytes(&self) -> u64 {
@@ -593,15 +645,7 @@ pub async fn receive_encrypted_packet(
             return Err(SshError::DecryptionFailed);
         }
 
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        if !mac.as_ref().is_etm() {
-            let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
-            if !mac_ok {
-                return Err(SshError::DecryptionFailed);
-            }
-        }
+        let plaintext = decrypt_verify_non_etm(cipher, mac, seq, &ciphertext, &mac_buf)?;
 
         let padding_len = plaintext[0] as usize;
         let payload_len = body_len - 1 - padding_len;
@@ -777,15 +821,7 @@ pub async fn receive_encrypted_packet_server(
             return Err(SshError::DecryptionFailed);
         }
 
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        if !mac.as_ref().is_etm() {
-            let mac_ok = mac.as_ref().verify_tag(seq, &plaintext, &mac_buf)?;
-            if !mac_ok {
-                return Err(SshError::DecryptionFailed);
-            }
-        }
+        let plaintext = decrypt_verify_non_etm(cipher, mac, seq, &ciphertext, &mac_buf)?;
 
         let padding_len = plaintext[0] as usize;
         let payload_len = body_len - 1 - padding_len;
@@ -806,6 +842,35 @@ pub async fn receive_encrypted_packet_server(
     }
 }
 
+/// Decrypt and verify a non-ETM MAC, running a dummy MAC check on decryption
+/// failure so the failure path takes comparable time (CBC padding-oracle
+/// mitigation, matching OpenSSH's constant-time behavior).
+fn decrypt_verify_non_etm(
+    cipher: &mut Box<dyn SshCipher>,
+    mac: &Box<dyn SshMac>,
+    seq: u64,
+    ciphertext: &[u8],
+    mac_buf: &[u8],
+) -> Result<Vec<u8>> {
+    let plaintext = match cipher.decrypt(seq, ciphertext) {
+        Ok(p) => p,
+        Err(_) => {
+            if !mac.is_etm() {
+                let dummy = vec![0u8; mac_buf.len().max(16)];
+                let _ = mac.verify_tag(seq, &dummy, mac_buf);
+            }
+            return Err(SshError::DecryptionFailed);
+        }
+    };
+    if !mac.is_etm() {
+        let mac_ok = mac.verify_tag(seq, &plaintext, mac_buf)?;
+        if !mac_ok {
+            return Err(SshError::DecryptionFailed);
+        }
+    }
+    Ok(plaintext)
+}
+
 fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -822,4 +887,86 @@ fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|e| SshError::Compression(e.to_string()))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_algorithms_lists() {
+        let key = supported_algorithms("key").unwrap();
+        assert!(key.contains(&"ssh-ed25519"));
+        assert!(key.contains(&"rsa-sha2-512"));
+        let cipher = supported_algorithms("cipher").unwrap();
+        assert!(cipher.contains(&"aes256-ctr"));
+        assert!(cipher.contains(&"chacha20-poly1305@openssh.com"));
+        let mac = supported_algorithms("mac").unwrap();
+        assert!(mac.contains(&"hmac-sha2-256-etm@openssh.com"));
+        let kex = supported_algorithms("kex").unwrap();
+        assert!(kex.contains(&"curve25519-sha256"));
+        assert!(supported_algorithms("nonsense").is_none());
+    }
+
+    #[test]
+    fn filter_algos_handles_caret_prefix() {
+        // Explicit list keeps only supported algorithms, preserving order.
+        let list = vec!["curve25519-sha256".to_string(), "not-real".to_string()];
+        let out = filter_algos(DEFAULT_KEX, Some(&list));
+        assert_eq!(out, vec!["curve25519-sha256"]);
+
+        // `^` prefix excludes algorithms from the default set.
+        let list = vec!["^ecdh-sha2-nistp256".to_string()];
+        let out = filter_algos(DEFAULT_KEX, Some(&list));
+        assert!(out.contains(&"curve25519-sha256"));
+        assert!(!out.contains(&"ecdh-sha2-nistp256"));
+
+        // `^` on a whole comma list excludes multiple algorithms.
+        let list = vec![
+            "^aes128-gcm@openssh.com".to_string(),
+            "aes256-gcm@openssh.com".to_string(),
+        ];
+        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
+        assert!(!out.contains(&"aes128-gcm@openssh.com"));
+        assert!(!out.contains(&"aes256-gcm@openssh.com"));
+        assert!(out.contains(&"aes256-ctr"));
+
+        // `+` appends to the default set.
+        let list = vec!["+blowfish-cbc".to_string()];
+        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
+        assert!(out.contains(&"blowfish-cbc"));
+        assert_eq!(out.len(), DEFAULT_CIPHERS.len() + 1);
+        assert!(out.ends_with(&["blowfish-cbc"]));
+
+        // `-` removes from the default set.
+        let list = vec!["-aes256-ctr".to_string()];
+        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
+        assert!(!out.contains(&"aes256-ctr"));
+        assert!(out.contains(&"aes128-ctr"));
+    }
+
+    #[test]
+    fn compression_negotiation_prefers_zlib_when_enabled() {
+        // Both sides enable compression -> zlib is chosen (RFC 4253 order).
+        let mut c = SshTransport::new();
+        c.compression_enabled = true;
+        let c_init = c.build_kex_init(None, None, None, None);
+        let mut s = SshTransport::new();
+        s.compression_enabled = true;
+        let s_init = s.build_kex_init(None, None, None, None);
+        let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
+        assert_eq!(neg.client_to_server_compression, "zlib@openssh.com");
+        assert_eq!(neg.server_to_client_compression, "zlib@openssh.com");
+
+        // Both disabled (the default) -> none is chosen.
+        let mut c2 = SshTransport::new();
+        c2.compression_enabled = false;
+        let c2_init = c2.build_kex_init(None, None, None, None);
+        let mut s2 = SshTransport::new();
+        s2.compression_enabled = false;
+        let s2_init = s2.build_kex_init(None, None, None, None);
+        let neg2 = SshTransport::negotiate_algorithms(&c2_init, &s2_init).unwrap();
+        assert_eq!(neg2.client_to_server_compression, "none");
+        assert_eq!(neg2.server_to_client_compression, "none");
+    }
 }

@@ -43,21 +43,7 @@ struct SshdArgs {
 fn main() {
     let args = SshdArgs::parse();
 
-    let log_level = if args.debug || args.log_to_stderr {
-        "debug"
-    } else {
-        "info"
-    };
-
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level)),
-        )
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).ok();
-
-    let mut config = if let Some(ref path) = args.config_file {
+    let mut config = if let Some(ref path) = args.config_path.or(args.config_file) {
         ServerConfig::load_from(std::path::Path::new(path))
     } else {
         ServerConfig::load()
@@ -86,6 +72,18 @@ fn main() {
                 }
                 "hostkey" | "host_key" => {
                     config.host_key_files.push(value.to_string());
+                }
+                "hostkeyalgorithms" | "host_key_algorithms" => {
+                    config.host_key_algorithms = Some(value.to_string());
+                }
+                "kexalgorithms" | "kex_algorithms" => {
+                    config.kex_algorithms = Some(value.to_string());
+                }
+                "ciphers" => {
+                    config.ciphers = Some(value.to_string());
+                }
+                "macs" => {
+                    config.macs = Some(value.to_string());
                 }
                 "passwordauthentication" | "password_auth" => {
                     config.password_auth = value == "yes";
@@ -130,6 +128,18 @@ fn main() {
                         config.client_alive_count_max = v;
                     }
                 }
+                "rekeylimit" | "rekey_limit" => {
+                    if let Some((bytes, secs)) = config::parse_rekey_limit_server(value) {
+                        config.rekey_limit_bytes = bytes;
+                        config.rekey_limit_time = secs;
+                    }
+                }
+                "pubkeyacceptedalgorithms" | "pubkey_accepted_algorithms" | "pubkeyacceptedkeytypes" => {
+                    config.pubkey_accepted_algorithms = Some(config::resolve_pubkey_algorithms_server(value));
+                }
+                "compression" => {
+                    config.compression = value == "yes";
+                }
                 "usedns" | "use_dns" => {
                     config.use_dns = value == "yes";
                 }
@@ -150,8 +160,32 @@ fn main() {
                         config.login_grace_time = v;
                     }
                 }
+                "strictmodes" | "strict_modes" => {
+                    config.strict_modes = value == "yes";
+                }
+                "permittty" | "permit_tty" => {
+                    config.permit_tty = value == "yes";
+                }
+                "permitemptypasswords" | "permit_empty_passwords" => {
+                    config.permit_empty_passwords = value == "yes";
+                }
+                "ignorerhosts" | "ignore_rhosts" => {
+                    config.ignore_rhosts = value == "yes";
+                }
+                "hostbasedauthentication" | "hostbased_auth" => {
+                    config.hostbased_auth = value == "yes";
+                }
+                "printlastlog" | "print_last_log" => {
+                    config.print_last_log = value == "yes";
+                }
+                "tcpkeepalive" | "tcp_keep_alive" => {
+                    config.tcp_keep_alive = value == "yes";
+                }
                 "allowagentforwarding" | "allow_agent_forwarding" => {
                     config.allow_agent_forwarding = value == "yes";
+                }
+                "allowstreamlocalforwarding" | "allow_streamlocal_forwarding" => {
+                    config.allow_streamlocal_forwarding = value == "yes";
                 }
                 "x11forwarding" | "x11_forwarding" => {
                     config.x11_forwarding = value == "yes";
@@ -179,6 +213,15 @@ fn main() {
                 "gatewayports" | "gateway_ports" => {
                     config.gateway_ports = value.to_lowercase();
                 }
+                "loglevel" | "log_level" => {
+                    config.log_level = Some(value.to_string());
+                }
+                "authorizedkeyscommand" | "authorized_keys_command" => {
+                    config.authorized_keys_command = Some(value.to_string());
+                }
+                "authorizedkeyscommanduser" | "authorized_keys_command_user" => {
+                    config.authorized_keys_command_user = Some(value.to_string());
+                }
                 _ => {}
             }
         }
@@ -189,6 +232,9 @@ fn main() {
             config.gateway_ports = "yes".to_string();
         }
     }
+
+    // Initialize logging after config is loaded so `LogLevel`/`-d`/`-e` apply.
+    init_logging(&config, args.debug || args.log_to_stderr);
 
     if !args.no_daemon && !args.debug {
         if let Err(e) = session::daemonize() {
@@ -216,4 +262,32 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+/// Initialize the tracing subscriber, honoring `LogLevel`/`-d`/`-e`/`RUST_LOG`.
+fn init_logging(cfg: &ServerConfig, debug_to_stderr: bool) {
+    let level = if std::env::var("RUST_LOG").is_ok() {
+        "info" // RUST_LOG overrides via EnvFilter::try_from_default_env
+    } else if let Some(l) = &cfg.log_level {
+        match l.to_uppercase().as_str() {
+            "QUIET" | "FATAL" => "error",
+            "ERROR" => "error",
+            "INFO" => "info",
+            "VERBOSE" => "info",
+            "DEBUG" | "DEBUG1" | "DEBUG2" => "debug",
+            "DEBUG3" => "trace",
+            _ => "info",
+        }
+    } else if debug_to_stderr {
+        "debug"
+    } else {
+        "info"
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level)),
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).ok();
 }

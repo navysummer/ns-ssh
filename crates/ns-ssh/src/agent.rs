@@ -12,8 +12,65 @@ pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 pub const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
+pub const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
+pub const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
+pub const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENT_SUCCESS: u8 = 6;
+
+/// Encode an SSH string (u32 length prefix + bytes).
+fn ssh_string(data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + data.len());
+    v.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+/// Serialize a private key into the agent's `SSH2_AGENTC_ADD_IDENTITY` key blob.
+///
+/// Matches the agent protocol formats used by OpenSSH's `ssh-add`:
+/// - ed25519: type, pk(32 raw), seed||pk(64), comment
+/// - ecdsa:   type, curve, point(04||X||Y), scalar_mpint, comment
+pub fn serialize_private_key(key: &dyn HostKeySigner) -> Result<Vec<u8>> {
+    use ssh_core::hostkey::{EcdsaP256HostKey, Ed25519HostKey};
+    let alg = key.algorithm_name();
+    if alg == "ssh-ed25519" {
+        let ed = key.as_any().downcast_ref::<Ed25519HostKey>()
+            .ok_or_else(|| SshError::Protocol("ed25519 downcast failed".into()))?;
+        let pk = ed.public_bytes();
+        let sk = ed.secret_bytes();
+        // Agent private key is 64 bytes: seed || public_key.
+        let mut sk64 = Vec::with_capacity(64);
+        sk64.extend_from_slice(&sk);
+        sk64.extend_from_slice(&pk);
+        let mut out = Vec::new();
+        out.extend(ssh_string(b"ssh-ed25519"));
+        out.extend(ssh_string(&pk));
+        out.extend(ssh_string(&sk64));
+        out.extend(ssh_string(b"")); // comment
+        Ok(out)
+    } else if alg == "ecdsa-sha2-nistp256" {
+        let ec = key.as_any().downcast_ref::<EcdsaP256HostKey>()
+            .ok_or_else(|| SshError::Protocol("ecdsa downcast failed".into()))?;
+        let point = ec.public_bytes();
+        let scalar = ec.secret_bytes();
+        // Private scalar as mpint: prepend 0x00 if high bit set.
+        let mut scalar_mpint = Vec::with_capacity(scalar.len() + 1);
+        if scalar.first().map(|b| b & 0x80 != 0).unwrap_or(false) {
+            scalar_mpint.push(0x00);
+        }
+        scalar_mpint.extend_from_slice(&scalar);
+        let mut out = Vec::new();
+        out.extend(ssh_string(b"ecdsa-sha2-nistp256"));
+        out.extend(ssh_string(b"nistp256"));
+        out.extend(ssh_string(&point));
+        out.extend(ssh_string(&scalar_mpint));
+        out.extend(ssh_string(b"")); // comment
+        Ok(out)
+    } else {
+        Err(SshError::Protocol(format!("unsupported key type for agent add: {}", alg)))
+    }
+}
 
 pub struct SshAgent {
     socket_path: Option<PathBuf>,
@@ -21,9 +78,17 @@ pub struct SshAgent {
 
 impl SshAgent {
     pub fn new() -> Self {
-        let socket_path = std::env::var("SSH_AUTH_SOCK")
-            .ok()
-            .map(PathBuf::from);
+        SshAgent::new_with_path(None)
+    }
+
+    /// Create an agent that connects to `override_path` (the `IdentityAgent`
+    /// setting) instead of `$SSH_AUTH_SOCK`.
+    pub fn new_with_path(override_path: Option<&str>) -> Self {
+        let socket_path = if let Some(p) = override_path {
+            Some(PathBuf::from(p))
+        } else {
+            std::env::var("SSH_AUTH_SOCK").ok().map(PathBuf::from)
+        };
 
         SshAgent { socket_path }
     }
@@ -114,6 +179,59 @@ impl SshAgent {
         let mut r = &response[1..];
         let signature = SshBytes::decode(&mut r)?.0;
         Ok(signature)
+    }
+
+    /// `ssh-add <keyfile>`: add a private key to the running agent.
+    pub async fn add_identity(&self, key: &dyn HostKeySigner) -> Result<()> {
+        let socket_path = self.socket_path.as_ref()
+            .ok_or_else(|| SshError::Protocol("SSH agent not available".into()))?;
+        let mut stream = UnixStream::connect(socket_path).await?;
+
+        let key_blob = serialize_private_key(key)?;
+        let mut payload = Vec::new();
+        payload.push(SSH_AGENTC_ADD_IDENTITY);
+        payload.extend_from_slice(&key_blob);
+
+        let mut request = Vec::new();
+        request.extend((payload.len() as u32).to_be_bytes());
+        request.extend_from_slice(&payload);
+        stream.write_all(&request).await?;
+
+        let mut response_len_buf = [0u8; 4];
+        stream.read_exact(&mut response_len_buf).await?;
+        let response_len = u32::from_be_bytes(response_len_buf) as usize;
+        let mut response = vec![0u8; response_len];
+        stream.read_exact(&mut response).await?;
+
+        if response.first() == Some(&SSH_AGENT_SUCCESS) {
+            Ok(())
+        } else {
+            Err(SshError::AuthFailed("agent add identity failed".into()))
+        }
+    }
+
+    /// `ssh-add -D`: remove all identities from the agent.
+    pub async fn remove_all_identities(&self) -> Result<()> {
+        let socket_path = self.socket_path.as_ref()
+            .ok_or_else(|| SshError::Protocol("SSH agent not available".into()))?;
+        let mut stream = UnixStream::connect(socket_path).await?;
+
+        let mut request = Vec::new();
+        request.extend(1u32.to_be_bytes());
+        request.push(SSH_AGENTC_REMOVE_ALL_IDENTITIES);
+        stream.write_all(&request).await?;
+
+        let mut response_len_buf = [0u8; 4];
+        stream.read_exact(&mut response_len_buf).await?;
+        let response_len = u32::from_be_bytes(response_len_buf) as usize;
+        let mut response = vec![0u8; response_len];
+        stream.read_exact(&mut response).await?;
+
+        if response.first() == Some(&SSH_AGENT_SUCCESS) {
+            Ok(())
+        } else {
+            Err(SshError::AuthFailed("agent remove-all failed".into()))
+        }
     }
 }
 

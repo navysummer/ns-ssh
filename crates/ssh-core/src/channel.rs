@@ -11,7 +11,11 @@ pub struct Channel {
     pub local_id: ChannelId,
     pub remote_id: Option<ChannelId>,
     pub channel_type: String,
+    /// Our advertised receive window (what we allow the peer to send us).
     pub window_size: u32,
+    /// The peer's advertised receive window (what the peer allows us to send).
+    /// Decremented when we send channel data; grows on SSH_MSG_CHANNEL_WINDOW_ADJUST.
+    pub peer_window: u32,
     pub max_packet_size: u32,
     pub data_tx: Option<mpsc::Sender<Vec<u8>>>,
     pub data_rx: Option<mpsc::Receiver<Vec<u8>>>,
@@ -61,6 +65,7 @@ impl ChannelManager {
             remote_id: None,
             channel_type: channel_type.to_string(),
             window_size,
+            peer_window: window_size,
             max_packet_size,
             data_tx: Some(data_tx),
             data_rx: Some(data_rx),
@@ -97,6 +102,34 @@ impl ChannelManager {
 
     pub fn find_by_remote_id(&self, remote_id: ChannelId) -> Option<&Channel> {
         self.channels.values().find(|c| c.remote_id == Some(remote_id))
+    }
+
+    /// Apply an SSH_MSG_CHANNEL_WINDOW_ADJUST to a channel's peer window.
+    /// The peer's advertised window grows, allowing us to send more data.
+    pub fn add_window(&mut self, local_id: ChannelId, amount: u32) {
+        if let Some(ch) = self.channels.get_mut(&local_id) {
+            ch.peer_window = ch.peer_window.saturating_add(amount);
+        }
+    }
+
+    /// Decrement a channel's peer window by `amount` after sending channel data.
+    pub fn sub_window(&mut self, local_id: ChannelId, amount: u32) {
+        if let Some(ch) = self.channels.get_mut(&local_id) {
+            ch.peer_window = ch.peer_window.saturating_sub(amount);
+        }
+    }
+
+    /// Record the peer's advertised receive window from a channel open
+    /// confirmation (client side) or channel open (server side).
+    pub fn set_peer_window(&mut self, local_id: ChannelId, window: u32) {
+        if let Some(ch) = self.channels.get_mut(&local_id) {
+            ch.peer_window = window;
+        }
+    }
+
+    /// The peer's current advertised receive window for send-gating.
+    pub fn peer_window(&self, local_id: ChannelId) -> u32 {
+        self.channels.get(&local_id).map(|c| c.peer_window).unwrap_or(u32::MAX)
     }
 
     pub fn close_channel(&mut self, local_id: ChannelId) {
@@ -383,6 +416,30 @@ pub fn parse_forwarded_tcpip_open(payload: &[u8]) -> Result<(ChannelId, u32, u32
     let orig_ip = SshString::decode(&mut r)?.as_str()?.to_string();
     let orig_port = u32::decode(&mut r)?;
     Ok((sender_channel, window_size, max_packet, addr, port, orig_ip, orig_port))
+}
+
+/// Parse a `direct-streamlocal@openssh.com` channel open. Returns
+/// (sender, window, max_packet, socket_path).
+pub fn parse_direct_streamlocal_open(payload: &[u8]) -> Result<(ChannelId, u32, u32, String)> {
+    let mut r = &payload[1..];
+    let _type = SshString::decode(&mut r)?;
+    let sender_channel = u32::decode(&mut r)?;
+    let window_size = u32::decode(&mut r)?;
+    let max_packet = u32::decode(&mut r)?;
+    let socket_path = SshString::decode(&mut r)?.as_str()?.to_string();
+    Ok((sender_channel, window_size, max_packet, socket_path))
+}
+
+/// Parse a `forwarded-streamlocal@openssh.com` channel open. Returns
+/// (sender, window, max_packet, socket_path).
+pub fn parse_forwarded_streamlocal_open(payload: &[u8]) -> Result<(ChannelId, u32, u32, String)> {
+    let mut r = &payload[1..];
+    let _type = SshString::decode(&mut r)?;
+    let sender_channel = u32::decode(&mut r)?;
+    let window_size = u32::decode(&mut r)?;
+    let max_packet = u32::decode(&mut r)?;
+    let socket_path = SshString::decode(&mut r)?.as_str()?.to_string();
+    Ok((sender_channel, window_size, max_packet, socket_path))
 }
 
 pub fn build_x11_open(

@@ -84,11 +84,11 @@ impl HostKeyManager {
         let content = if key_name.contains("ed25519") {
             let signer = key as *const dyn HostKeySigner as *const Ed25519HostKey;
             let ed_key = unsafe { &*signer };
-            format_openssh_ed25519(&ed_key.secret_bytes())
+            ssh_core::keygen::format_openssh_ed25519(&ed_key.secret_bytes())
         } else if key_name.contains("ecdsa") {
             let signer = key as *const dyn HostKeySigner as *const EcdsaP256HostKey;
             let ecdsa_key = unsafe { &*signer };
-            format_openssh_ecdsa(&ecdsa_key.secret_bytes())
+            ssh_core::keygen::format_openssh_ecdsa(&ecdsa_key.secret_bytes())
         } else {
             return Err(SshError::Protocol("unsupported key type for generation".into()));
         };
@@ -119,93 +119,6 @@ impl HostKeyManager {
             (k.algorithm_name().to_string(), k.public_key_bytes())
         }).collect()
     }
-}
-
-fn format_openssh_ed25519(secret: &[u8; 32]) -> String {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"openssh-key-v1\0");
-    buf.extend_from_slice(&0u32.to_be_bytes()); // cipher: none
-    buf.extend_from_slice(&0u32.to_be_bytes()); // kdf: none
-    buf.extend_from_slice(&0u32.to_be_bytes()); // kdf options: empty
-    buf.extend_from_slice(&1u32.to_be_bytes()); // number of keys: 1
-
-    let mut pub_key_buf = Vec::new();
-    pub_key_buf.extend_from_slice(b"ssh-ed25519");
-    let signing = ed25519_dalek::SigningKey::from_bytes(secret);
-    let pub_key = signing.verifying_key();
-    pub_key_buf.extend_from_slice(&(32u32).to_be_bytes());
-    pub_key_buf.extend_from_slice(pub_key.as_bytes());
-    buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&pub_key_buf);
-
-    let mut priv_key_buf = Vec::new();
-    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // check int 1
-    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // check int 2
-    priv_key_buf.extend_from_slice(b"ssh-ed25519");
-    priv_key_buf.extend_from_slice(&(32u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(pub_key.as_bytes());
-    priv_key_buf.extend_from_slice(&(64u32).to_be_bytes()); // secret key length
-    priv_key_buf.extend_from_slice(secret);
-    priv_key_buf.extend_from_slice(pub_key.as_bytes());
-    priv_key_buf.extend_from_slice(b"\0\0\0\0"); // comment (empty)
-    priv_key_buf.extend_from_slice(b"\0\0\0\0\0\0\0\0"); // padding
-
-    buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&priv_key_buf);
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-    let mut result = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(70) {
-        result.push_str(std::str::from_utf8(chunk).unwrap());
-        result.push('\n');
-    }
-    result.push_str("-----END OPENSSH PRIVATE KEY-----\n");
-    result
-}
-
-fn format_openssh_ecdsa(secret: &[u8]) -> String {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"openssh-key-v1\0");
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf.extend_from_slice(&0u32.to_be_bytes());
-    buf.extend_from_slice(&1u32.to_be_bytes());
-
-    let signing_key = p256::ecdsa::SigningKey::from_bytes(secret.into()).unwrap();
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-
-    let mut pub_key_buf = Vec::new();
-    pub_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
-    pub_key_buf.extend_from_slice(b"nistp256");
-    pub_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
-    pub_key_buf.extend_from_slice(point.as_bytes());
-    buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&pub_key_buf);
-
-    let mut priv_key_buf = Vec::new();
-    priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
-    priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
-    priv_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
-    priv_key_buf.extend_from_slice(b"nistp256");
-    priv_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(point.as_bytes());
-    priv_key_buf.extend_from_slice(&(secret.len() as u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(secret);
-    priv_key_buf.extend_from_slice(b"\0\0\0\0");
-    priv_key_buf.extend_from_slice(b"\0\0\0\0\0\0\0\0");
-
-    buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&priv_key_buf);
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-    let mut result = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");
-    for chunk in encoded.as_bytes().chunks(70) {
-        result.push_str(std::str::from_utf8(chunk).unwrap());
-        result.push('\n');
-    }
-    result.push_str("-----END OPENSSH PRIVATE KEY-----\n");
-    result
 }
 
 fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {

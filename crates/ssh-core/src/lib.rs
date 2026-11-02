@@ -10,6 +10,7 @@ pub mod auth;
 pub mod channel;
 pub mod sftp;
 pub mod known_hosts;
+pub mod keygen;
 
 pub use error::{SshError, Result};
 pub use encoding::{SshEncode, SshDecode, SshString, SshBytes, SshNameList, SshMpInt};

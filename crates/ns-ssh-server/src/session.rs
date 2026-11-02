@@ -24,6 +24,10 @@ pub struct Session {
     pub pty_write: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     pub pty_resize_fd: Option<i32>,
     pub status: SessionStatus,
+    /// Chroot directory to use (from ChrootDirectory or authorized_keys).
+    pub chroot_dir: Option<String>,
+    /// Forced command from authorized_keys command= option.
+    pub auth_key_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +36,15 @@ pub enum SessionStatus {
     Running,
     Completed,
     Failed,
+}
+
+/// How a session's child process terminated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildExit {
+    /// Normal exit with a status code.
+    Status(i32),
+    /// Killed by a signal (signal number, signal name without "SIG" prefix).
+    Signal(i32, String),
 }
 
 pub struct SessionManager {
@@ -75,6 +88,8 @@ impl SessionManager {
             pty_write: None,
             pty_resize_fd: None,
             status: SessionStatus::Pending,
+            chroot_dir: None,
+            auth_key_command: None,
         };
 
         self.sessions.insert(id, session);
@@ -93,6 +108,19 @@ impl SessionManager {
         self.sessions.keys().next().cloned()
     }
 
+    pub fn session_ids(&self) -> Vec<u32> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    pub fn set_pty(&mut self, id: u32, term: String, width: u32, height: u32) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.pty = true;
+            session.term = term;
+            session.width = width;
+            session.height = height;
+        }
+    }
+
     pub fn remove_session(&mut self, id: u32) {
         self.sessions.remove(&id);
     }
@@ -104,6 +132,24 @@ impl SessionManager {
     pub fn set_command(&mut self, id: u32, command: String) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.command = Some(command);
+        }
+    }
+
+    pub fn set_auth_key_command(&mut self, id: u32, command: String) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.auth_key_command = Some(command);
+        }
+    }
+
+    pub fn set_chroot_dir(&mut self, id: u32, dir: String) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.chroot_dir = Some(dir);
+        }
+    }
+
+    pub fn set_pty_disabled(&mut self, id: u32) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.pty = false;
         }
     }
 
@@ -125,12 +171,19 @@ impl SessionManager {
             .ok_or_else(|| SshError::Protocol("session not found".into()))?;
 
         let username = session.username.clone();
-        let command = session.command.clone();
         let env_vars = session.env_vars.clone();
         let pty = session.pty;
         let user_info = get_user_info(&username)?;
         let uid = user_info.uid;
         let gid = user_info.gid;
+
+        // Determine effective working directory and chroot
+        let effective_workdir = if let Some(ref chroot) = session.chroot_dir {
+            // Inside chroot, home is relative to chroot root
+            format!("{}/{}", chroot, user_info.home_dir)
+        } else {
+            work_dir.to_string()
+        };
 
         let (pty_read, pty_write, pty_resize_fd, pty_stdio) = if pty {
             open_pty(session.width, session.height)?
@@ -140,7 +193,7 @@ impl SessionManager {
 
         let mut pty_stdio = pty_stdio;
         let mut build_base = |c: &mut TokioCommand| {
-            c.current_dir(work_dir)
+            c.current_dir(&effective_workdir)
                 .env("HOME", &user_info.home_dir)
                 .env("USER", &username)
                 .env("LOGNAME", &username)
@@ -151,7 +204,12 @@ impl SessionManager {
             for (name, value) in &env_vars {
                 c.env(name, value);
             }
-            configure_pre_exec(c, uid, gid, pty);
+            let post_chroot_cwd = if session.chroot_dir.is_some() {
+                Some(user_info.home_dir.as_str())
+            } else {
+                None
+            };
+            configure_pre_exec(c, uid, gid, pty, session.chroot_dir.as_deref(), post_chroot_cwd);
             if let Some((si, so, se)) = pty_stdio.take() {
                 c.stdin(std::process::Stdio::from(si))
                     .stdout(std::process::Stdio::from(so))
@@ -163,7 +221,12 @@ impl SessionManager {
             }
         };
 
-        let mut cmd = if let Some(ref cmd_str) = command {
+        // Build effective command: auth key command= > session command > shell
+        let effective_cmd = session.auth_key_command
+            .clone()
+            .or_else(|| session.command.clone());
+
+        let mut cmd = if let Some(ref cmd_str) = effective_cmd {
             let mut c = TokioCommand::new("/bin/sh");
             c.arg("-c").arg(cmd_str);
             build_base(&mut c);
@@ -212,27 +275,40 @@ impl SessionManager {
     }
 
     pub fn check_exit_status(&mut self, id: u32) -> Option<i32> {
+        match self.poll_child_exit(id) {
+            Some(ChildExit::Status(code)) => Some(code),
+            Some(ChildExit::Signal(sig, _)) => Some(128 + sig),
+            None => None,
+        }
+    }
+
+    /// Poll a session child and report how it terminated (status or signal).
+    pub fn poll_child_exit(&mut self, id: u32) -> Option<ChildExit> {
         if let Some(session) = self.sessions.get_mut(&id) {
             if let Some(ref mut child) = session.child {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         session.status = SessionStatus::Completed;
                         if let Some(code) = status.code() {
-                            Some(code)
+                            Some(ChildExit::Status(code))
                         } else {
                             #[cfg(unix)]
                             {
                                 use std::os::unix::process::ExitStatusExt;
-                                Some(128 + status.signal().unwrap_or(1))
+                                if let Some(sig) = status.signal() {
+                                    Some(ChildExit::Signal(sig, signal_name(sig).to_string()))
+                                } else {
+                                    Some(ChildExit::Status(1))
+                                }
                             }
                             #[cfg(not(unix))]
-                            { Some(1) }
+                            { Some(ChildExit::Status(1)) }
                         }
                     }
                     Ok(None) => None,
                     Err(_) => {
                         session.status = SessionStatus::Failed;
-                        Some(1)
+                        Some(ChildExit::Status(1))
                     }
                 }
             } else {
@@ -250,9 +326,29 @@ impl SessionManager {
     }
 }
 
-fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, _pty: bool) {
+fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, _pty: bool, chroot: Option<&str>, chroot_cwd: Option<&str>) {
+    let mut chroot_owned = chroot.map(|s| std::ffi::CString::new(s));
+    let mut cwd_owned = chroot_cwd.map(|s| std::ffi::CString::new(s));
     unsafe {
         cmd.pre_exec(move || {
+            // Apply chroot if specified (must use CString for NUL-termination)
+            if let Some(Ok(dir)) = chroot_owned.take() {
+                if libc::chroot(dir.as_ptr()) != 0 {
+                    eprintln!("chroot failed: {}", std::io::Error::last_os_error());
+                    return std::io::Result::Err(std::io::Error::last_os_error());
+                }
+                // After chroot, current dir should be "/"
+                if libc::chdir(b"/\0".as_ptr() as *const libc::c_char) != 0 {
+                    eprintln!("chdir / after chroot failed: {}", std::io::Error::last_os_error());
+                    return std::io::Result::Err(std::io::Error::last_os_error());
+                }
+                if let Some(Ok(cwd)) = cwd_owned.take() {
+                    if libc::chdir(cwd.as_ptr()) != 0 {
+                        eprintln!("chdir {} after chroot failed: {}", cwd.to_string_lossy(), std::io::Error::last_os_error());
+                        return std::io::Result::Err(std::io::Error::last_os_error());
+                    }
+                }
+            }
             if libc::setgid(gid) != 0 {
                 eprintln!("setgid failed");
             }
@@ -454,4 +550,55 @@ pub fn daemonize() -> Result<()> {
         libc::setsid();
     }
     Ok(())
+}
+
+/// Map a signal number to its OpenSSH name (without "SIG" prefix).
+pub fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "HUP",
+        2 => "INT",
+        3 => "QUIT",
+        4 => "ILL",
+        5 => "TRAP",
+        6 => "ABRT",
+        7 => "BUS",
+        8 => "FPE",
+        9 => "KILL",
+        10 => "USR1",
+        11 => "SEGV",
+        12 => "USR2",
+        13 => "PIPE",
+        14 => "ALRM",
+        15 => "TERM",
+        16 => "STKFLT",
+        17 => "CHLD",
+        18 => "CONT",
+        19 => "STOP",
+        20 => "TSTP",
+        21 => "TTIN",
+        22 => "TTOU",
+        23 => "URG",
+        24 => "XCPU",
+        25 => "XFSZ",
+        26 => "VTALRM",
+        27 => "PROF",
+        28 => "WINCH",
+        29 => "IO",
+        30 => "PWR",
+        31 => "SYS",
+        _ => "UNKNOWN",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_name_mapping() {
+        assert_eq!(signal_name(2), "INT");
+        assert_eq!(signal_name(15), "TERM");
+        assert_eq!(signal_name(9), "KILL");
+        assert_eq!(signal_name(99), "UNKNOWN");
+    }
 }

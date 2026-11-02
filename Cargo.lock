@@ -818,6 +818,7 @@ dependencies = [
  "ctr",
  "dirs",
  "libc",
+ "md-5",
  "num-bigint",
  "rand",
  "rpassword",
