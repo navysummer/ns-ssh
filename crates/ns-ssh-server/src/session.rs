@@ -326,7 +326,7 @@ impl SessionManager {
     }
 }
 
-fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, _pty: bool, chroot: Option<&str>, chroot_cwd: Option<&str>) {
+fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, pty: bool, chroot: Option<&str>, chroot_cwd: Option<&str>) {
     let mut chroot_owned = chroot.map(|s| std::ffi::CString::new(s));
     let mut cwd_owned = chroot_cwd.map(|s| std::ffi::CString::new(s));
     unsafe {
@@ -349,6 +349,23 @@ fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, _pty: bool, ch
                     }
                 }
             }
+            // Place the session in its own session + process group so signal
+            // forwarding can target the whole group (`kill(-pid, sig)`),
+            // matching OpenSSH. For PTY sessions, make the pty slave (fd 0)
+            // the controlling terminal.
+            if libc::setsid() != 0 {
+                // Not fatal: continue without a fresh session.
+            }
+            if pty {
+                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            }
+            // Reset signal dispositions so the session child is killable by
+            // signal forwarding even if the server inherited SIG_IGN (e.g. it
+            // was started as a background job). OpenSSH does this too.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             if libc::setgid(gid) != 0 {
                 eprintln!("setgid failed");
             }
@@ -396,7 +413,12 @@ fn open_pty(
         libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
     }
 
-    let resize_fd = unsafe { libc::dup(slave) };
+    // Use a dup of the MASTER (not the slave) for TIOCSWINSZ. Holding a slave
+    // fd in the parent keeps the slave side open for the whole session, so the
+    // pty master read never returns EOF when the child exits and the server
+    // hangs in exit_poll waiting for the reader task to finish (readers_done
+    // never reaches 0). TIOCSWINSZ is valid on the master fd.
+    let resize_fd = unsafe { libc::dup(master) };
 
     let stdin_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(slave) };
     let stdout_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(libc::dup(slave)) };

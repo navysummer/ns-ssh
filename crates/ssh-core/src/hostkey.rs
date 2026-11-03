@@ -279,8 +279,11 @@ impl HostKeySigner for EcdsaP384HostKey {
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         use p384::ecdsa::signature::hazmat::PrehashSigner;
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        // RFC 5656 §6.2.1: the hash is tied to the curve — nistp384 uses SHA-384.
+        // Signing with SHA-256 produced a signature OpenSSH could never verify
+        // (it always hashes with SHA-384 for this curve).
+        use sha2::{Sha384, Digest};
+        let mut hasher = Sha384::new();
         hasher.update(data);
         let hash = hasher.finalize();
         let sig: p384::ecdsa::Signature = self.signing_key
@@ -298,8 +301,8 @@ impl HostKeySigner for EcdsaP384HostKey {
         let sig_bytes = SshBytes::decode(&mut r)?;
         let sig = p384::ecdsa::Signature::from_slice(&sig_bytes.0)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p384 sig: {}", e)))?;
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        use sha2::{Sha384, Digest};
+        let mut hasher = Sha384::new();
         hasher.update(data);
         let hash = hasher.finalize();
         use p384::ecdsa::signature::hazmat::PrehashVerifier;
@@ -375,8 +378,9 @@ impl HostKeySigner for EcdsaP521HostKey {
 
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         use p521::ecdsa::signature::hazmat::PrehashSigner;
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        // RFC 5656 §6.2.1: nistp521 is hashed with SHA-512, not SHA-256.
+        use sha2::{Sha512, Digest};
+        let mut hasher = Sha512::new();
         hasher.update(data);
         let hash = hasher.finalize();
         let sig = self.signing_key
@@ -394,8 +398,8 @@ impl HostKeySigner for EcdsaP521HostKey {
         let sig_bytes = SshBytes::decode(&mut r)?;
         let sig = p521::ecdsa::Signature::from_slice(&sig_bytes.0)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p521 sig: {}", e)))?;
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
+        use sha2::{Sha512, Digest};
+        let mut hasher = Sha512::new();
         hasher.update(data);
         let hash = hasher.finalize();
         use p521::ecdsa::signature::hazmat::PrehashVerifier;
@@ -629,4 +633,51 @@ pub fn get_supported_host_key_algorithms() -> Vec<&'static str> {
         "rsa-sha2-512",
         "ssh-rsa",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strip the `string keytype` prefix from an SSH signature blob.
+    fn ssh_sig_bytes(blob: &[u8]) -> Vec<u8> {
+        let mut r: &[u8] = blob;
+        let _ = SshString::decode(&mut r).unwrap();
+        SshBytes::decode(&mut r).unwrap().0
+    }
+
+    /// RFC 5656 §6.2.1: nistp384 hashes with SHA-384. A round-trip through our
+    /// own sign/verify would not catch a wrong hash (both sides would agree),
+    /// so pin the digest explicitly against the verifying key.
+    #[test]
+    fn ecdsa_p384_signature_uses_sha384() {
+        use p384::ecdsa::signature::hazmat::PrehashVerifier;
+        use sha2::{Digest, Sha256, Sha384};
+        let key = EcdsaP384HostKey::generate().unwrap();
+        let data = b"kex exchange hash";
+        let sig = ssh_sig_bytes(&key.sign(data).unwrap());
+
+        let good = Sha384::digest(data);
+        let parsed = p384::ecdsa::Signature::from_slice(&sig).unwrap();
+        assert!(key.verifying_key.verify_prehash(&good, &parsed).is_ok());
+
+        let wrong = Sha256::digest(data);
+        assert!(key.verifying_key.verify_prehash(&wrong, &parsed).is_err());
+    }
+
+    #[test]
+    fn ecdsa_p521_signature_uses_sha512() {
+        use p521::ecdsa::signature::hazmat::PrehashVerifier;
+        use sha2::{Digest, Sha256, Sha512};
+        let key = EcdsaP521HostKey::generate().unwrap();
+        let data = b"kex exchange hash";
+        let sig = ssh_sig_bytes(&key.sign(data).unwrap());
+
+        let good = Sha512::digest(data);
+        let parsed = p521::ecdsa::Signature::from_slice(&sig).unwrap();
+        assert!(key.verifying_key.verify_prehash(&good, &parsed).is_ok());
+
+        let wrong = Sha256::digest(data);
+        assert!(key.verifying_key.verify_prehash(&wrong, &parsed).is_err());
+    }
 }

@@ -390,7 +390,8 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) {
         "chrootdirectory" | "chroot_directory" => o.chroot_directory = Some(value.to_string()),
         "authorizedkeysfile" | "authorized_keys_file" => {
             let mut list = o.authorized_keys_files.take().unwrap_or_default();
-            list.push(value.to_string());
+            // OpenSSH allows a whitespace-separated list of files.
+            list.extend(value.split_whitespace().map(|s| s.to_string()));
             o.authorized_keys_files = Some(list);
         }
         "maxsessions" | "max_sessions" => {
@@ -642,7 +643,9 @@ fn default_max_startups() -> String { "10:30:60".to_string() }
 fn default_login_grace_time() -> u32 { 120 }
 
 fn default_accept_env() -> Vec<String> {
-    vec!["LANG".to_string(), "LC_*".to_string()]
+    // OpenSSH's default is not to accept any environment variables from the
+    // client; `AcceptEnv` must be configured explicitly.
+    Vec::new()
 }
 
 fn default_x11_display_offset() -> u32 { 10 }
@@ -946,7 +949,10 @@ impl ServerConfig {
                     config.permit_root_login = v == "yes";
                 }
                 "authorizedkeysfile" | "authorized_keys_file" => {
-                    config.authorized_keys_files.push(value.to_string());
+                    // OpenSSH allows a whitespace-separated list of files.
+                    config.authorized_keys_files.extend(
+                        value.split_whitespace().map(|s| s.to_string())
+                    );
                 }
                 "allowgroups" | "allow_groups" => {
                     config.allow_groups.extend(value.split_whitespace().map(|s| s.to_string()));
@@ -1043,6 +1049,10 @@ impl ServerConfig {
                 }
                 "permitlisten" | "permit_listen" => {
                     config.permit_listen.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
+                }
+                "acceptenv" | "accept_env" => {
+                    // OpenSSH allows whitespace/comma-separated patterns.
+                    config.accept_env.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
                 }
                 "gatewayports" | "gateway_ports" => {
                     config.gateway_ports = value.to_lowercase();

@@ -157,6 +157,11 @@ pub struct SshTransport {
     pub server_kex_init: Vec<u8>,
     pub outgoing_seq: u64,
     pub incoming_seq: u64,
+    /// Actual bytes written to the wire (including the 4-byte packet_length
+    /// field and any MAC/AEAD tag) since this transport was created.
+    pub bytes_out: u64,
+    /// Actual bytes read from the wire since this transport was created.
+    pub bytes_in: u64,
     pub exchange: Option<KexExchange>,
     pub last_rekey_bytes: u64,
     pub last_rekey_instant: std::time::Instant,
@@ -187,6 +192,8 @@ impl SshTransport {
             server_kex_init: Vec::new(),
             outgoing_seq: 0,
             incoming_seq: 0,
+            bytes_out: 0,
+            bytes_in: 0,
             exchange: None,
             last_rekey_bytes: 0,
             last_rekey_instant: std::time::Instant::now(),
@@ -245,14 +252,19 @@ impl SshTransport {
         payload
     }
 
-    pub fn prepare_rekey(&mut self) -> Vec<u8> {
+    pub fn prepare_rekey(&mut self, is_server: bool) -> Vec<u8> {
         let mut cookie = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
         let mut payload = Vec::new();
         payload.push(msg::SSH_MSG_KEXINIT);
         payload.extend_from_slice(&cookie);
-        payload.extend(self.client_kex_init[17..].to_vec());
-        self.client_kex_init = payload.clone();
+        let source = if is_server { self.server_kex_init.clone() } else { self.client_kex_init.clone() };
+        payload.extend(source[17..].to_vec());
+        if is_server {
+            self.server_kex_init = payload.clone();
+        } else {
+            self.client_kex_init = payload.clone();
+        }
         payload
     }
 
@@ -265,7 +277,7 @@ impl SshTransport {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.outgoing_seq.saturating_add(self.incoming_seq).saturating_mul(1400)
+        self.bytes_out.saturating_add(self.bytes_in)
     }
 
     pub fn negotiate_algorithms(
@@ -302,10 +314,23 @@ impl SshTransport {
             .ok_or_else(|| SshError::KexFailed("no common client-to-server cipher".into()))?;
         let cipher_sc = choose_algorithm(&client_ciphers_sc.0, &server_ciphers_sc.0)
             .ok_or_else(|| SshError::KexFailed("no common server-to-client cipher".into()))?;
-        let mac_cs = choose_algorithm(&client_macs_cs.0, &server_macs_cs.0)
-            .ok_or_else(|| SshError::KexFailed("no common client-to-server mac".into()))?;
-        let mac_sc = choose_algorithm(&client_macs_sc.0, &server_macs_sc.0)
-            .ok_or_else(|| SshError::KexFailed("no common server-to-client mac".into()))?;
+        // AEAD ciphers (including chacha20-poly1305@openssh.com) carry their
+        // own authentication tag (Poly1305 / GCM); there is no separate MAC
+        // algorithm. OpenSSH reports "<implicit>" in this case.
+        let mac_cs = if crate::cipher::create_cipher(&cipher_cs)
+            .map(|c| c.is_aead()).unwrap_or(false) {
+            "none".to_string()
+        } else {
+            choose_algorithm(&client_macs_cs.0, &server_macs_cs.0)
+                .ok_or_else(|| SshError::KexFailed("no common client-to-server mac".into()))?
+        };
+        let mac_sc = if crate::cipher::create_cipher(&cipher_sc)
+            .map(|c| c.is_aead()).unwrap_or(false) {
+            "none".to_string()
+        } else {
+            choose_algorithm(&client_macs_sc.0, &server_macs_sc.0)
+                .ok_or_else(|| SshError::KexFailed("no common server-to-client mac".into()))?
+        };
         let comp_cs = choose_algorithm(&client_comps_cs.0, &server_comps_cs.0)
             .unwrap_or_else(|| "none".to_string());
         let comp_sc = choose_algorithm(&client_comps_sc.0, &server_comps_sc.0)
@@ -385,9 +410,9 @@ impl SshTransport {
         let s2c_iv_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.iv_len();
         let s2c_mac_len = crate::mac::create_mac(&negotiation.server_to_client_mac)?.key_len();
 
-        let s2c_iv = derive_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len);
-        let s2c_key = derive_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len);
-        let s2c_mac_key = derive_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len);
+        let s2c_iv = crate::kex::derive_s2c_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len);
+        let s2c_key = crate::kex::derive_s2c_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len);
+        let s2c_mac_key = crate::kex::derive_s2c_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len);
 
         let mut c2s_cipher = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?;
         c2s_cipher.set_key(&c2s_key)?;
@@ -406,6 +431,12 @@ impl SshTransport {
         let mut s2c_mac = crate::mac::create_mac(&negotiation.server_to_client_mac)?;
         s2c_mac.set_key(&s2c_mac_key)?;
         self.server_to_client_mac = Some(s2c_mac);
+
+        if std::env::var("NS_DEBUG_PKT").is_ok() {
+            let h = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+            eprintln!("KEYS c2s_key={} c2s_iv={} c2s_mac={} s2c_key={} s2c_iv={} s2c_mac={}",
+                h(&c2s_key), h(&c2s_iv), h(&c2s_mac_key), h(&s2c_key), h(&s2c_iv), h(&s2c_mac_key));
+        }
 
         Ok(())
     }
@@ -428,32 +459,94 @@ pub async fn send_version_string(stream: &mut (impl AsyncWrite + Unpin), version
 }
 
 pub async fn read_version_string(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>> {
-    let mut version = Vec::new();
     let mut buf = [0u8; 1];
+    // RFC 4253 §4.2: the server may send arbitrary "banner" lines before its
+    // identification string. Any line that does not start with "SSH-" is
+    // ancillary text and must be skipped; the protocol starts at the first
+    // "SSH-" line.
     loop {
-        stream.read_exact(&mut buf).await?;
-        if buf[0] == b'\n' {
-            break;
+        let mut line = Vec::new();
+        loop {
+            stream.read_exact(&mut buf).await?;
+            if buf[0] == b'\n' {
+                break;
+            }
+            if buf[0] != b'\r' {
+                line.push(buf[0]);
+            }
+            if line.len() > 255 {
+                return Err(SshError::Protocol("version string too long".into()));
+            }
         }
-        if buf[0] != b'\r' {
-            version.push(buf[0]);
-        }
-        if version.len() > 255 {
-            return Err(SshError::Protocol("version string too long".into()));
+        if line.starts_with(b"SSH-") {
+            return Ok(line);
         }
     }
-    Ok(version)
+}
+
+/// Compute the random-padding length for an SSH packet (RFC 4253 §6).
+///
+/// `base` is the length of `padding_length byte + payload` (i.e. 1 + payload.len()).
+///
+/// When `packet_length_encrypted` is true (non-ETM MAC, or the pre-key "none"
+/// cipher) the 4-byte packet_length field is part of the encrypted stream and
+/// OpenSSH requires `(4 + packet_length)` to be a multiple of the block size
+/// (`need = 4 + packlen - block_size` must be block-aligned). When false
+/// (ETM MAC or an AEAD cipher) the packet_length field is authenticated but not
+/// encrypted, so OpenSSH requires `packet_length` itself to be a multiple of
+/// the block size. Minimum padding is 4 bytes.
+pub fn compute_packet_padding(
+    base: usize,
+    block_size: usize,
+    packet_length_encrypted: bool,
+) -> usize {
+    let target = if packet_length_encrypted { (block_size - 4) % block_size } else { 0 };
+    let rem = base % block_size;
+    let mut padding_len = (target + block_size - rem) % block_size;
+    if padding_len < 4 { padding_len += block_size; }
+    padding_len
+}
+
+/// Validate a decrypted/plain packet body (`padding_length || payload || padding`)
+/// and return the payload.
+///
+/// `padding_length` is supplied by the peer, so it must never be trusted for
+/// slice arithmetic: RFC 4253 §6 requires at least 4 bytes of padding and at
+/// least one payload byte, and any body that violates that is rejected with
+/// `InvalidPacket` instead of underflowing `body.len() - 1 - padding_length`
+/// (which used to panic in debug builds and slice out of bounds otherwise).
+pub fn unpack_packet_body(body: &[u8]) -> Result<Vec<u8>> {
+    let padding_len = match body.first() {
+        Some(v) => *v as usize,
+        None => return Err(SshError::InvalidPacket("empty packet body".into())),
+    };
+    // RFC 4253 §6: "There MUST be at least four bytes of padding."
+    if padding_len < 4 {
+        return Err(SshError::InvalidPacket(format!(
+            "invalid padding length: {}",
+            padding_len
+        )));
+    }
+    // Reject before subtracting: keeps at least one payload byte
+    // (RFC 4253 §6: the payload "MUST be at least one byte").
+    if padding_len + 1 >= body.len() {
+        return Err(SshError::InvalidPacket(format!(
+            "padding length {} exceeds packet body length {}",
+            padding_len,
+            body.len()
+        )));
+    }
+    Ok(body[1..body.len() - padding_len].to_vec())
 }
 
 pub async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> Result<()> {
     let base = 1 + payload.len();
-    let remainder = base % 8;
-    let mut padding_len = if remainder == 0 { 0 } else { 8 - remainder };
-    if padding_len < 4 { padding_len += 8; }
+    let padding_len = compute_packet_padding(base, 8, true);
     let mut padding = [0u8; 64];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
     let body_len = base + padding_len;
-    let packet_len_field = (4 + body_len) as u32;
+    // RFC 4253 §6: packet_length excludes its own 4-byte field.
+    let packet_len_field = body_len as u32;
 
     let mut packet = Vec::new();
     packet.extend(&packet_len_field.to_be_bytes());
@@ -471,23 +564,15 @@ pub async fn receive_raw_packet(stream: &mut (impl AsyncRead + Unpin)) -> Result
     stream.read_exact(&mut len_buf).await?;
     let total_len = u32::from_be_bytes(len_buf) as usize;
 
-    if total_len > MAX_PACKET_SIZE || total_len < 12 {
+    if total_len > MAX_PACKET_SIZE || total_len < 5 {
         return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
     }
-    let body_len = total_len - 4;
+    let body_len = total_len;
 
     let mut rest = vec![0u8; body_len];
     stream.read_exact(&mut rest).await?;
 
-    let padding_len = rest[0] as usize;
-    let payload_len = body_len - 1 - padding_len;
-
-    if payload_len == 0 {
-        return Err(SshError::InvalidPacket("empty payload".into()));
-    }
-
-    let payload = rest[1..1 + payload_len].to_vec();
-    Ok(payload)
+    unpack_packet_body(&rest)
 }
 
 pub async fn send_encrypted_packet(
@@ -497,7 +582,12 @@ pub async fn send_encrypted_packet(
     is_newkeys: bool,
     is_aead: bool,
 ) -> Result<()> {
-    if transport.client_to_server_cipher.is_none() || transport.client_to_server_mac.is_none() {
+    if transport.client_to_server_cipher.is_none() {
+        // Unencrypted pre-KEX / NEWKEYS packets still count toward the rekey
+        // budget; the padding rule is deterministic, so the wire length is
+        // known before writing.
+        let base = 1 + payload.len();
+        transport.bytes_out += (4 + base + compute_packet_padding(base, 8, true)) as u64;
         return send_raw_packet(stream, payload).await;
     }
 
@@ -512,20 +602,24 @@ pub async fn send_encrypted_packet(
     };
 
     let cipher = transport.client_to_server_cipher.as_mut().unwrap();
-    let mac = transport.client_to_server_mac.as_ref().unwrap();
+    let mac = transport.client_to_server_mac.as_ref();
     let block_size = cipher.block_size().max(8);
     let seq = transport.outgoing_seq;
+    let mut wire_len: usize;
 
     if is_aead {
-        let tag_len = cipher.tag_len();
+        let chachapoly = cipher.is_chachapoly();
         let base = 1 + payload.len();
-        let remainder = base % block_size;
-        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-        if padding_len < 4 { padding_len += block_size; }
+        // AEAD always uses aadlen=4 (OpenSSH: aadlen = (mac && etm) || authlen
+        // ? 4 : 0), so packet_length itself must be block-aligned — for
+        // AES-GCM (block 16) and chacha20-poly1305 (block 8) alike. chacha
+        // merely encrypts the length field on the wire with its header key;
+        // that does not change the padding rule.
+        let padding_len = compute_packet_padding(base, block_size, false);
         let mut padding = [0u8; 64];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
         let body_len = base + padding_len;
-        let packet_len_field = (4 + body_len) as u32;
+        let packet_len_field = body_len as u32;
 
         let mut packet = Vec::new();
         packet.extend(&packet_len_field.to_be_bytes());
@@ -533,20 +627,27 @@ pub async fn send_encrypted_packet(
         packet.extend(&payload);
         packet.extend(&padding[..padding_len]);
 
-        let ciphertext = cipher.encrypt(seq, &packet[4..])?;
-        packet.truncate(4);
-        packet.extend(&ciphertext);
-
-        stream.write_all(&packet).await?;
+        if chachapoly {
+            let ciphertext = cipher.encrypt(seq, &packet)?;
+            wire_len = ciphertext.len();
+            stream.write_all(&ciphertext).await?;
+        } else {
+            // AES-GCM authenticates the cleartext packet_length as AAD.
+            let ciphertext = cipher.encrypt_with_aad(seq, &packet[..4], &packet[4..])?;
+            packet.truncate(4);
+            packet.extend(&ciphertext);
+            wire_len = packet.len();
+            stream.write_all(&packet).await?;
+        }
     } else {
+        let mac = mac.unwrap();
         let base = 1 + payload.len();
-        let remainder = base % block_size;
-        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-        if padding_len < 4 { padding_len += block_size; }
+        // ETM leaves packet_length in the clear (target 0); non-ETM encrypts it.
+        let padding_len = compute_packet_padding(base, block_size, !mac.as_ref().is_etm());
         let mut padding = [0u8; 64];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
         let body_len = base + padding_len;
-        let packet_len_field = (4 + body_len) as u32;
+        let packet_len_field = body_len as u32;
         let len_bytes = packet_len_field.to_be_bytes();
 
         let mut packet_data = Vec::new();
@@ -554,25 +655,39 @@ pub async fn send_encrypted_packet(
         packet_data.extend(&payload);
         packet_data.extend(&padding[..padding_len]);
 
-        let ciphertext = cipher.encrypt(seq, &packet_data)?;
-        let mac_tag = if mac.as_ref().is_etm() {
+        let packet = if mac.as_ref().is_etm() {
+            // RFC 6668: ETM leaves packet_length in the clear and authenticates
+            // seq || packet_length || ciphertext, so encrypt only the body.
+            let ciphertext = cipher.encrypt(seq, &packet_data)?;
             let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
             etm_input.extend_from_slice(&len_bytes);
             etm_input.extend_from_slice(&ciphertext);
-            mac.as_ref().compute_tag(seq, &etm_input)?
+            let mac_tag = mac.as_ref().compute_tag(seq, &etm_input)?;
+
+            let mut packet = Vec::new();
+            packet.extend_from_slice(&len_bytes);
+            packet.extend(&ciphertext);
+            packet.extend(&mac_tag);
+            packet
         } else {
-            mac.as_ref().compute_tag(seq, &packet_data)?
+            // RFC 4253 §6.4: a non-ETM MAC's packet_length is encrypted as
+            // part of the first cipher block. Encrypt the whole packet (length
+            // included) and authenticate the plaintext packet.
+            let mut plain = Vec::with_capacity(4 + packet_data.len());
+            plain.extend_from_slice(&len_bytes);
+            plain.extend_from_slice(&packet_data);
+            let mac_tag = mac.as_ref().compute_tag(seq, &plain)?;
+            let mut packet = cipher.encrypt(seq, &plain)?;
+            packet.extend(&mac_tag);
+            packet
         };
 
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&len_bytes);
-        packet.extend(&ciphertext);
-        packet.extend(&mac_tag);
-
+        wire_len = packet.len();
         stream.write_all(&packet).await?;
     }
 
     if !is_newkeys {
+        transport.bytes_out += wire_len as u64;
         transport.outgoing_seq += 1;
     }
     stream.flush().await?;
@@ -585,73 +700,84 @@ pub async fn receive_encrypted_packet(
     is_newkeys: bool,
     is_aead: bool,
 ) -> Result<Vec<u8>> {
-    if transport.server_to_client_cipher.is_none() || transport.server_to_client_mac.is_none() {
-        return receive_raw_packet(stream).await;
+    if transport.server_to_client_cipher.is_none() {
+        let payload = receive_raw_packet(stream).await?;
+        let base = 1 + payload.len();
+        transport.bytes_in += (4 + base + compute_packet_padding(base, 8, true)) as u64;
+        return Ok(payload);
     }
 
     let cipher = transport.server_to_client_cipher.as_mut().unwrap();
-    let mac = transport.server_to_client_mac.as_ref().unwrap();
+    let mac = transport.server_to_client_mac.as_ref();
     let seq = transport.incoming_seq;
 
     let payload = if is_aead {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let total_len = u32::from_be_bytes(len_buf) as usize;
         let tag_len = cipher.tag_len();
-
-        if total_len > MAX_PACKET_SIZE || total_len < 12 {
-            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
-        }
-        let body_len = total_len - 4;
-
-        let mut ciphertext = vec![0u8; body_len + tag_len];
-        stream.read_exact(&mut ciphertext).await?;
-
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        let padding_len = plaintext[0] as usize;
-        let payload_len = body_len - 1 - padding_len;
-        let payload = plaintext[1..1 + payload_len].to_vec();
-
-        if !is_newkeys { transport.incoming_seq += 1; }
-        payload
-    } else {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let total_len = u32::from_be_bytes(len_buf) as usize;
-        let block_size = cipher.block_size().max(8);
-        let mac_len = mac.tag_len();
-
-        if total_len > MAX_PACKET_SIZE || total_len < 12 || (total_len - 4) % block_size != 0 {
-            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
-        }
-        let body_len = total_len - 4;
-
-        let mut ciphertext = vec![0u8; body_len];
-        stream.read_exact(&mut ciphertext).await?;
-        let mut mac_buf = vec![0u8; mac_len];
-        stream.read_exact(&mut mac_buf).await?;
-
-        let mac_ok = if mac.as_ref().is_etm() {
-            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
-            etm_input.extend_from_slice(&len_buf);
-            etm_input.extend_from_slice(&ciphertext);
-            mac.as_ref().verify_tag(seq, &etm_input, &mac_buf)?
+        if cipher.is_chachapoly() {
+            // chacha20-poly1305@openssh.com: the 4-byte packet_length is
+            // encrypted with the header key, and the Poly1305 tag follows the
+            // ciphertext. `cipher.decrypt` expects ciphertext || tag.
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let plen = cipher.decrypt_length(seq, &len_buf)? as usize;
+            // AEAD uses aadlen=4, so packet_length is block-aligned.
+            if plen > MAX_PACKET_SIZE || plen < 5 || plen % cipher.block_size() != 0 {
+                return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
+            }
+            let mut ct = Vec::with_capacity(4 + plen + tag_len);
+            ct.extend_from_slice(&len_buf);
+            let mut body_ct = vec![0u8; plen];
+            stream.read_exact(&mut body_ct).await?;
+            ct.extend_from_slice(&body_ct);
+            if tag_len > 0 {
+                let mut tag = vec![0u8; tag_len];
+                stream.read_exact(&mut tag).await?;
+                ct.extend_from_slice(&tag);
+            }
+            let plaintext = cipher.decrypt(seq, &ct)
+                .map_err(|_| SshError::DecryptionFailed)?;
+            if plaintext.len() < 4 {
+                return Err(SshError::Protocol("chacha packet too short".into()));
+            }
+            let payload = unpack_packet_body(&plaintext[4..])?;
+            if !is_newkeys {
+                transport.bytes_in += (4 + plen + tag_len) as u64;
+                transport.incoming_seq += 1;
+            }
+            payload
         } else {
-            true
-        };
-        if mac.as_ref().is_etm() && !mac_ok {
-            return Err(SshError::DecryptionFailed);
+            // GCM and other AEAD ciphers: packet_length is cleartext and
+            // authenticated; the tag follows the ciphertext.
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let total_len = u32::from_be_bytes(len_buf) as usize;
+            // AEAD uses aadlen=4, so packet_length is block-aligned.
+            if total_len > MAX_PACKET_SIZE || total_len < 5 || total_len % cipher.block_size() != 0 {
+                return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
+            }
+            let mut ciphertext = vec![0u8; total_len + tag_len];
+            stream.read_exact(&mut ciphertext).await?;
+            // AES-GCM authenticates the cleartext packet_length as AAD.
+            let plaintext = cipher.decrypt_with_aad(seq, &len_buf, &ciphertext)
+                .map_err(|_| SshError::DecryptionFailed)?;
+            let payload = unpack_packet_body(&plaintext)?;
+            if !is_newkeys {
+                transport.bytes_in += (4 + total_len + tag_len) as u64;
+                transport.incoming_seq += 1;
+            }
+            payload
         }
-
-        let plaintext = decrypt_verify_non_etm(cipher, mac, seq, &ciphertext, &mac_buf)?;
-
-        let padding_len = plaintext[0] as usize;
-        let payload_len = body_len - 1 - padding_len;
-        let payload = plaintext[1..1 + payload_len].to_vec();
-
-        if !is_newkeys { transport.incoming_seq += 1; }
+    } else {
+        let mac = mac.unwrap();
+        let (payload, wire_len) = if mac.as_ref().is_etm() {
+            receive_etm_packet(stream, cipher, mac, seq).await?
+        } else {
+            receive_non_etm_packet(stream, cipher, mac, seq).await?
+        };
+        if !is_newkeys {
+            transport.bytes_in += wire_len as u64;
+            transport.incoming_seq += 1;
+        }
         payload
     };
 
@@ -674,6 +800,8 @@ pub async fn send_encrypted_packet_server(
     is_aead: bool,
 ) -> Result<()> {
     if transport.server_to_client_cipher.is_none() || transport.server_to_client_mac.is_none() {
+        let base = 1 + payload.len();
+        transport.bytes_out += (4 + base + compute_packet_padding(base, 8, true)) as u64;
         return send_raw_packet(stream, payload).await;
     }
 
@@ -691,17 +819,18 @@ pub async fn send_encrypted_packet_server(
     let mac = transport.server_to_client_mac.as_ref().unwrap();
     let block_size = cipher.block_size().max(8);
     let seq = transport.outgoing_seq;
+    let mut wire_len: usize;
 
     if is_aead {
-        let tag_len = cipher.tag_len();
+        let chachapoly = cipher.is_chachapoly();
         let base = 1 + payload.len();
-        let remainder = base % block_size;
-        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-        if padding_len < 4 { padding_len += block_size; }
+        // AEAD always uses aadlen=4, so packet_length is block-aligned for
+        // both AES-GCM (16) and chacha20-poly1305 (8).
+        let padding_len = compute_packet_padding(base, block_size, false);
         let mut padding = [0u8; 64];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
         let body_len = base + padding_len;
-        let packet_len_field = (4 + body_len) as u32;
+        let packet_len_field = body_len as u32;
 
         let mut packet = Vec::new();
         packet.extend(&packet_len_field.to_be_bytes());
@@ -709,20 +838,27 @@ pub async fn send_encrypted_packet_server(
         packet.extend(&payload);
         packet.extend(&padding[..padding_len]);
 
-        let ciphertext = cipher.encrypt(seq, &packet[4..])?;
-        packet.truncate(4);
-        packet.extend(&ciphertext);
-
-        stream.write_all(&packet).await?;
+        if chachapoly {
+            // encrypt() returns ciphertext || tag over the whole packet.
+            let ciphertext = cipher.encrypt(seq, &packet)?;
+            wire_len = ciphertext.len();
+            stream.write_all(&ciphertext).await?;
+        } else {
+            // AES-GCM authenticates the cleartext packet_length as AAD.
+            let ciphertext = cipher.encrypt_with_aad(seq, &packet[..4], &packet[4..])?;
+            packet.truncate(4);
+            packet.extend(&ciphertext);
+            wire_len = packet.len();
+            stream.write_all(&packet).await?;
+        }
     } else {
         let base = 1 + payload.len();
-        let remainder = base % block_size;
-        let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-        if padding_len < 4 { padding_len += block_size; }
+        // ETM leaves packet_length in the clear (target 0); non-ETM encrypts it.
+        let padding_len = compute_packet_padding(base, block_size, !mac.as_ref().is_etm());
         let mut padding = [0u8; 64];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..padding_len.min(64)]);
         let body_len = base + padding_len;
-        let packet_len_field = (4 + body_len) as u32;
+        let packet_len_field = body_len as u32;
         let len_bytes = packet_len_field.to_be_bytes();
 
         let mut packet_data = Vec::new();
@@ -730,25 +866,39 @@ pub async fn send_encrypted_packet_server(
         packet_data.extend(&payload);
         packet_data.extend(&padding[..padding_len]);
 
-        let ciphertext = cipher.encrypt(seq, &packet_data)?;
-        let mac_tag = if mac.as_ref().is_etm() {
+        let packet = if mac.as_ref().is_etm() {
+            // RFC 6668: ETM leaves packet_length in the clear and authenticates
+            // seq || packet_length || ciphertext, so encrypt only the body.
+            let ciphertext = cipher.encrypt(seq, &packet_data)?;
             let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
             etm_input.extend_from_slice(&len_bytes);
             etm_input.extend_from_slice(&ciphertext);
-            mac.as_ref().compute_tag(seq, &etm_input)?
+            let mac_tag = mac.as_ref().compute_tag(seq, &etm_input)?;
+
+            let mut packet = Vec::new();
+            packet.extend_from_slice(&len_bytes);
+            packet.extend(&ciphertext);
+            packet.extend(&mac_tag);
+            packet
         } else {
-            mac.as_ref().compute_tag(seq, &packet_data)?
+            // RFC 4253 §6.4: a non-ETM MAC's packet_length is encrypted as
+            // part of the first cipher block. Encrypt the whole packet (length
+            // included) and authenticate the plaintext packet.
+            let mut plain = Vec::with_capacity(4 + packet_data.len());
+            plain.extend_from_slice(&len_bytes);
+            plain.extend_from_slice(&packet_data);
+            let mac_tag = mac.as_ref().compute_tag(seq, &plain)?;
+            let mut packet = cipher.encrypt(seq, &plain)?;
+            packet.extend(&mac_tag);
+            packet
         };
 
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&len_bytes);
-        packet.extend(&ciphertext);
-        packet.extend(&mac_tag);
-
+        wire_len = packet.len();
         stream.write_all(&packet).await?;
     }
 
     if !is_newkeys {
+        transport.bytes_out += wire_len as u64;
         transport.outgoing_seq += 1;
     }
     stream.flush().await?;
@@ -762,7 +912,10 @@ pub async fn receive_encrypted_packet_server(
     is_aead: bool,
 ) -> Result<Vec<u8>> {
     if transport.client_to_server_cipher.is_none() || transport.client_to_server_mac.is_none() {
-        return receive_raw_packet(stream).await;
+        let payload = receive_raw_packet(stream).await?;
+        let base = 1 + payload.len();
+        transport.bytes_in += (4 + base + compute_packet_padding(base, 8, true)) as u64;
+        return Ok(payload);
     }
 
     let cipher = transport.client_to_server_cipher.as_mut().unwrap();
@@ -770,64 +923,69 @@ pub async fn receive_encrypted_packet_server(
     let seq = transport.incoming_seq;
 
     let payload = if is_aead {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let total_len = u32::from_be_bytes(len_buf) as usize;
         let tag_len = cipher.tag_len();
-
-        if total_len > MAX_PACKET_SIZE || total_len < 12 {
-            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
-        }
-        let body_len = total_len - 4;
-
-        let mut ciphertext = vec![0u8; body_len + tag_len];
-        stream.read_exact(&mut ciphertext).await?;
-
-        let plaintext = cipher.decrypt(seq, &ciphertext)
-            .map_err(|_| SshError::DecryptionFailed)?;
-
-        let padding_len = plaintext[0] as usize;
-        let payload_len = body_len - 1 - padding_len;
-        let payload = plaintext[1..1 + payload_len].to_vec();
-
-        if !is_newkeys { transport.incoming_seq += 1; }
-        payload
-    } else {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let total_len = u32::from_be_bytes(len_buf) as usize;
-        let block_size = cipher.block_size().max(8);
-        let mac_len = mac.tag_len();
-
-        if total_len > MAX_PACKET_SIZE || total_len < 12 || (total_len - 4) % block_size != 0 {
-            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
-        }
-        let body_len = total_len - 4;
-
-        let mut ciphertext = vec![0u8; body_len];
-        stream.read_exact(&mut ciphertext).await?;
-        let mut mac_buf = vec![0u8; mac_len];
-        stream.read_exact(&mut mac_buf).await?;
-
-        let mac_ok = if mac.as_ref().is_etm() {
-            let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
-            etm_input.extend_from_slice(&len_buf);
-            etm_input.extend_from_slice(&ciphertext);
-            mac.as_ref().verify_tag(seq, &etm_input, &mac_buf)?
+        if cipher.is_chachapoly() {
+            // chacha20-poly1305@openssh.com: encrypted packet_length (header
+            // key) followed by the body and the Poly1305 tag.
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let plen = cipher.decrypt_length(seq, &len_buf)? as usize;
+            // AEAD uses aadlen=4, so packet_length is block-aligned.
+            if plen > MAX_PACKET_SIZE || plen < 5 || plen % cipher.block_size() != 0 {
+                return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
+            }
+            let mut ct = Vec::with_capacity(4 + plen + tag_len);
+            ct.extend_from_slice(&len_buf);
+            let mut body_ct = vec![0u8; plen];
+            stream.read_exact(&mut body_ct).await?;
+            ct.extend_from_slice(&body_ct);
+            if tag_len > 0 {
+                let mut tag = vec![0u8; tag_len];
+                stream.read_exact(&mut tag).await?;
+                ct.extend_from_slice(&tag);
+            }
+            let plaintext = cipher.decrypt(seq, &ct)
+                .map_err(|_| SshError::DecryptionFailed)?;
+            if plaintext.len() < 4 {
+                return Err(SshError::Protocol("chacha packet too short".into()));
+            }
+            let payload = unpack_packet_body(&plaintext[4..])?;
+            if !is_newkeys {
+                transport.bytes_in += (4 + plen + tag_len) as u64;
+                transport.incoming_seq += 1;
+            }
+            payload
         } else {
-            true
-        };
-        if mac.as_ref().is_etm() && !mac_ok {
-            return Err(SshError::DecryptionFailed);
+            // GCM and other AEAD ciphers: packet_length is cleartext.
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let total_len = u32::from_be_bytes(len_buf) as usize;
+            // AEAD uses aadlen=4, so packet_length is block-aligned.
+            if total_len > MAX_PACKET_SIZE || total_len < 5 || total_len % cipher.block_size() != 0 {
+                return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
+            }
+            let mut ciphertext = vec![0u8; total_len + tag_len];
+            stream.read_exact(&mut ciphertext).await?;
+            // AES-GCM authenticates the cleartext packet_length as AAD.
+            let plaintext = cipher.decrypt_with_aad(seq, &len_buf, &ciphertext)
+                .map_err(|_| SshError::DecryptionFailed)?;
+            let payload = unpack_packet_body(&plaintext)?;
+            if !is_newkeys {
+                transport.bytes_in += (4 + total_len + tag_len) as u64;
+                transport.incoming_seq += 1;
+            }
+            payload
         }
-
-        let plaintext = decrypt_verify_non_etm(cipher, mac, seq, &ciphertext, &mac_buf)?;
-
-        let padding_len = plaintext[0] as usize;
-        let payload_len = body_len - 1 - padding_len;
-        let payload = plaintext[1..1 + payload_len].to_vec();
-
-        if !is_newkeys { transport.incoming_seq += 1; }
+    } else {
+        let (payload, wire_len) = if mac.is_etm() {
+            receive_etm_packet(stream, cipher, mac, seq).await?
+        } else {
+            receive_non_etm_packet(stream, cipher, mac, seq).await?
+        };
+        if !is_newkeys {
+            transport.bytes_in += wire_len as u64;
+            transport.incoming_seq += 1;
+        }
         payload
     };
 
@@ -842,33 +1000,90 @@ pub async fn receive_encrypted_packet_server(
     }
 }
 
-/// Decrypt and verify a non-ETM MAC, running a dummy MAC check on decryption
-/// failure so the failure path takes comparable time (CBC padding-oracle
-/// mitigation, matching OpenSSH's constant-time behavior).
-fn decrypt_verify_non_etm(
+/// Read an ETM packet: packet_length is cleartext, the MAC covers
+/// `seq || packet_length || ciphertext` and is verified before decryption.
+/// Returns the payload and the number of wire bytes consumed.
+async fn receive_etm_packet(
+    stream: &mut (impl AsyncRead + Unpin + ?Sized),
     cipher: &mut Box<dyn SshCipher>,
     mac: &Box<dyn SshMac>,
     seq: u64,
-    ciphertext: &[u8],
-    mac_buf: &[u8],
-) -> Result<Vec<u8>> {
-    let plaintext = match cipher.decrypt(seq, ciphertext) {
-        Ok(p) => p,
-        Err(_) => {
-            if !mac.is_etm() {
-                let dummy = vec![0u8; mac_buf.len().max(16)];
-                let _ = mac.verify_tag(seq, &dummy, mac_buf);
-            }
-            return Err(SshError::DecryptionFailed);
-        }
-    };
-    if !mac.is_etm() {
-        let mac_ok = mac.verify_tag(seq, &plaintext, mac_buf)?;
-        if !mac_ok {
-            return Err(SshError::DecryptionFailed);
-        }
+) -> Result<(Vec<u8>, usize)> {
+    let block_size = cipher.block_size().max(8);
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let total_len = u32::from_be_bytes(len_buf) as usize;
+
+    if total_len > MAX_PACKET_SIZE || total_len < 5 || total_len % block_size != 0 {
+        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
     }
-    Ok(plaintext)
+
+    let mut ciphertext = vec![0u8; total_len];
+    stream.read_exact(&mut ciphertext).await?;
+    let mut mac_buf = vec![0u8; mac.tag_len()];
+    stream.read_exact(&mut mac_buf).await?;
+
+    let mut etm_input = Vec::with_capacity(4 + ciphertext.len());
+    etm_input.extend_from_slice(&len_buf);
+    etm_input.extend_from_slice(&ciphertext);
+    if !mac.verify_tag(seq, &etm_input, &mac_buf)? {
+        return Err(SshError::DecryptionFailed);
+    }
+
+    let plaintext = cipher.decrypt(seq, &ciphertext)
+        .map_err(|_| SshError::DecryptionFailed)?;
+    Ok((unpack_packet_body(&plaintext)?, 4 + total_len + mac.tag_len()))
+}
+
+/// Read a non-ETM packet (RFC 4253 §6.4): the 4-byte packet_length is part of
+/// the encrypted stream, so the first cipher block must be decrypted to learn
+/// the body length. The MAC covers the plaintext packet
+/// `seq || packet_length || padding_length || payload || padding`.
+/// Returns the payload and the number of wire bytes consumed.
+async fn receive_non_etm_packet(
+    stream: &mut (impl AsyncRead + Unpin + ?Sized),
+    cipher: &mut Box<dyn SshCipher>,
+    mac: &Box<dyn SshMac>,
+    seq: u64,
+) -> Result<(Vec<u8>, usize)> {
+    let block_size = cipher.block_size().max(8);
+    let mut first_block = vec![0u8; block_size];
+    stream.read_exact(&mut first_block).await?;
+    let plain_first = cipher.decrypt(seq, &first_block)
+        .map_err(|_| SshError::DecryptionFailed)?;
+    if plain_first.len() < 4 {
+        return Err(SshError::Protocol("non-ETM packet too short".into()));
+    }
+    let plen = u32::from_be_bytes([plain_first[0], plain_first[1], plain_first[2], plain_first[3]])
+        as usize;
+    if plen > MAX_PACKET_SIZE || plen < 5 {
+        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
+    }
+    // `packet_length` plus its own 4-byte field is what the cipher stream
+    // covers, so `4 + plen` must be block-aligned and at least one block.
+    if 4 + plen < block_size || (4 + plen) % block_size != 0 {
+        return Err(SshError::InvalidPacket(format!(
+            "invalid non-ETM packet size: {} (block size {})",
+            plen, block_size
+        )));
+    }
+
+    let rest_len = 4 + plen - block_size;
+    let mut rest = vec![0u8; rest_len];
+    stream.read_exact(&mut rest).await?;
+    let rest_plain = cipher.decrypt(seq, &rest)
+        .map_err(|_| SshError::DecryptionFailed)?;
+
+    let mut full = plain_first;
+    full.extend_from_slice(&rest_plain);
+
+    let mut mac_buf = vec![0u8; mac.tag_len()];
+    stream.read_exact(&mut mac_buf).await?;
+    if mac.tag_len() > 0 && !mac.verify_tag(seq, &full, &mac_buf)? {
+        return Err(SshError::DecryptionFailed);
+    }
+
+    unpack_packet_body(&full[4..]).map(|p| (p, block_size + rest_len + mac.tag_len()))
 }
 
 fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
@@ -968,5 +1183,427 @@ mod tests {
         let neg2 = SshTransport::negotiate_algorithms(&c2_init, &s2_init).unwrap();
         assert_eq!(neg2.client_to_server_compression, "none");
         assert_eq!(neg2.server_to_client_compression, "none");
+    }
+
+    /// Build a raw packet body: padding_length, payload, padding.
+    fn packet_body(padding_len: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(padding_len);
+        body.extend_from_slice(payload);
+        body.extend(std::iter::repeat(0xAAu8).take(padding_len as usize));
+        body
+    }
+
+    #[test]
+    fn unpack_packet_body_accepts_valid_packet() {
+        let payload = b"\x14\x01\x02\x03";
+        let body = packet_body(4, payload);
+        assert_eq!(unpack_packet_body(&body).unwrap(), payload);
+    }
+
+    #[test]
+    fn unpack_packet_body_rejects_empty_body() {
+        assert!(matches!(
+            unpack_packet_body(&[]),
+            Err(SshError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
+    fn unpack_packet_body_rejects_padding_below_rfc_minimum() {
+        // RFC 4253 §6 requires at least four padding bytes. A peer sending
+        // padding_length = 0..=3 must be rejected, not silently accepted.
+        for padding_len in 0..4u8 {
+            let body = packet_body(padding_len, b"\x14");
+            assert!(matches!(
+                unpack_packet_body(&body),
+                Err(SshError::InvalidPacket(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unpack_packet_body_rejects_padding_larger_than_body() {
+        // This is the regression guard for the old
+        // `body_len - 1 - padding_len` arithmetic: padding_len = 255 on a
+        // short body used to underflow and panic/slice out of bounds.
+        let mut body = vec![255u8];
+        body.extend_from_slice(&[0u8; 8]);
+        assert!(matches!(
+            unpack_packet_body(&body),
+            Err(SshError::InvalidPacket(_))
+        ));
+
+        // padding_length == body.len() also underflows the payload length.
+        let body = vec![9u8; 9];
+        assert!(matches!(
+            unpack_packet_body(&body),
+            Err(SshError::InvalidPacket(_))
+        ));
+    }
+
+    #[test]
+    fn unpack_packet_body_rejects_zero_length_payload() {
+        // padding_length + 1 == body.len(): one padding byte too many leaves
+        // no payload at all, which RFC 4253 forbids.
+        let body = vec![8u8; 9];
+        assert!(matches!(
+            unpack_packet_body(&body),
+            Err(SshError::InvalidPacket(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_version_string_skips_banner_lines() {
+        // A proxy may prepend arbitrary text lines; only the SSH- line counts.
+        let input = b"proxy says hello\r\nnot a version line\nSSH-2.0-NS_SSH\r\n";
+        let mut reader: &[u8] = input;
+        assert_eq!(
+            read_version_string(&mut reader).await.unwrap(),
+            b"SSH-2.0-NS_SSH"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_version_string_rejects_overlong_line() {
+        // RFC 4253 §4.2 caps each line at 255 bytes; reject instead of
+        // buffering unbounded ancillary text.
+        let mut input = vec![b'x'; 300];
+        input.extend_from_slice(b"\r\nSSH-2.0-x\r\n");
+        let mut reader: &[u8] = &input;
+        assert!(matches!(
+            read_version_string(&mut reader).await,
+            Err(SshError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_raw_packet_returns_payload_and_rejects_bad_padding() {
+        // Valid raw packet: total_len = 6, padding_length = 4, payload = [0x14].
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&6u32.to_be_bytes());
+        wire.extend_from_slice(&packet_body(4, b"\x14"));
+        let mut reader: &[u8] = &wire;
+        assert_eq!(receive_raw_packet(&mut reader).await.unwrap(), vec![0x14]);
+
+        // Peer-controlled padding_length larger than the body is an error,
+        // never a panic.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        let mut body = vec![255u8];
+        body.extend_from_slice(&[0u8; 8]);
+        wire.extend_from_slice(&body);
+        let mut reader: &[u8] = &wire;
+        assert!(matches!(
+            receive_raw_packet(&mut reader).await,
+            Err(SshError::InvalidPacket(_))
+        ));
+    }
+
+    const TEST_KEY: [u8; 32] = [0x42; 32];
+    const TEST_IV: [u8; 16] = [0x24; 16];
+    const TEST_MAC_KEY: [u8; 32] = [0x11; 32];
+
+    fn make_cipher(name: &str) -> Box<dyn SshCipher> {
+        let mut c = crate::cipher::create_cipher(name).unwrap();
+        c.set_key(&TEST_KEY[..c.key_len()]).unwrap();
+        c.set_iv(&TEST_IV[..c.iv_len()]).unwrap();
+        c
+    }
+
+    fn make_mac(name: &str) -> Box<dyn SshMac> {
+        let mut m = crate::mac::create_mac(name).unwrap();
+        m.set_key(&TEST_MAC_KEY[..m.key_len()]).unwrap();
+        m
+    }
+
+    /// Install a matching cipher/MAC pair on the client-to-server direction
+    /// with a non-ETM MAC (the RFC 4253 §6.4 packet layout).
+    fn install_client_direction(t: &mut SshTransport, cipher_name: &str, seq: u64) {
+        t.client_to_server_cipher = Some(make_cipher(cipher_name));
+        t.client_to_server_mac = Some(make_mac("hmac-sha2-256"));
+        t.outgoing_seq = seq;
+        t.incoming_seq = seq;
+    }
+
+    /// Install a matching cipher/MAC pair on the server-to-client direction.
+    fn install_server_direction(t: &mut SshTransport, cipher_name: &str, seq: u64) {
+        t.server_to_client_cipher = Some(make_cipher(cipher_name));
+        t.server_to_client_mac = Some(make_mac("hmac-sha2-256"));
+        t.outgoing_seq = seq;
+        t.incoming_seq = seq;
+    }
+
+    fn plaintext_packet_len(payload_len: usize, block_size: usize) -> usize {
+        let base = 1 + payload_len;
+        1 + payload_len + compute_packet_padding(base, block_size, true)
+    }
+
+    #[tokio::test]
+    async fn non_etm_roundtrip_client_to_server() {
+        // AES-CTR (stream) and AES-CBC (stateful chaining) must both work: the
+        // receiver decrypts the first block to learn packet_length and then
+        // continues the same cipher stream for the remainder.
+        for cipher_name in ["aes128-ctr", "aes128-cbc"] {
+            let mut sender = SshTransport::new();
+            let mut receiver = SshTransport::new();
+            install_client_direction(&mut sender, cipher_name, 9);
+            install_client_direction(&mut receiver, cipher_name, 9);
+
+            let payload = vec![msg::SSH_MSG_SERVICE_REQUEST, 0, 0, 0, 4, b'n', b'o', b'p', b'e'];
+            let mut wire: Vec<u8> = Vec::new();
+            send_encrypted_packet(&mut wire, &payload, &mut sender, false, false)
+                .await
+                .unwrap();
+
+            let block_size = make_cipher(cipher_name).block_size();
+            let plen = plaintext_packet_len(payload.len(), block_size);
+            // The 4-byte packet_length is part of the ciphertext, so the bytes
+            // on the wire must not equal the plaintext length.
+            let wire_len = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
+            assert_ne!(wire_len, plen, "{cipher_name}: packet_length leaked in clear");
+            assert_eq!(wire.len(), 4 + plen + 32, "{cipher_name}: wrong wire layout");
+
+            let mut reader: &[u8] = &wire;
+            let got = receive_encrypted_packet_server(&mut reader, &mut receiver, false, false)
+                .await
+                .unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(receiver.incoming_seq, 10);
+            assert_eq!(sender.outgoing_seq, 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn non_etm_roundtrip_server_to_client() {
+        for cipher_name in ["aes128-ctr", "aes128-cbc"] {
+            let mut sender = SshTransport::new();
+            let mut receiver = SshTransport::new();
+            install_server_direction(&mut sender, cipher_name, 3);
+            install_server_direction(&mut receiver, cipher_name, 3);
+
+            let payload = vec![msg::SSH_MSG_CHANNEL_DATA, 1, 2, 3, 4];
+            let mut wire: Vec<u8> = Vec::new();
+            send_encrypted_packet_server(&mut wire, &payload, &mut sender, false, false)
+                .await
+                .unwrap();
+
+            let block_size = make_cipher(cipher_name).block_size();
+            let plen = plaintext_packet_len(payload.len(), block_size);
+            let wire_len = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
+            assert_ne!(wire_len, plen, "{cipher_name}: packet_length leaked in clear");
+            assert_eq!(wire.len(), 4 + plen + 32, "{cipher_name}: wrong wire layout");
+
+            let mut reader: &[u8] = &wire;
+            let got = receive_encrypted_packet(&mut reader, &mut receiver, false, false)
+                .await
+                .unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(receiver.incoming_seq, 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_counters_reflect_actual_wire_lengths() {
+        // non-ETM (ciphertext covers the length field) and AEAD (tag appended
+        // after the ciphertext) must both report exactly what crossed the wire.
+        for (cipher_name, aead) in [("aes128-ctr", false), ("aes128-gcm@openssh.com", true)] {
+            let mut sender = SshTransport::new();
+            let mut receiver = SshTransport::new();
+            install_client_direction(&mut sender, cipher_name, 0);
+            install_client_direction(&mut receiver, cipher_name, 0);
+
+            let payload = vec![msg::SSH_MSG_IGNORE, 1, 2, 3];
+            let mut wire: Vec<u8> = Vec::new();
+            send_encrypted_packet(&mut wire, &payload, &mut sender, false, aead)
+                .await
+                .unwrap();
+            let mut reader: &[u8] = &wire;
+            let got = receive_encrypted_packet_server(&mut reader, &mut receiver, false, aead)
+                .await
+                .unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(sender.bytes_out as usize, wire.len(), "{cipher_name}: bytes_out");
+            assert_eq!(receiver.bytes_in as usize, wire.len(), "{cipher_name}: bytes_in");
+            assert_eq!(sender.total_bytes() as usize, wire.len());
+            assert_eq!(receiver.total_bytes() as usize, wire.len());
+        }
+    }
+
+    #[test]
+    fn rekey_budget_uses_bytes_since_last_rekey() {
+        let mut t = SshTransport::new();
+        // Default budget is 1 GiB; a few packets must not trigger a rekey.
+        t.bytes_out = 10_000;
+        t.bytes_in = 10_000;
+        assert!(!t.needs_rekey(t.total_bytes(), 0));
+
+        // Once the baseline is recorded, only bytes sent/received *after* it
+        // count: 1000 bytes below the budget must stay false, reaching it true.
+        t.last_rekey_bytes = t.total_bytes();
+        t.rekey_bytes = 1000;
+        t.bytes_out += 999;
+        assert!(!t.needs_rekey(t.total_bytes(), 0));
+        t.bytes_out += 1;
+        assert!(t.needs_rekey(t.total_bytes(), 0));
+
+        // The time-based limit is independent of the byte budget.
+        assert!(t.needs_rekey(t.total_bytes(), SshTransport::REKEY_SECONDS));
+    }
+
+    #[tokio::test]
+    async fn non_etm_rejects_tampered_mac() {
+        let mut sender = SshTransport::new();
+        install_client_direction(&mut sender, "aes128-ctr", 0);
+        let payload = vec![msg::SSH_MSG_IGNORE, 1];
+        let mut wire: Vec<u8> = Vec::new();
+        send_encrypted_packet(&mut wire, &payload, &mut sender, false, false)
+            .await
+            .unwrap();
+        let last = wire.len() - 1;
+        wire[last] ^= 0x01;
+
+        let mut receiver = SshTransport::new();
+        install_client_direction(&mut receiver, "aes128-ctr", 0);
+        let mut reader: &[u8] = &wire;
+        assert!(matches!(
+            receive_encrypted_packet_server(&mut reader, &mut receiver, false, false).await,
+            Err(SshError::DecryptionFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_etm_rejects_impossible_packet_length() {
+        // The length is only known after decrypting the first block, so a
+        // malicious peer can encode any value here. Reject lengths that are
+        // out of range or that cannot tile the cipher stream in whole blocks.
+        for (cipher_name, bad_len) in [("aes128-ctr", 4u32), ("aes128-ctr", 22), ("aes128-cbc", 22)] {
+            let block_size = make_cipher(cipher_name).block_size();
+            let mut plain = vec![0u8; block_size];
+            plain[..4].copy_from_slice(&bad_len.to_be_bytes());
+            let mut enc = make_cipher(cipher_name);
+            let wire = enc.encrypt(0, &plain).unwrap();
+
+            let mut receiver = SshTransport::new();
+            install_client_direction(&mut receiver, cipher_name, 0);
+            let mut reader: &[u8] = &wire;
+            assert!(
+                matches!(
+                    receive_encrypted_packet_server(&mut reader, &mut receiver, false, false).await,
+                    Err(SshError::InvalidPacket(_))
+                ),
+                "{cipher_name}: accepted packet_length {bad_len} (block {block_size})"
+            );
+        }
+    }
+
+    fn install_client_aead(t: &mut SshTransport, cipher_name: &str, seq: u64) {
+        t.client_to_server_cipher = Some(make_cipher(cipher_name));
+        // AEAD carries its own tag; the negotiation still installs a "none" MAC.
+        t.client_to_server_mac = Some(make_mac("none"));
+        t.outgoing_seq = seq;
+        t.incoming_seq = seq;
+    }
+
+    fn install_server_aead(t: &mut SshTransport, cipher_name: &str, seq: u64) {
+        t.server_to_client_cipher = Some(make_cipher(cipher_name));
+        t.server_to_client_mac = Some(make_mac("none"));
+        t.outgoing_seq = seq;
+        t.incoming_seq = seq;
+    }
+
+    /// AEAD (aadlen=4) pads `packet_length` itself to a whole block.
+    fn aead_plaintext_packet_len(payload_len: usize, block_size: usize) -> usize {
+        let base = 1 + payload_len;
+        base + compute_packet_padding(base, block_size, false)
+    }
+
+    #[tokio::test]
+    async fn aead_gcm_client_to_server_layout_and_roundtrip() {
+        for cipher_name in ["aes128-gcm@openssh.com", "aes256-gcm@openssh.com"] {
+            let mut sender = SshTransport::new();
+            let mut receiver = SshTransport::new();
+            install_client_aead(&mut sender, cipher_name, 4);
+            install_client_aead(&mut receiver, cipher_name, 4);
+
+            let payload = vec![msg::SSH_MSG_SERVICE_REQUEST, 0, 0, 0, 4, b'n', b'o', b'p', b'e'];
+            let mut wire: Vec<u8> = Vec::new();
+            send_encrypted_packet(&mut wire, &payload, &mut sender, false, true)
+                .await
+                .unwrap();
+
+            // AES-GCM has a 16-byte block, but its *padding* rule is
+            // packet_length % 16 == 0 (aadlen=4), not (4 + packet_length) % 16.
+            let block_size = make_cipher(cipher_name).block_size();
+            assert_eq!(block_size, 16, "{cipher_name}: unexpected block size");
+            let plen = aead_plaintext_packet_len(payload.len(), block_size);
+            let tag_len = make_cipher(cipher_name).tag_len();
+
+            let wire_len = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize;
+            assert_eq!(wire_len, plen, "{cipher_name}: packet_length must be cleartext");
+            assert_eq!(plen % block_size, 0, "{cipher_name}: packet_length not block-aligned");
+            assert_eq!(wire.len(), 4 + plen + tag_len, "{cipher_name}: wrong wire layout");
+
+            let mut reader: &[u8] = &wire;
+            let got = receive_encrypted_packet_server(&mut reader, &mut receiver, false, true)
+                .await
+                .unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(receiver.incoming_seq, 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn aead_gcm_server_to_client_layout_and_roundtrip() {
+        for cipher_name in ["aes128-gcm@openssh.com", "aes256-gcm@openssh.com"] {
+            let mut sender = SshTransport::new();
+            let mut receiver = SshTransport::new();
+            install_server_aead(&mut sender, cipher_name, 2);
+            install_server_aead(&mut receiver, cipher_name, 2);
+
+            let payload = vec![msg::SSH_MSG_CHANNEL_DATA, 1, 2, 3, 4];
+            let mut wire: Vec<u8> = Vec::new();
+            send_encrypted_packet_server(&mut wire, &payload, &mut sender, false, true)
+                .await
+                .unwrap();
+
+            let block_size = make_cipher(cipher_name).block_size();
+            let plen = aead_plaintext_packet_len(payload.len(), block_size);
+            let tag_len = make_cipher(cipher_name).tag_len();
+            assert_eq!(
+                u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize,
+                plen
+            );
+            assert_eq!(wire.len(), 4 + plen + tag_len);
+
+            let mut reader: &[u8] = &wire;
+            let got = receive_encrypted_packet(&mut reader, &mut receiver, false, true)
+                .await
+                .unwrap();
+            assert_eq!(got, payload);
+            assert_eq!(receiver.incoming_seq, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn aead_gcm_rejects_tampered_ciphertext() {
+        let mut sender = SshTransport::new();
+        install_client_aead(&mut sender, "aes128-gcm@openssh.com", 0);
+        let payload = vec![msg::SSH_MSG_IGNORE, 1];
+        let mut wire: Vec<u8> = Vec::new();
+        send_encrypted_packet(&mut wire, &payload, &mut sender, false, true)
+            .await
+            .unwrap();
+        // Flip a byte inside the ciphertext (not the cleartext length, which
+        // would only change how many bytes are read).
+        wire[5] ^= 0x01;
+
+        let mut receiver = SshTransport::new();
+        install_client_aead(&mut receiver, "aes128-gcm@openssh.com", 0);
+        let mut reader: &[u8] = &wire;
+        assert!(matches!(
+            receive_encrypted_packet_server(&mut reader, &mut receiver, false, true).await,
+            Err(SshError::DecryptionFailed)
+        ));
     }
 }

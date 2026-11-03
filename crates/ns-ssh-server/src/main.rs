@@ -199,7 +199,10 @@ fn main() {
                     config.force_command = Some(value.to_string());
                 }
                 "acceptenv" | "accept_env" => {
-                    config.accept_env.push(value.to_string());
+                    // OpenSSH allows whitespace-separated and repeated patterns.
+                    config.accept_env.extend(
+                        value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string())
+                    );
                 }
                 "allowtcpforwarding" | "allow_tcp_forwarding" => {
                     config.allow_tcp_forwarding_mode = value.to_lowercase();

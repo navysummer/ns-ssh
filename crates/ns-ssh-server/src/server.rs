@@ -172,6 +172,7 @@ async fn handle_connection(
     transport.server_version = msg::SSH_SERVER_VERSION.as_bytes().to_vec();
 
     let client_kex = receive_raw_packet(&mut stream).await?;
+    transport.incoming_seq += 1;
     transport.client_kex_init = client_kex.clone();
 
     let host_key_algs: Vec<String> = {
@@ -197,6 +198,7 @@ async fn handle_connection(
         mac_algs.as_deref(),
     );
     send_raw_packet(&mut stream, &kex_init).await?;
+    transport.outgoing_seq += 1;
     transport.server_kex_init = kex_init.clone();
     transport.client_kex_init = client_kex;
 
@@ -228,13 +230,15 @@ async fn handle_connection(
         let (client_public_key, min, nbits, max, p_bytes, g_bytes, actual_modp) =
             if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
                 let req_msg = receive_raw_packet(&mut stream).await?;
+                transport.incoming_seq += 1;
                 let (min, nbits, max) = match req_msg.first() {
                     Some(&msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD) => {
+                        // RFC 4419 §3: the legacy 30 message carries only
+                        // min and n; there is no explicit maximum.
                         let mut r = &req_msg[1..];
                         let mn = u32::decode(&mut r)?;
                         let nb = u32::decode(&mut r)?;
-                        let mx = u32::decode(&mut r)?;
-                        (mn, nb, mx)
+                        (mn, nb, u32::MAX)
                     }
                     Some(&msg::SSH_MSG_KEX_DH_GEX_REQUEST) => {
                         let mut r = &req_msg[1..];
@@ -245,30 +249,35 @@ async fn handle_connection(
                     }
                     _ => return Err(SshError::Protocol("expected gex request".into())),
                 };
+                // RFC 4419 §3: answer with a group inside [min, max], closest
+                // to the client's preferred size. Our supported groups are the
+                // RFC 3526 2048/4096/8192-bit safe primes.
+                let group = ssh_core::kex::select_gex_group(min, nbits, max)
+                    .ok_or_else(|| SshError::KexFailed(format!(
+                        "no supported group-exchange modulus in requested range [{}, {}]",
+                        min, max
+                    )))?;
+                let p_bytes = group.p.to_bytes_be();
+                let g_bytes = group.g.to_bytes_be();
+                let p = group.p.clone();
+                let g = group.g.clone();
+                let exp_bytes = group.exp_bytes;
                 let gex_hash: &'static str = if negotiation.kex_algorithm.contains("sha256") { "sha256" } else { "sha1" };
-                let exp_bytes = if negotiation.kex_algorithm.contains("sha256") { 512 } else { 256 };
                 let gex_name: &'static str = if negotiation.kex_algorithm.contains("sha256") {
                     "diffie-hellman-group-exchange-sha256"
                 } else {
                     "diffie-hellman-group-exchange-sha1"
                 };
-                let template_modp = if negotiation.kex_algorithm.contains("sha256") {
-                    ssh_core::kex::ModpKex::gex_sha256()
-                } else {
-                    ssh_core::kex::ModpKex::gex_sha1()
-                };
-                let p_bytes = template_modp.p().to_bytes_be();
-                let g_bytes = template_modp.g().to_bytes_be();
-                let p = template_modp.p().clone();
-                let g = template_modp.g().clone();
                 let mut group_msg = Vec::new();
                 group_msg.push(msg::SSH_MSG_KEX_DH_GEX_GROUP);
                 use ssh_core::encoding::SshMpInt;
                 SshMpInt(p_bytes.clone()).encode(&mut group_msg)?;
                 SshMpInt(g_bytes.clone()).encode(&mut group_msg)?;
                 send_raw_packet(&mut stream, &group_msg).await?;
+                transport.outgoing_seq += 1;
 
                 let init_msg = receive_raw_packet(&mut stream).await?;
+                transport.incoming_seq += 1;
                 if init_msg.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_INIT) {
                     return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_INIT".into()));
                 }
@@ -281,9 +290,9 @@ async fn handle_connection(
             } else {
                 kex.generate_keypair()?;
                 let client_dh_init = receive_raw_packet(&mut stream).await?;
+                transport.incoming_seq += 1;
                 let mut r = &client_dh_init[1..];
-                use ssh_core::encoding::SshBytes;
-                let client_pub = SshBytes::decode(&mut r)?.0;
+                let client_pub = SshMpInt::decode(&mut r)?.0;
                 (client_pub, None, None, None, None, None, None)
             };
 
@@ -328,6 +337,7 @@ async fn handle_connection(
                 &client_pub_for_hash,
                 &server_pub_for_hash,
                 &shared_secret,
+                negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
             )
         };
 
@@ -343,14 +353,29 @@ async fn handle_connection(
         use ssh_core::encoding::SshMpInt;
         SshMpInt(kex.public_key_bytes()).encode(&mut dh_reply)?;
     } else {
-        SshBytes(kex.public_key_bytes()).encode(&mut dh_reply)?;
+        // f is an mpint: values with the high bit set must carry a leading
+        // 0x00 byte, otherwise peers read it as a negative bignum.
+        SshMpInt(kex.public_key_bytes()).encode(&mut dh_reply)?;
     }
     SshBytes(server_signature).encode(&mut dh_reply)?;
     send_raw_packet(&mut stream, &dh_reply).await?;
+    transport.outgoing_seq += 1;
 
     let aead = negotiation.server_to_client_cipher.contains("gcm")
         || negotiation.server_to_client_cipher.contains("chacha20");
 
+    // RFC 4253 §7.1: SSH_MSG_NEWKEYS is exchanged with the current (old) keys.
+    // Neither side has installed the new keys yet, so both NEWKEYS packets are
+    // plaintext; only after the exchange do we switch to the new keys.
+    let newkeys_client = receive_encrypted_packet_server(&mut stream, &mut transport, true, aead).await?;
+    if newkeys_client.first() != Some(&msg::SSH_MSG_NEWKEYS) {
+        return Err(SshError::Protocol("expected NEWKEYS from client".into()));
+    }
+
+    let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
+    send_encrypted_packet_server(&mut stream, &newkeys_msg, &mut transport, true, aead).await?;
+
+    // Only now is it safe to install and use the new keys.
     transport.install_new_keys(
         &negotiation,
         &kex_hash,
@@ -361,15 +386,10 @@ async fn handle_connection(
 
     transport.session_id = Some(exchange_hash.clone());
 
-    let newkeys_client = receive_encrypted_packet_server(&mut stream, &mut transport, true, aead).await?;
-    if newkeys_client.first() != Some(&msg::SSH_MSG_NEWKEYS) {
-        return Err(SshError::Protocol("expected NEWKEYS from client".into()));
-    }
-
-    let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
-    send_encrypted_packet_server(&mut stream, &newkeys_msg, &mut transport, true, aead).await?;
-
     transport.state = KexState::Established;
+    // The RekeyLimit byte counter starts after the initial key exchange.
+    transport.last_rekey_bytes = transport.total_bytes();
+    transport.last_rekey_instant = std::time::Instant::now();
 
     {
         let mut ext_info = vec![msg::SSH_EXT_INFO_S];
@@ -1116,14 +1136,11 @@ async fn handle_connection_service(
         .map(|c| c.is_aead())
         .unwrap_or(false);
 
-    let svc_request = receive_encrypted_packet_server(stream, transport, false, aead).await?;
-    if svc_request.first() != Some(&msg::SSH_MSG_SERVICE_REQUEST) {
-        return Err(SshError::Protocol("expected connection service".into()));
-    }
-
-    let mut svc_accept = vec![msg::SSH_MSG_SERVICE_ACCEPT];
-    SshString::new(msg::SSH_SERVICE_NAME_CONNECTION).encode(&mut svc_accept)?;
-    send_encrypted_packet_server(stream, &svc_accept, transport, false, aead).await?;
+    // OpenSSH does NOT use a SSH_MSG_SERVICE_REQUEST for "ssh-connection":
+    // after userauth success the client opens a session channel directly, and
+    // OpenSSH's sshd dispatch table never registers SSH2_MSG_SERVICE_REQUEST.
+    // We therefore do not require it here; if a (non-standard) client does send
+    // one, the connection loop below replies with SERVICE_ACCEPT.
 
     let user_info = crate::session::get_user_info(username)?;
     let mut work_dir = user_info.home_dir.clone();
@@ -1198,8 +1215,16 @@ async fn handle_connection_service(
     }
     let (x11_tx, mut x11_rx) = mpsc::unbounded_channel::<X11Accept>();
     let mut x11_enabled = false;
+    // Track the X11 listener task so it is aborted when the connection ends
+    // (OpenSSH closes its X11 listener when the client's connection ends).
+    // `AbortJoin` guarantees the abort runs on every exit path (including the
+    // `?` error propagations), so the bound port is always released.
+    let mut x11_listener_handle = AbortJoin(None);
 
     let mut missed_alive: u32 = 0;
+    // True once the server has sent its rekey KEXINIT and is waiting for the
+    // client's KEXINIT to complete the exchange (server-initiated rekey).
+    let mut server_rekey_kex_sent = false;
     let alive_interval_ms = config.client_alive_interval.saturating_mul(1000);
     let alive_enabled = alive_interval_ms > 0;
     let mut alive_sleep: std::pin::Pin<Box<tokio::time::Sleep>> =
@@ -1243,19 +1268,6 @@ async fn handle_connection_service(
                     pending_stdin.remove(&sid);
                 } else {
                     *queue = still;
-                }
-            }
-        }
-
-        let tb = transport.total_bytes();
-        let el = transport.last_rekey_instant.elapsed().as_secs();
-        let server_should_rekey = transport.needs_rekey(tb, el);
-
-        if server_should_rekey && matches!(transport.state, ssh_core::transport::KexState::Established) {
-            match perform_rekey_server(stream, transport, config, host_keys, None).await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!("server-initiated rekey failed: {:?}", e);
                 }
             }
         }
@@ -1518,11 +1530,30 @@ async fn handle_connection_service(
                 }
 
                 match packet[0] {
+                    msg::SSH_MSG_SERVICE_REQUEST => {
+                        // RFC 4254: a client may request the "ssh-connection"
+                        // service explicitly. OpenSSH's client does not, but
+                        // accept it if sent and reply SERVICE_ACCEPT.
+                        let mut r = &packet[1..];
+                        if let Ok(service) = SshString::decode(&mut r) {
+                            if let Ok(s) = service.as_str() {
+                                if s == msg::SSH_SERVICE_NAME_CONNECTION {
+                                    let mut accept = vec![msg::SSH_MSG_SERVICE_ACCEPT];
+                                    SshString::new(msg::SSH_SERVICE_NAME_CONNECTION).encode(&mut accept)?;
+                                    send_encrypted_packet_server(stream, &accept, transport, false, aead).await?;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     msg::SSH_MSG_KEXINIT => {
-                        match perform_rekey_server(stream, transport, config, host_keys, Some(packet)).await {
-                            Ok(()) => {}
+                        match perform_rekey_server(stream, transport, config, host_keys, Some(packet), server_rekey_kex_sent).await {
+                            Ok(()) => {
+                                server_rekey_kex_sent = false;
+                            }
                             Err(e) => {
-                                tracing::warn!("client-initiated rekey failed: {:?}", e);
+                                tracing::warn!("rekey failed: {:?}", e);
+                                server_rekey_kex_sent = false;
                             }
                         }
                         continue;
@@ -2036,7 +2067,7 @@ async fn handle_connection_service(
                                                 Ok(listener) => {
                                                     x11_enabled = true;
                                                     let tx = x11_tx.clone();
-                                                    tokio::spawn(async move {
+                                                    x11_listener_handle = AbortJoin(Some(tokio::spawn(async move {
                                                         loop {
                                                             match listener.accept().await {
                                                                 Ok((s, p)) => {
@@ -2045,7 +2076,7 @@ async fn handle_connection_service(
                                                                 Err(_) => break,
                                                             }
                                                         }
-                                                    });
+                                                    })));
                                                 }
                                                 Err(e) => {
                                                     tracing::warn!("x11 listener bind on {} failed: {}", x11_port, e);
@@ -2190,7 +2221,10 @@ async fn handle_connection_service(
                                                 };
                                                 unsafe {
                                                     if let Some(pid) = child.id() {
-                                                        libc::kill(pid as i32, signal);
+                                                        // Signal the whole process group so the signal reaches
+                                                        // the actual foreground process (e.g. a shell's child
+                                                        // such as `sleep`), matching OpenSSH.
+                                                        libc::kill(-(pid as i32), signal);
                                                     }
                                                 }
                                             }
@@ -2290,6 +2324,32 @@ async fn handle_connection_service(
                 }
             }
         }
+
+        // Rekey is checked *after* processing each packet (or the idle 60s
+        // timer) rather than at the top of the loop. When due, the server
+        // sends its KEXINIT and marks the exchange in progress, then returns
+        // to the normal loop: any pre-rekey data the peer already sent (e.g. a
+        // channel request) is processed normally, and the exchange completes
+        // when the peer's KEXINIT arrives in the SSH_MSG_KEXINIT arm below.
+        let tb = transport.total_bytes();
+        let el = transport.last_rekey_instant.elapsed().as_secs();
+        let server_should_rekey = transport.needs_rekey(tb, el);
+        if server_should_rekey && !server_rekey_kex_sent
+            && matches!(transport.state, ssh_core::transport::KexState::Established)
+        {
+            use ssh_core::transport::KexState;
+            let aead = transport.client_to_server_cipher.as_ref().map(|c| c.is_aead()).unwrap_or(false);
+            let sk = transport.prepare_rekey(true);
+            match send_encrypted_packet_server(stream, &sk, transport, false, aead).await {
+                Ok(()) => {
+                    transport.state = KexState::RekeyInProgress;
+                    server_rekey_kex_sent = true;
+                }
+                Err(e) => {
+                    tracing::warn!("server-initiated rekey KEXINIT failed: {:?}", e);
+                }
+            }
+        }
     }
 
     // Connection is closing: stop all forwarded listeners so their bound
@@ -2298,8 +2358,27 @@ async fn handle_connection_service(
     for (_, handle) in forwarded_listeners.drain() {
         handle.abort();
     }
+    x11_listener_handle.abort();
 
     Ok(())
+}
+
+/// A `JoinHandle` that aborts the task when dropped, guaranteeing cleanup on
+/// every function exit path (including early `?` error returns).
+struct AbortJoin(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortJoin {
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for AbortJoin {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 fn pump_socket<S>(
@@ -2375,11 +2454,10 @@ async fn send_child_exit_message(
 
 async fn send_raw_packet(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
     let base = 1 + payload.len();
-    let remainder = base % 8;
-    let mut padding_len = if remainder == 0 { 0 } else { 8 - remainder };
-    if padding_len < 4 { padding_len += 8; }
-    // OpenSSH-compatible: packet_length field value includes its own 4 bytes
-    let packet_len_field = (4 + base + padding_len) as u32;
+    let padding_len = ssh_core::transport::compute_packet_padding(base, 8, true);
+    // RFC 4253 §6: packet_length is the body length (padding_length + payload +
+    // padding), NOT including the 4-byte packet_length field itself.
+    let packet_len_field = (base + padding_len) as u32;
 
     let mut packet = Vec::with_capacity(4 + (base + padding_len) as usize);
     packet.extend_from_slice(&packet_len_field.to_be_bytes());
@@ -2399,33 +2477,19 @@ async fn receive_raw_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
     stream.read_exact(&mut len_buf).await?;
     let total_len = u32::from_be_bytes(len_buf) as usize;
 
-    // Try compatible parse:
-    // Case A (OpenSSH): total_len includes own 4 bytes → body_len = total_len - 4
-    // Case B (RFC literal): total_len excludes own 4 bytes → body_len = total_len
-    let (body_len, used_total_len) = if total_len >= 12 && total_len % 8 == 4 {
-        (total_len - 4, true)
-    } else if total_len >= 12 && total_len % 8 == 0 {
-        (total_len, false)
-    } else {
-        // Fallback: heuristic: if total_len < 12 probably invalid, take total_len-4 if >=12 else total_len
-        if total_len >= 12 { (total_len - 4, true) } else { (total_len, false) }
-    };
+    // RFC 4253 §6: packet_length excludes its own 4-byte field, so the body
+    // (padding_length + payload + padding) is exactly `total_len` bytes.
+    let body_len = total_len;
 
-    if body_len < 5 {
-        return Err(SshError::InvalidPacket(format!("invalid body size: {} (total_len={} used_total_included_self={})", body_len, total_len, used_total_len)));
+    // `total_len` is peer-controlled: bound it before allocating, otherwise a
+    // single 0xFFFFFFFF packet_length makes us reserve ~4 GiB.
+    if body_len < 5 || body_len > ssh_core::transport::MAX_PACKET_SIZE {
+        return Err(SshError::InvalidPacket(format!("invalid body size: {} (total_len={})", body_len, total_len)));
     }
     let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body).await?;
 
-    let padding_len = body[0] as usize;
-    if padding_len >= body_len {
-        return Err(SshError::InvalidPacket("invalid padding".into()));
-    }
-    let payload_len = body_len - 1 - padding_len;
-    if payload_len == 0 {
-        return Err(SshError::InvalidPacket("empty payload".into()));
-    }
-    Ok(body[1..1 + payload_len].to_vec())
+    unpack_packet_body(&body)
 }
 
 /// A no-op waker used only to probe `poll_write` synchronously without ever
@@ -2460,18 +2524,35 @@ async fn send_encrypted_packet_server(
     _is_new_keys: bool,
     aead: bool,
 ) -> Result<()> {
-    let block_size = if aead { 8 } else {
-        transport.server_to_client_cipher.as_ref()
-            .map(|c| c.block_size())
-            .unwrap_or(8)
-    };
+    // Packet padding is always aligned to the cipher's block size. AES-GCM
+    // reports 16 (it is an AEAD, but the *padding* rule is still
+    // packet_length % 16 == 0); chacha20-poly1305 reports 8; before any cipher
+    // exists (KEX/NEWKEYS) fall back to the RFC 4253 minimum of 8.
+    let block_size = transport.server_to_client_cipher.as_ref()
+        .map(|c| c.block_size())
+        .unwrap_or(8);
+
+    let has_cipher = transport.server_to_client_cipher.is_some();
+    let etm = transport.server_to_client_mac.as_ref()
+        .map(|m| m.is_etm()).unwrap_or(false);
+    let chachapoly = transport.server_to_client_cipher.as_ref()
+        .map(|c| c.is_chachapoly()).unwrap_or(false);
+    // RFC 4253 §6.4 / RFC 6668: a non-ETM MAC (or the pre-key "none" cipher)
+    // encrypts packet_length as part of the first cipher block; ETM and AEAD
+    // ciphers leave packet_length in the clear (authenticated as AAD). OpenSSH's
+    // chacha20-poly1305@openssh.com encrypts the length with a separate header
+    // key but still uses aadlen=4 for the *padding* rule (authlen != 0).
+    let length_encrypted_on_wire = chachapoly || !has_cipher || (!aead && !etm);
+    // aadlen is only meaningful once a cipher/MAC is in place. Raw packets
+    // (NEWKEYS, KEX before the key exchange) use aadlen=0, so packet_length
+    // must satisfy (4 + packet_length) % block_size == 0.
+    let padding_uses_aadlen = has_cipher && (aead || (etm && has_cipher) || chachapoly);
 
     let base = 1 + payload.len();
-    let remainder = base % block_size;
-    let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-    if padding_len < 4 { padding_len += block_size; }
+    let padding_len = ssh_core::transport::compute_packet_padding(base, block_size, !padding_uses_aadlen);
     let body_len = base + padding_len;
-    let packet_len_field = (4 + body_len) as u32;
+    // RFC 4253 §6: packet_length excludes its own 4-byte field.
+    let packet_len_field = body_len as u32;
 
     let mut packet = Vec::with_capacity(4 + body_len);
     packet.extend_from_slice(&packet_len_field.to_be_bytes());
@@ -2483,32 +2564,54 @@ async fn send_encrypted_packet_server(
 
     let seq = transport.outgoing_seq;
 
-    if aead {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
-            let plaintext = packet[4..].to_vec();
-            let ciphertext = cipher.encrypt(seq, &plaintext)?;
-            packet.truncate(4);
-            packet.extend_from_slice(&ciphertext);
+    // Non-ETM MAC covers the plaintext packet (RFC 4253 §6.4):
+    // H(seq || packet_length || padding_length || payload || padding).
+    let mut non_etm_tag = None;
+    if !aead && !etm {
+        if let Some(ref mac) = transport.server_to_client_mac {
+            if mac.tag_len() > 0 {
+                non_etm_tag = Some(mac.compute_tag(seq, &packet)?);
+            }
         }
-    } else {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
+    }
+
+    if let Some(ref mut cipher) = transport.server_to_client_cipher {
+        if length_encrypted_on_wire {
+            // Non-ETM / chacha: encrypt the entire packet (packet_length
+            // included). For chacha, encrypt() returns ciphertext || tag.
+            let ciphertext = cipher.encrypt(seq, &packet)?;
+            packet = ciphertext;
+        } else {
+            // ETM/AEAD: keep packet_length plaintext, encrypt the body only.
+            // AES-GCM authenticates the cleartext length as AAD.
             let plaintext = packet[4..].to_vec();
-            let ciphertext = cipher.encrypt(seq, &plaintext)?;
+            let ciphertext = if aead {
+                cipher.encrypt_with_aad(seq, &packet[..4], &plaintext)?
+            } else {
+                cipher.encrypt(seq, &plaintext)?
+            };
             packet.truncate(4);
             packet.extend_from_slice(&ciphertext);
         }
     }
 
+    // ETM MAC covers seq || packet_length || ciphertext (RFC 6668 §2).
     if let Some(ref mac) = transport.server_to_client_mac {
         if mac.tag_len() > 0 {
-            let mac_data = &packet[4..];
-            let tag = mac.compute_tag(seq, mac_data)?;
-            packet.extend_from_slice(&tag);
+            if etm {
+                let tag = mac.compute_tag(seq, &packet)?;
+                packet.extend_from_slice(&tag);
+            } else if !aead {
+                if let Some(t) = non_etm_tag {
+                    packet.extend_from_slice(&t);
+                }
+            }
         }
     }
 
     stream.write_all(&packet).await?;
     stream.flush().await?;
+    transport.bytes_out += packet.len() as u64;
     transport.outgoing_seq += 1;
     Ok(())
 }
@@ -2521,54 +2624,165 @@ async fn receive_encrypted_packet_server(
 ) -> Result<Vec<u8>> {
     let seq = transport.incoming_seq;
 
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-
-    let packet_len = u32::from_be_bytes(len_buf) as usize;
-    if packet_len > 256 * 1024 || packet_len < 12 {
-        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
-    }
-    let body_len = packet_len - 4;
-
-    let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body).await?;
-
-    let ciphertext = body.clone();
-
-    if aead {
-        if let Some(ref mut cipher) = transport.client_to_server_cipher {
-            let decrypted = cipher.decrypt(seq, &body)?;
-            body = decrypted;
+    // Before the first key exchange (and for NEWKEYS during a rekey) there is
+    // no cipher installed: the packet is plaintext but still advances the
+    // sequence number, since RFC 4253 §6 counts every packet.
+    if transport.client_to_server_cipher.is_none() {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let packet_len = u32::from_be_bytes(len_buf) as usize;
+        if packet_len < 5 || packet_len > ssh_core::transport::MAX_PACKET_SIZE {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
         }
+        let mut body = vec![0u8; packet_len];
+        stream.read_exact(&mut body).await?;
+        transport.bytes_in += (4 + packet_len) as u64;
+        transport.incoming_seq += 1;
+        return unpack_packet_body(&body);
+    }
+
+    let cipher = transport.client_to_server_cipher.as_mut().unwrap();
+    let mac = transport.client_to_server_mac.as_ref();
+    let chachapoly = cipher.is_chachapoly();
+    let etm = mac.map(|m| m.is_etm()).unwrap_or(false);
+
+    let mut wire_len: usize = 0;
+
+    let body: Vec<u8> = if chachapoly {
+        // chacha20-poly1305@openssh.com: the 4-byte packet_length is encrypted
+        // with the header key; decrypt_length to learn the body length. The
+        // Poly1305 tag is verified by `cipher.decrypt`.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let packet_len = cipher.decrypt_length(seq, &len_buf)? as usize;
+        if packet_len > ssh_core::transport::MAX_PACKET_SIZE
+            || packet_len < 5
+            || packet_len % cipher.block_size() != 0
+        {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
+        }
+        let mut ct = len_buf.to_vec();
+        let mut body_ct = vec![0u8; packet_len];
+        stream.read_exact(&mut body_ct).await?;
+        ct.extend_from_slice(&body_ct);
+        let tlen = cipher.tag_len();
+        if tlen > 0 {
+            let mut tag = vec![0u8; tlen];
+            stream.read_exact(&mut tag).await?;
+            ct.extend_from_slice(&tag);
+        }
+        let plain = cipher.decrypt(seq, &ct)?;
+        if plain.len() < 4 {
+            return Err(SshError::Protocol("chacha packet too short".into()));
+        }
+        wire_len = ct.len();
+        plain[4..].to_vec()
+    } else if aead {
+        // GCM and other AEAD ciphers leave packet_length in the clear; the
+        // auth tag is appended after the ciphertext (not counted in
+        // packet_length).
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let packet_len = u32::from_be_bytes(len_buf) as usize;
+        if packet_len > ssh_core::transport::MAX_PACKET_SIZE
+            || packet_len < 5
+            || packet_len % cipher.block_size() != 0
+        {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
+        }
+        let mut body = vec![0u8; packet_len];
+        stream.read_exact(&mut body).await?;
+        let tlen = cipher.tag_len();
+        if tlen > 0 {
+            let mut tag = vec![0u8; tlen];
+            stream.read_exact(&mut tag).await?;
+            body.extend_from_slice(&tag);
+        }
+        // AES-GCM authenticates the cleartext packet_length as AAD.
+        wire_len = 4 + body.len();
+        cipher.decrypt_with_aad(seq, &len_buf, &body)?
+    } else if etm {
+        // RFC 6668: packet_length is in the clear and the MAC covers
+        // seq || packet_length || ciphertext; verify before decrypting.
+        let mac = mac.unwrap();
+        let block_size = cipher.block_size().max(8);
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let packet_len = u32::from_be_bytes(len_buf) as usize;
+        if packet_len > ssh_core::transport::MAX_PACKET_SIZE
+            || packet_len < 5
+            || packet_len % block_size != 0
+        {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
+        }
+        let mut ct = vec![0u8; packet_len];
+        stream.read_exact(&mut ct).await?;
+        let mut tag_buf = vec![0u8; mac.tag_len()];
+        stream.read_exact(&mut tag_buf).await?;
+        let mut etm_input = Vec::with_capacity(4 + ct.len());
+        etm_input.extend_from_slice(&len_buf);
+        etm_input.extend_from_slice(&ct);
+        if !mac.verify_tag(seq, &etm_input, &tag_buf)? {
+            return Err(SshError::DecryptionFailed);
+        }
+        wire_len = 4 + packet_len + mac.tag_len();
+        cipher.decrypt(seq, &ct)?
     } else {
-        if let Some(ref mut cipher) = transport.client_to_server_cipher {
-            let decrypted = cipher.decrypt(seq, &body)?;
-            body = decrypted;
+        // RFC 4253 §6.4: a non-ETM MAC encrypts packet_length as part of the
+        // first cipher block, so that block must be decrypted to learn the
+        // body length. Early implementations read the length in the clear,
+        // which shifted the whole ciphertext by four bytes and always failed
+        // the MAC.
+        let block_size = cipher.block_size().max(8);
+        let mut first_block = vec![0u8; block_size];
+        stream.read_exact(&mut first_block).await?;
+        let plain_first = cipher.decrypt(seq, &first_block)?;
+        if plain_first.len() < 4 {
+            return Err(SshError::Protocol("non-ETM packet too short".into()));
         }
-    }
+        let packet_len = u32::from_be_bytes([
+            plain_first[0], plain_first[1], plain_first[2], plain_first[3],
+        ]) as usize;
+        if packet_len > ssh_core::transport::MAX_PACKET_SIZE || packet_len < 5 {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
+        }
+        // `packet_length` plus its own 4-byte field is the encrypted stream's
+        // length, so it must be block-aligned and at least one block.
+        if 4 + packet_len < block_size || (4 + packet_len) % block_size != 0 {
+            return Err(SshError::InvalidPacket(format!(
+                "invalid non-ETM packet size: {} (block size {})",
+                packet_len, block_size
+            )));
+        }
+        let rest_len = 4 + packet_len - block_size;
+        let mut rest = vec![0u8; rest_len];
+        stream.read_exact(&mut rest).await?;
+        let rest_plain = cipher.decrypt(seq, &rest)?;
 
-    if let Some(ref mac) = transport.client_to_server_mac {
-        if mac.tag_len() > 0 {
-            let mut tag_buf = vec![0u8; mac.tag_len()];
-            stream.read_exact(&mut tag_buf).await?;
-            if !mac.verify_tag(seq, &ciphertext, &tag_buf)? {
-                return Err(SshError::DecryptionFailed);
+        let mut full = plain_first;
+        full.extend_from_slice(&rest_plain);
+
+        if let Some(mac) = mac {
+            if mac.tag_len() > 0 {
+                let mut tag_buf = vec![0u8; mac.tag_len()];
+                stream.read_exact(&mut tag_buf).await?;
+                if !mac.verify_tag(seq, &full, &tag_buf)? {
+                    return Err(SshError::DecryptionFailed);
+                }
             }
         }
-    }
+        wire_len = 4 + packet_len + mac.map(|m| m.tag_len()).unwrap_or(0);
+        full[4..].to_vec()
+    };
 
+    transport.bytes_in += wire_len as u64;
     transport.incoming_seq += 1;
 
     if body.is_empty() {
         return Err(SshError::Protocol("empty packet".into()));
     }
 
-    let padding_len = body[0] as usize;
-    if padding_len >= body.len() {
-        return Err(SshError::InvalidPacket("invalid padding".into()));
-    }
-
-    Ok(body[1..body.len() - padding_len].to_vec())
+    unpack_packet_body(&body)
 }
 
 async fn run_internal_sftp(
@@ -3285,31 +3499,30 @@ async fn perform_rekey_server(
     config: &ServerConfig,
     host_keys: &Arc<Mutex<HostKeyManager>>,
     pre_received_client_kex: Option<Vec<u8>>,
+    kex_sent: bool,
 ) -> Result<()> {
     use ssh_core::transport::KexState;
-    if transport.state != KexState::Established { return Ok(()); }
+    if transport.state != KexState::Established && transport.state != KexState::RekeyInProgress {
+        return Ok(());
+    }
     transport.state = KexState::RekeyInProgress;
 
     let aead = transport.client_to_server_cipher.as_ref().map(|c| c.is_aead()).unwrap_or(false);
 
     let hk = host_keys.lock().await;
     let negotiation_pre = {
-        let sk = transport.prepare_rekey();
-        let c_kex_init = if pre_received_client_kex.is_none() {
-            send_encrypted_packet_server(stream, &sk, transport, false, aead).await?;
-            let p = receive_encrypted_packet_server(stream, transport, false, aead).await?;
+        let c_kex_init = {
+            let p = pre_received_client_kex
+                .ok_or_else(|| SshError::KexFailed("no client KEXINIT during rekey".into()))?;
             if p.first() != Some(&msg::SSH_MSG_KEXINIT) {
                 return Err(SshError::KexFailed("expected KEXINIT during rekey".into()));
             }
             p
-        } else {
-            send_encrypted_packet_server(stream, &sk, transport, false, aead).await?;
-            let p = pre_received_client_kex.unwrap();
-            if p.first() != Some(&msg::SSH_MSG_KEXINIT) {
-                return Err(SshError::KexFailed("expected KEXINIT in pre-received rekey".into()));
-            }
-            p
         };
+        if !kex_sent {
+            let sk = transport.prepare_rekey(true);
+            send_encrypted_packet_server(stream, &sk, transport, false, aead).await?;
+        }
         transport.client_kex_init = c_kex_init.clone();
         let neg = SshTransport::negotiate_algorithms(&transport.client_kex_init, &transport.server_kex_init)?;
         let (hk_name, pk_bytes) = {
@@ -3331,9 +3544,9 @@ async fn perform_rekey_server(
             let req = receive_encrypted_packet_server(stream, transport, false, aead).await?;
             let (min, nbits, max) = match req.first() {
                 Some(&msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD) => {
+                    // RFC 4419 §3: legacy form carries min and n only.
                     let mut r = &req[1..];
-                    let nbits32 = u32::decode(&mut r)?;
-                    (2048u32, nbits32, 4096u32)
+                    (u32::decode(&mut r)?, u32::decode(&mut r)?, u32::MAX)
                 }
                 Some(&msg::SSH_MSG_KEX_DH_GEX_REQUEST) => {
                     let mut r = &req[1..];
@@ -3347,8 +3560,13 @@ async fn perform_rekey_server(
             } else {
                 "diffie-hellman-group-exchange-sha1"
             };
-            let group_p = ssh_core::kex::ModpKex::group14_p();
-            let group_g = ssh_core::kex::ModpKex::group14_g();
+            let group = ssh_core::kex::select_gex_group(min, nbits, max)
+                .ok_or_else(|| SshError::KexFailed(format!(
+                    "no supported group-exchange modulus in requested range [{}, {}]",
+                    min, max
+                )))?;
+            let group_p = group.p.to_bytes_be();
+            let group_g = group.g.to_bytes_be();
             let mut group_msg = Vec::new();
             group_msg.push(msg::SSH_MSG_KEX_DH_GEX_GROUP);
             SshMpInt(group_p.clone()).encode(&mut group_msg)?;
@@ -3364,7 +3582,7 @@ async fn perform_rekey_server(
 
             let p_bu = num_bigint::BigUint::from_bytes_be(&group_p);
             let g_bu = num_bigint::BigUint::from_bytes_be(&group_g);
-            let mut am = ssh_core::kex::ModpKex::with_params(gex_name, gex_hash, p_bu, g_bu, if gex_hash == "sha256" { 512 } else { 256 });
+            let mut am = ssh_core::kex::ModpKex::with_params(gex_name, gex_hash, p_bu, g_bu, group.exp_bytes);
             am.generate_keypair()?;
             let srv_pub = am.public_key_bytes();
             let shared = am.compute_shared_secret(&client_pub)?;
@@ -3404,7 +3622,7 @@ async fn perform_rekey_server(
                 return Err(SshError::Protocol("expected SSH_MSG_KEXDH_INIT".into()));
             }
             let mut r = &client_init[1..];
-            let client_pub = SshBytes::decode(&mut r)?.0;
+            let client_pub = SshMpInt::decode(&mut r)?.0;
 
             let shared = kex.compute_shared_secret(&client_pub)?;
             let exchange = KexExchange {
@@ -3418,13 +3636,14 @@ async fn perform_rekey_server(
             let exch_hash = ssh_core::kex::compute_exchange_hash(
                 &hash_name, &exchange, &hostkey_blob,
                 &client_pub, &server_pub, &shared,
+                negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
             );
             let sig = selected_signer.sign(&exch_hash)?;
             let sig_blob = SshBytes(sig).0;
             let mut dh_reply = Vec::new();
             dh_reply.push(msg::SSH_MSG_KEXDH_REPLY);
             SshBytes(hostkey_blob).encode(&mut dh_reply)?;
-            SshBytes(server_pub).encode(&mut dh_reply)?;
+            SshMpInt(server_pub).encode(&mut dh_reply)?;
             SshBytes(sig_blob).encode(&mut dh_reply)?;
             send_encrypted_packet_server(stream, &dh_reply, transport, false, aead).await?;
 

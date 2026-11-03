@@ -3,6 +3,7 @@
 
 use base64::Engine;
 use ssh_core::hostkey::{Ed25519HostKey, HostKeySigner};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -214,6 +215,8 @@ fn large_transfer_window_replenishment() {
     let dir = temp_dir("large");
     let port = free_port();
     let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    // No pinned algorithm overrides; the shared launch helper takes a slice.
+    let extra_args: &[&str] = &[];
 
     let key = Ed25519HostKey::generate().expect("generate key");
     let secret = key.secret_bytes();
@@ -254,6 +257,11 @@ fn large_transfer_window_replenishment() {
         .arg("maxauthtries=10")
         .arg("-o")
         .arg("login_grace_time=30")
+        .arg("-o")
+        .arg("AcceptEnv=LANG LC_*")
+        .arg("-o")
+        .arg("X11Forwarding=yes")
+        .args(extra_args)
         .arg("--host-key-file")
         .arg(host_key_path.to_str().unwrap())
         .stderr(Stdio::piped())
@@ -974,5 +982,633 @@ fn ssh_add_adds_identity_to_agent() {
     {
         let _ = Command::new("kill").arg(&pid).status();
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shared helper: generate a client key + authorized_keys + host key, launch the
+/// test server on `port`, and return `(server_child, id_path, kh_path, dir)`.
+fn launch_test_server(
+    dir: &Path,
+    port: u16,
+) -> (std::process::Child, PathBuf, PathBuf) {
+    launch_test_server_extra(dir, port, &[])
+}
+
+/// Same as `launch_test_server` but forwards extra `-o key=value` style
+/// arguments, for tests that need to pin a specific algorithm.
+fn launch_test_server_extra(
+    dir: &Path,
+    port: u16,
+    extra_args: &[&str],
+) -> (std::process::Child, PathBuf, PathBuf) {
+    let server_bin = workspace_target_dir();
+    assert!(server_bin.exists(), "ns-ssh-server binary not built; run `cargo build`");
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg("maxauthtries=10")
+        .arg("-o")
+        .arg("login_grace_time=30")
+        .arg("-o")
+        .arg("AcceptEnv=LANG LC_*")
+        .arg("-o")
+        .arg("X11Forwarding=yes")
+        .args(extra_args)
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let kh = dir.join("known_hosts");
+    (server, id_path, kh)
+}
+
+/// Client args common to every end-to-end test (host key checking off for CI).
+fn base_client_args(
+    port: u16,
+    user: &str,
+    id_path: &Path,
+    kh: &Path,
+) -> Vec<std::ffi::OsString> {
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    vec![
+        client_bin.into(),
+        "-p".into(),
+        port.to_string().into(),
+        "-l".into(),
+        user.into(),
+        "-i".into(),
+        id_path.as_os_str().to_os_string(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        format!("UserKnownHostsFile={}", kh.display()).into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+    ]
+}
+
+/// `-t` force TTY: the remote command must see a real TTY on stdin/stdout and the
+/// session must terminate cleanly (exit-status propagates), not hang in exit_poll.
+#[test]
+fn pty_session_round_trip() {
+    let dir = temp_dir("pty");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-t")
+        .arg("127.0.0.1")
+        .arg("test -t 0 && echo TTY_STDIN_OK || echo NO_STDIN; test -t 1 && echo TTY_STDOUT_OK || echo NO_STDOUT; exit 3")
+        .output()
+        .expect("run pty client");
+
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("TTY_STDIN_OK"),
+        "expected TTY_STDIN_OK, got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("TTY_STDOUT_OK"),
+        "expected TTY_STDOUT_OK, got: {:?}",
+        stdout
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "expected exit 3, status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = server_out;
+}
+
+/// ProxyJump (`-J`) end-to-end: connect through the test server as the jump host
+/// to the same server as the target, then run a command.
+#[test]
+fn proxy_jump_round_trip() {
+    let dir = temp_dir("proxyjump");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let jump = format!("127.0.0.1:{}", port);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-J")
+        .arg(&jump)
+        .arg("127.0.0.1")
+        .arg("echo VIA_JUMP")
+        .output()
+        .expect("run proxyjump client");
+
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("VIA_JUMP"),
+        "expected VIA_JUMP, got: {:?} (stderr={:?})",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = server_out;
+}
+
+/// Signal forwarding: send SIGTERM to the client while a remote `sleep` runs;
+/// the client must forward it to the server, which signals the remote process
+/// group, and the client must exit promptly (not hang on the sleeping session).
+#[test]
+fn signal_forwarding_round_trip() {
+    let dir = temp_dir("signal");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("sleep 30; echo AFTER_SLEEP")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run signal client");
+    let pid = child.id();
+
+    // Give the client a moment to connect, authenticate, and start the remote
+    // command, then forward SIGTERM (not ignored for background processes).
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+
+    // Wait up to ~12s for the client to exit after the signal.
+    let start = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("poll child") {
+            break st;
+        }
+        if start.elapsed() > Duration::from_secs(12) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("client did not exit after SIGTERM (signal not forwarded?)");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let mut out = String::new();
+    let mut err = String::new();
+    use std::io::Read;
+    if let Some(mut so) = child.stdout.take() {
+        let _ = so.read_to_string(&mut out);
+    }
+    if let Some(mut se) = child.stderr.take() {
+        let _ = se.read_to_string(&mut err);
+    }
+
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        err.contains("Killed by signal"),
+        "expected 'Killed by signal' on stderr, got: {:?} (stdout={:?}, status={:?})",
+        err,
+        out,
+        status
+    );
+    let _ = server_out;
+}
+
+/// `SetEnv` (with a name in the test server's `AcceptEnv LANG LC_*`) must
+/// reach the remote process, and the client must not send unsolicited LANG/LC_*
+/// that would override it (the default `SendEnv` is empty, matching OpenSSH).
+#[test]
+fn setenv_propagates() {
+    let dir = temp_dir("setenv");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("SetEnv=LANG=zz_ZZ.UTF-8")
+        .arg("127.0.0.1")
+        .arg("echo \"LANG=[$LANG]\"")
+        .output()
+        .expect("run setenv client");
+
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LANG=[zz_ZZ.UTF-8]"),
+        "expected SetEnv LANG to propagate, got: {:?} (stderr={:?})",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = server_out;
+}
+
+/// `-s subsystem` requests a server subsystem (e.g. `sftp`). This verifies the
+/// client sends a proper subsystem channel request and that the server's
+/// internal-sftp replies to an SFTP INIT with a VERSION packet.
+#[test]
+fn subsystem_sftp_round_trip() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("subsystem");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+
+    let host_key_path = dir.join("host_key_ed25519");
+    // The subsystem directive is only parsed from the config file (not -o).
+    let config_path = dir.join("sshd_config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nAuthorizedKeysFile {}\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n",
+            port,
+            host_key_path.display(),
+            auth_path.display()
+        ),
+    )
+    .unwrap();
+
+    let server = Command::new(&server_bin)
+        .arg("-d") // no daemonize; keep server in foreground so the test can reap it
+        .arg("-f")
+        .arg(&config_path)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn subsystem server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let kh = dir.join("known_hosts");
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-s")
+        .arg("127.0.0.1")
+        .arg("sftp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sftp subsystem client");
+
+    // Send an SFTP INIT (version 3) and expect a VERSION reply (type 2).
+    use std::io::{Read, Write};
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let init = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&5u32.to_be_bytes()); // packet length
+        b.push(1u8); // SSH_FXP_INIT
+        b.extend_from_slice(&3u32.to_be_bytes()); // version
+        b
+    };
+    stdin.write_all(&init).expect("write SFTP INIT");
+    stdin.flush().unwrap();
+
+    let stdout = child.stdout.take().expect("child stdout");
+    // Read the full SFTP reply (4-byte length + body) in a reader thread so a
+    // missing reply cannot block the test forever.
+    let reply = read_sftp_reply(stdout, Duration::from_secs(10));
+    let version_ok = reply
+        .as_deref()
+        .and_then(|b| b.get(4).copied())
+        == Some(2u8); // SSH_FXP_VERSION (after the 4-byte length)
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        version_ok,
+        "expected SFTP VERSION reply from subsystem, got {:?}",
+        reply
+    );
+}
+
+/// Non-ETM packet framing (RFC 4253 §6.4) encrypts `packet_length` together
+/// with the body. Force a CTR cipher plus a non-ETM MAC so the whole handshake,
+/// authentication and exec round-trip use that layout on both sides.
+#[test]
+fn non_etm_exec_round_trip() {
+    let dir = temp_dir("non-etm");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("MACs=hmac-sha2-512")
+        .arg("-o")
+        .arg("Ciphers=aes128-ctr")
+        .arg("127.0.0.1")
+        .arg("echo NON_ETM_OK")
+        .output()
+        .expect("run non-ETM client");
+
+    let _ = server.kill();
+    let _ = server.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "non-ETM exec failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("NON_ETM_OK"),
+        "non-ETM exec produced no output: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// AES-GCM end-to-end: pins the AEAD packet layout (cleartext 4-byte
+/// packet_length authenticated as AAD, `packet_length % 16 == 0` padding, tag
+/// after the ciphertext). A wrong block size previously produced
+/// "padding error: need 24 block 16 mod 8" against OpenSSH.
+#[test]
+fn gcm_exec_round_trip() {
+    for cipher in ["aes128-gcm@openssh.com", "aes256-gcm@openssh.com"] {
+        let dir = temp_dir(&format!("gcm-{}", cipher.split('@').next().unwrap()));
+        let port = free_port();
+        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+        let (mut server, id_path, kh) =
+            launch_test_server_extra(&dir, port, &["-o", &format!("ciphers={}", cipher)]);
+
+        let args = base_client_args(port, &user, &id_path, &kh);
+        let output = Command::new(&args[0])
+            .args(&args[1..])
+            .arg("-o")
+            .arg(format!("Ciphers={}", cipher))
+            .arg("127.0.0.1")
+            .arg("echo GCM_OK")
+            .output()
+            .expect("run GCM client");
+
+        let _ = server.kill();
+        let _ = server.wait_with_output();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            output.status.success(),
+            "GCM ({cipher}) exec failed: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("GCM_OK"),
+            "GCM ({cipher}) exec produced no output: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+/// Read one length-prefixed SFTP packet (type byte + body) from `r` within
+/// `timeout`, using a reader thread so a missing reply cannot block forever.
+/// Returns the full packet bytes on success, or None on timeout/EOF.
+fn read_sftp_reply<R: Read + Send + 'static>(mut r: R, timeout: Duration) -> Option<Vec<u8>> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("sftp-reader".into())
+        .spawn(move || {
+            let mut hdr = [0u8; 4];
+            if read_full(&mut r, &mut hdr) {
+                let len = u32::from_be_bytes(hdr) as usize;
+                if len > 0 && len <= 1 << 20 {
+                    let mut body = vec![0u8; len];
+                    if read_full(&mut r, &mut body) {
+                        let mut packet = Vec::with_capacity(4 + len);
+                        packet.extend_from_slice(&hdr);
+                        packet.extend_from_slice(&body);
+                        let _ = tx.send(packet);
+                    }
+                }
+            }
+            // Otherwise drop tx so the receiver times out.
+        })
+        .expect("spawn reader thread");
+    match rx.recv_timeout(timeout) {
+        Ok(buf) => Some(buf),
+        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> bool {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(m) => filled += m,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Wait until `port` is no longer bound by a listening socket (the server
+/// released its X11/forward listener after the prior connection ended).
+fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        // A successful bind proves the port is free; drop the probe immediately
+        // so the next session can claim it.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    false
+}
+
+/// X11 forwarding (`-X`) end-to-end: the server binds an X11 listener
+/// (6000+offset), a remote client connects to it, and the bytes tunnel back to
+/// the local X display socket (127.0.0.1:6000). The reply must tunnel back to
+/// the remote in the other direction. Also verifies the server releases its X11
+/// listener when the connection ends (no "Address already in use" on the next
+/// session).
+#[test]
+fn x11_forwarding_round_trip() {
+    let dir = temp_dir("x11");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    // Fake local X display server: bind 127.0.0.1:6000 and echo back any data.
+    let listener = std::net::TcpListener::bind("127.0.0.1:6000").expect("bind fake X display");
+    let x11_thread = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut conn, _addr) = listener.accept().expect("fake X accept");
+        let mut buf = [0u8; 1024];
+        let n = conn.read(&mut buf).expect("fake X read");
+        let got = buf[..n].to_vec();
+        conn.write_all(b"X11_REPLY_FROM_LOCAL").expect("fake X write");
+        (got, n)
+    });
+
+    // Run an `ssh -X` session; the remote command connects to the server's X11
+    // listener on 127.0.0.1:6010 (default offset 10), sends a payload, and
+    // reads the reply tunneled back from the local display.
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..])
+        .arg("-X")
+        .arg("127.0.0.1")
+        .arg("python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',6010),timeout=5); s.sendall(b'HELLO_X11'); print(s.recv(100).decode(), flush=True)\"");
+    let output = cmd.env("DISPLAY", "localhost:0").output().expect("run x11 client");
+
+    // The remote should have received the reply tunneled from the local display.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("X11_REPLY_FROM_LOCAL"),
+        "expected X11 reply in stdout, got: {:?}\nstderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The fake local display must have received the payload.
+    let (got, _n) = x11_thread.join().expect("join fake X thread");
+    assert_eq!(
+        got,
+        b"HELLO_X11".to_vec(),
+        "fake X display did not receive the X11 payload"
+    );
+
+    // The server must release its X11 listener (port 6010) once the first
+    // connection ends, so the next session can bind it fresh (no leak).
+    assert!(
+        wait_for_port_free(6010, Duration::from_secs(5)),
+        "server did not release X11 listener 6010 after session 1"
+    );
+
+    // Second `-X` session: the server must bind port 6010 fresh (no leak), and
+    // the tunnel must work again.
+    let listener2 = std::net::TcpListener::bind("127.0.0.1:6000").expect("bind fake X display 2");
+    let x11_thread2 = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut conn, _addr) = listener2.accept().expect("fake X accept 2");
+        let mut buf = [0u8; 1024];
+        let n = conn.read(&mut buf).expect("fake X read 2");
+        conn.write_all(b"X11_REPLY_AGAIN").expect("fake X write 2");
+        buf[..n].to_vec()
+    });
+    let mut cmd2 = Command::new(&args[0]);
+    cmd2.args(&args[1..])
+        .arg("-X")
+        .arg("127.0.0.1")
+        .arg("python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',6010),timeout=5); s.sendall(b'HELLO_AGAIN'); print(s.recv(100).decode(), flush=True)\"");
+    let output2 = cmd2.env("DISPLAY", "localhost:0").output().expect("run x11 client 2");
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    assert!(
+        stdout2.contains("X11_REPLY_AGAIN"),
+        "expected X11 reply on second session, got: {:?}\nstderr: {}",
+        stdout2,
+        String::from_utf8_lossy(&output2.stderr)
+    );
+    let got2 = x11_thread2.join().expect("join fake X thread 2");
+    assert_eq!(got2, b"HELLO_AGAIN".to_vec(), "second session payload mismatch");
+
+    let _ = server.kill();
+    let _ = server.wait_with_output();
     let _ = std::fs::remove_dir_all(&dir);
 }

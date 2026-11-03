@@ -13,19 +13,43 @@ pub trait SshMac: Send + Sync {
     fn verify_tag(&self, seq: u64, packet_data: &[u8], tag: &[u8]) -> Result<bool>;
 }
 
+// RFC 4253 §6.4: the sequence number in the MAC input is a 4-byte uint32
+// (not a u64), encoded big-endian.
+fn seq_bytes(seq: u64) -> [u8; 4] {
+    (seq as u32).to_be_bytes()
+}
+
+/// Compare a computed tag against a peer-supplied tag in constant time.
+///
+/// A plain `==` on slices returns at the first differing byte, which leaks how
+/// many leading bytes of a forged tag were correct and enables a byte-by-byte
+/// forgery oracle. Only the equal-length case can be a match, and the length
+/// itself is public (it is negotiated), so comparing it first is fine.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    // Keep the compiler from turning this into an early-exit comparison.
+    std::hint::black_box(diff) == 0
+}
+
 fn hmac_sha256(key: &[u8], seq: u64, data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| SshError::Protocol(format!("HMAC: {}", e)))?;
-    mac.update(&seq.to_be_bytes()); mac.update(data);
+    mac.update(&seq_bytes(seq)); mac.update(data);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 fn hmac_sha512(key: &[u8], seq: u64, data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha512>::new_from_slice(key).map_err(|e| SshError::Protocol(format!("HMAC: {}", e)))?;
-    mac.update(&seq.to_be_bytes()); mac.update(data);
+    mac.update(&seq_bytes(seq)); mac.update(data);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 fn hmac_sha1(key: &[u8], seq: u64, data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha1>::new_from_slice(key).map_err(|e| SshError::Protocol(format!("HMAC: {}", e)))?;
-    mac.update(&seq.to_be_bytes()); mac.update(data);
+    mac.update(&seq_bytes(seq)); mac.update(data);
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
@@ -40,7 +64,7 @@ macro_rules! def_mac {
             fn is_etm(&self) -> bool { $etm }
             fn set_key(&mut self, k: &[u8]) -> Result<()> { self.key = k.to_vec(); Ok(()) }
             fn compute_tag(&self, seq: u64, data: &[u8]) -> Result<Vec<u8>> { ($compute)(&self.key, seq, data) }
-            fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(($compute)(&self.key, seq, data)? == tag) }
+            fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(ct_eq(&($compute)(&self.key, seq, data)?, tag)) }
         }
     };
 }
@@ -61,7 +85,7 @@ impl SshMac for HmacSha196Mac {
     fn is_etm(&self) -> bool { false }
     fn set_key(&mut self, k: &[u8]) -> Result<()> { self.key = k.to_vec(); Ok(()) }
     fn compute_tag(&self, seq: u64, data: &[u8]) -> Result<Vec<u8>> { Ok(hmac_sha1(&self.key, seq, data)?[..12].to_vec()) }
-    fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(&hmac_sha1(&self.key, seq, data)?[..12] == tag) }
+    fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(ct_eq(&hmac_sha1(&self.key, seq, data)?[..12], tag)) }
 }
 
 pub struct HmacSha196EtmMac { key: Vec<u8> }
@@ -73,7 +97,7 @@ impl SshMac for HmacSha196EtmMac {
     fn is_etm(&self) -> bool { true }
     fn set_key(&mut self, k: &[u8]) -> Result<()> { self.key = k.to_vec(); Ok(()) }
     fn compute_tag(&self, seq: u64, data: &[u8]) -> Result<Vec<u8>> { Ok(hmac_sha1(&self.key, seq, data)?[..12].to_vec()) }
-    fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(&hmac_sha1(&self.key, seq, data)?[..12] == tag) }
+    fn verify_tag(&self, seq: u64, data: &[u8], tag: &[u8]) -> Result<bool> { Ok(ct_eq(&hmac_sha1(&self.key, seq, data)?[..12], tag)) }
 }
 
 pub struct NoMac;
@@ -114,4 +138,28 @@ pub fn get_supported_macs() -> Vec<&'static str> {
         "hmac-sha1-96-etm@openssh.com",
         "none",
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_tag_accepts_exact_tag_and_rejects_any_mutation() {
+        for name in ["hmac-sha2-256", "hmac-sha2-512", "hmac-sha1", "hmac-sha1-96"] {
+            let mut mac = create_mac(name).unwrap();
+            mac.set_key(&vec![0x5a; mac.key_len()]).unwrap();
+            let tag = mac.compute_tag(7, b"packet body").unwrap();
+            assert!(mac.verify_tag(7, b"packet body", &tag).unwrap(), "{name}");
+
+            // Wrong data, wrong seq, and a flipped tag byte must all fail.
+            assert!(!mac.verify_tag(7, b"packet bodY", &tag).unwrap(), "{name}");
+            assert!(!mac.verify_tag(8, b"packet body", &tag).unwrap(), "{name}");
+            let mut bad = tag.clone();
+            bad[0] ^= 0x01;
+            assert!(!mac.verify_tag(7, b"packet body", &bad).unwrap(), "{name}");
+            // Truncated tags are rejected by the length check.
+            assert!(!mac.verify_tag(7, b"packet body", &tag[..tag.len() - 1]).unwrap(), "{name}");
+        }
+    }
 }

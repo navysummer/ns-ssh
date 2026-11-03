@@ -485,6 +485,10 @@ pub struct SshClient {
     pump_write: VecDeque<Vec<u8>>,
     /// Set when the pump observes SSH_MSG_CHANNEL_EOF or SSH_MSG_CHANNEL_CLOSE.
     pump_closed: bool,
+    /// Inbound packets read while a rekey was in progress that are not part of
+    /// the key exchange (e.g. a CHANNEL_SUCCESS for a pre-rekey request). They
+    /// are replayed by `recv_packet` after the rekey completes.
+    deferred_packets: VecDeque<Vec<u8>>,
 }
 
 impl SshClient {
@@ -514,6 +518,7 @@ impl SshClient {
             pump_in: VecDeque::new(),
             pump_write: VecDeque::new(),
             pump_closed: false,
+            deferred_packets: VecDeque::new(),
         }
     }
 
@@ -658,9 +663,11 @@ impl SshClient {
             self.config.macs.as_deref(),
         );
         send_raw_packet(stream, &kex_init).await?;
+        self.transport.outgoing_seq += 1; // seq counts every packet (RFC 4253 §6.4)
         self.transport.state = KexState::KexInitSent;
 
         let server_kex = receive_raw_packet(stream).await?;
+        self.transport.incoming_seq += 1;
         self.transport.server_kex_init = server_kex.clone();
         self.transport.state = KexState::KexInitReceived;
 
@@ -672,19 +679,22 @@ impl SshClient {
         let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
 
         let (server_host_key_blob, server_public_key, server_signature_blob, shared_secret, exchange_hash, kex_hash_name) = if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
-            let (min, nbits, max) = if negotiation.kex_algorithm.contains("sha256") {
-                (2048u32, 4096u32, 8192u32)
-            } else {
-                (2048u32, 2048u32, 4096u32)
-            };
+            // RFC 4419 §3: min = 2048, preferred = 3072, max = 8192 (the same
+            // range OpenSSH requests).
+            let (min, nbits, max) = (2048u32, 3072u32, 8192u32);
+            // RFC 4419 §3: clients send SSH_MSG_KEX_DH_GEX_REQUEST (34) with
+            // min/n/max. The legacy 30 (REQUEST_OLD) carries only min/n and is
+            // rejected by modern servers, so always use 34.
             let mut req = Vec::new();
-            req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD);
+            req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST);
             min.encode(&mut req)?;
             nbits.encode(&mut req)?;
             max.encode(&mut req)?;
             send_raw_packet(stream, &req).await?;
+            self.transport.outgoing_seq += 1;
 
             let group_msg = receive_raw_packet(stream).await?;
+            self.transport.incoming_seq += 1;
             if group_msg.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_GROUP) {
                 return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_GROUP".into()));
             }
@@ -695,6 +705,19 @@ impl SshClient {
             let g_bytes = g_mp.clone();
             let p_bu = num_bigint::BigUint::from_bytes_be(&p_mp);
             let g_bu = num_bigint::BigUint::from_bytes_be(&g_mp);
+            // Validate the server-selected group before using it: the size must
+            // fall inside the range we requested and g must be a valid
+            // generator in (1, p-1).
+            let p_bits = p_bu.bits();
+            if p_bits < u64::from(min) || p_bits > u64::from(max) {
+                return Err(SshError::Protocol(format!(
+                    "group-exchange modulus is {} bits, outside requested [{}, {}]",
+                    p_bits, min, max
+                )));
+            }
+            if g_bu <= num_bigint::BigUint::from(1u32) || g_bu >= &p_bu - num_bigint::BigUint::from(1u32) {
+                return Err(SshError::Protocol("group-exchange generator out of range".into()));
+            }
             let exp_bytes = if negotiation.kex_algorithm.contains("sha256") { 512 } else { 256 };
             let gex_name: &'static str = if negotiation.kex_algorithm.contains("sha256") {
                 "diffie-hellman-group-exchange-sha256"
@@ -710,8 +733,10 @@ impl SshClient {
             init_msg.push(msg::SSH_MSG_KEX_DH_GEX_INIT);
             SshMpInt(client_pub.clone()).encode(&mut init_msg)?;
             send_raw_packet(stream, &init_msg).await?;
+            self.transport.outgoing_seq += 1;
 
             let reply = receive_raw_packet(stream).await?;
+            self.transport.incoming_seq += 1;
             if reply.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_REPLY) {
                 return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_REPLY".into()));
             }
@@ -744,11 +769,16 @@ impl SshClient {
             kex.generate_keypair()?;
             let mut dh_payload = Vec::new();
             dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-            SshBytes(kex.public_key_bytes()).encode(&mut dh_payload)?;
+            // e is an mpint: encode with the 0x00 sign prefix when the high
+            // bit is set. Sending it as a plain string makes peers interpret
+            // roughly half of all values as negative bignums.
+            SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
             send_raw_packet(stream, &dh_payload).await?;
+            self.transport.outgoing_seq += 1;
             self.transport.state = KexState::KexDhInitSent;
 
             let reply = receive_raw_packet(stream).await?;
+            self.transport.incoming_seq += 1;
             self.transport.state = KexState::KexDhReplyReceived;
 
             let mut r = &reply[1..];
@@ -773,6 +803,9 @@ impl SshClient {
                 &kex.public_key_bytes(),
                 &srv_pub,
                 &shared,
+                // Finite-field DH hashes e/f as mpints; ECDH/curve25519 as
+                // byte strings.
+                negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
             );
             (host_key_blob, srv_pub, sig_blob, shared, exch_hash, hash_name)
         };
@@ -938,19 +971,12 @@ impl SshClient {
             return Err(SshError::HostKeyVerificationFailed);
         }
 
-        self.transport.install_new_keys(
-            &negotiation,
-            hash_name,
-            &shared_secret,
-            &exchange_hash,
-            &exchange_hash,
-        )?;
-
-        self.session_id = Some(exchange_hash);
-
         let aead = self.is_aead();
         let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
 
+        // RFC 4253 §7.1: SSH_MSG_NEWKEYS is sent with the current (old) keys.
+        // Neither side has installed the new keys yet, so this is a plaintext
+        // packet; both sides switch to the new keys only after the exchange.
         let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
         send_encrypted_packet(stream, &newkeys_msg, &mut self.transport, true, aead).await?;
         self.transport.state = KexState::NewKeysSent;
@@ -960,8 +986,22 @@ impl SshClient {
             return Err(SshError::Protocol("expected NEWKEYS".into()));
         }
         self.transport.state = KexState::NewKeysReceived;
+
+        // Only now is it safe to install and use the new keys.
+        self.transport.install_new_keys(
+            &negotiation,
+            hash_name,
+            &shared_secret,
+            &exchange_hash,
+            &exchange_hash,
+        )?;
+
+        self.session_id = Some(exchange_hash);
         self.transport.kex_algorithm = Some(kex);
         self.transport.state = KexState::Established;
+        // The RekeyLimit byte counter starts after the initial key exchange.
+        self.transport.last_rekey_bytes = self.transport.total_bytes();
+        self.transport.last_rekey_instant = std::time::Instant::now();
 
         Ok(())
     }
@@ -1270,9 +1310,6 @@ impl SshClient {
         width: u32,
         height: u32,
     ) -> Result<ChannelId> {
-        let aead = self.is_aead();
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-
         let local_id = self.channel_manager.alloc_channel(
             msg::SSH_CHANNEL_TYPE_SESSION,
             msg::CHANNEL_PACKET_WINDOW_SIZE,
@@ -1285,9 +1322,13 @@ impl SshClient {
             msg::CHANNEL_PACKET_WINDOW_SIZE,
             msg::CHANNEL_MAX_PACKET_SIZE,
         );
-        send_encrypted_packet(stream, &open_msg, &mut self.transport, false, aead).await?;
+        self.send_packet(&open_msg, false).await?;
 
-        let open_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        let open_resp = self.recv_packet().await?;
+        if std::env::var("NS_DEBUG_PKT").is_ok() {
+            let hex: String = open_resp.iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("CHANNEL_OPEN_RESP type={} len={} seq={} hex={}", open_resp.first().copied().unwrap_or(0), open_resp.len(), self.transport.incoming_seq.saturating_sub(1), hex);
+        }
         match open_resp.first() {
             Some(&msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
                 let (recipient, sender, w, _m) = parse_channel_open_confirmation(&open_resp)?;
@@ -1306,14 +1347,14 @@ impl SshClient {
 
         if self.config.forward_agent {
             let req = build_channel_request(local_id, msg::SSH_REQUEST_AUTH_AGENT, false, None);
-            send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+            self.send_packet(&req, false).await?;
         }
 
         if pty {
             let pty_data = build_pty_request(term, width, height, width * 8, height * 16, &[]);
             let pty_msg = build_channel_request(local_id, msg::SSH_REQUEST_PTY, true, Some(&pty_data));
-            send_encrypted_packet(stream, &pty_msg, &mut self.transport, false, aead).await?;
-            let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            self.send_packet(&pty_msg, false).await?;
+            let _resp = self.recv_packet().await?;
         }
 
         if self.config.forward_x11 {
@@ -1330,23 +1371,23 @@ impl SshClient {
             let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
             let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
-            send_encrypted_packet(stream, &x11_msg, &mut self.transport, false, aead).await?;
-            let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            self.send_packet(&x11_msg, false).await?;
+            let _resp = self.recv_packet().await?;
         }
 
-        for (name, value) in &self.config.set_env {
+        for (name, value) in &self.config.set_env.clone() {
             let env_data = build_env_request(name, value);
             let env_msg = build_channel_request(local_id, msg::SSH_REQUEST_ENV, false, Some(&env_data));
-            send_encrypted_packet(stream, &env_msg, &mut self.transport, false, aead).await?;
+            self.send_packet(&env_msg, false).await?;
         }
         if !self.config.send_env.is_empty() {
             let envs: Vec<(String, String)> = std::env::vars().collect();
-            for pattern in &self.config.send_env {
+            for pattern in &self.config.send_env.clone() {
                 for (name, value) in &envs {
                     if env_pattern_match(name, pattern) {
                         let env_data = build_env_request(name, value);
                         let env_msg = build_channel_request(local_id, msg::SSH_REQUEST_ENV, false, Some(&env_data));
-                        send_encrypted_packet(stream, &env_msg, &mut self.transport, false, aead).await?;
+                        self.send_packet(&env_msg, false).await?;
                     }
                 }
             }
@@ -1355,20 +1396,18 @@ impl SshClient {
         if let Some(cmd) = command {
             let exec_data = build_exec_request(cmd);
             let exec_msg = build_channel_request(local_id, msg::SSH_REQUEST_EXEC, true, Some(&exec_data));
-            send_encrypted_packet(stream, &exec_msg, &mut self.transport, false, aead).await?;
-            let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            self.send_packet(&exec_msg, false).await?;
+            let _resp = self.recv_packet().await?;
         } else {
             let shell_msg = build_channel_request(local_id, msg::SSH_REQUEST_SHELL, true, None);
-            send_encrypted_packet(stream, &shell_msg, &mut self.transport, false, aead).await?;
-            let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            self.send_packet(&shell_msg, false).await?;
+            let _resp = self.recv_packet().await?;
         }
 
         Ok(local_id)
     }
 
     pub async fn request_session_subsystem(&mut self, subsystem: &str) -> Result<ChannelId> {
-        let aead = self.is_aead();
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
         let local_id = self.channel_manager.alloc_channel(
             msg::SSH_CHANNEL_TYPE_SESSION,
             msg::CHANNEL_PACKET_WINDOW_SIZE,
@@ -1380,8 +1419,8 @@ impl SshClient {
             msg::CHANNEL_PACKET_WINDOW_SIZE,
             msg::CHANNEL_MAX_PACKET_SIZE,
         );
-        send_encrypted_packet(stream, &open_msg, &mut self.transport, false, aead).await?;
-        let open_resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        self.send_packet(&open_msg, false).await?;
+        let open_resp = self.recv_packet().await?;
         match open_resp.first() {
             Some(&msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
                 let (recipient, sender, w, _m) = parse_channel_open_confirmation(&open_resp)?;
@@ -1399,8 +1438,8 @@ impl SshClient {
         }
         let sub_data = build_subsystem_request(subsystem);
         let sub_msg = build_channel_request(local_id, msg::SSH_REQUEST_SUBSYSTEM, true, Some(&sub_data));
-        send_encrypted_packet(stream, &sub_msg, &mut self.transport, false, aead).await?;
-        let _resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        self.send_packet(&sub_msg, false).await?;
+        let _resp = self.recv_packet().await?;
         Ok(local_id)
     }
 
@@ -1460,8 +1499,11 @@ impl SshClient {
 
         let mut local_meta: Vec<(String, u16, u16)> = Vec::new();
         let mut forward_failed = false;
-        for (i, (bind_port, host, connect_port)) in self.config.local_forwards.clone().into_iter().enumerate() {
-            let bind_addr = format!("{}:{}", local_bind_host, bind_port);
+        for (i, (fbind, bind_port, host, connect_port)) in self.config.local_forwards.clone().into_iter().enumerate() {
+            // Per-forward bind address (`-L bind:port:host:hostport`) overrides
+            // the global BindAddress / GatewayPorts policy.
+            let bind_host = if fbind.is_empty() { local_bind_host.clone() } else { fbind };
+            let bind_addr = format!("{}:{}", bind_host, bind_port);
             match TcpListener::bind(&bind_addr).await {
                 Ok(listener) => {
                     tracing::info!("Local forwarding listening on {} -> {}:{}", bind_addr, host, connect_port);
@@ -1544,10 +1586,11 @@ impl SshClient {
         }
 
         let mut remote_forward_map: HashMap<u16, (String, u16)> = HashMap::new();
-        for (remote_port, ref local_host, local_port) in self.config.remote_forwards.clone() {
-            // Send an empty bind address so the server applies its GatewayPorts
-            // policy (OpenSSH: `-R` defaults to loopback unless GatewayPorts).
-            let req = build_global_request_tcpip_forward(true, "", remote_port as u32);
+        for (bind_addr, remote_port, ref local_host, local_port) in self.config.remote_forwards.clone() {
+            // An empty bind address makes the server apply its GatewayPorts
+            // policy (OpenSSH: `-R` defaults to loopback unless GatewayPorts);
+            // an explicit `-R bind:port:host:hostport` bind address is honored.
+            let req = build_global_request_tcpip_forward(true, &bind_addr, remote_port as u32);
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
             remote_forward_map.insert(remote_port, (local_host.clone(), local_port));
@@ -1658,8 +1701,15 @@ impl SshClient {
                 let tb = self.transport.total_bytes();
                 let el = self.transport.last_rekey_instant.elapsed().as_secs();
                 if self.transport.needs_rekey(tb, el) {
-                    if let Err(e) = self.perform_rekey().await {
-                        tracing::warn!("rekey failed (continuing): {:?}", e);
+                    match self.perform_rekey().await {
+                        Ok(deferred) => {
+                            for d in deferred {
+                                self.deferred_packets.push_back(d);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("rekey failed (continuing): {:?}", e);
+                        }
                     }
                 }
             }
@@ -1825,6 +1875,18 @@ impl SshClient {
                         }
                         None => {
                             stdin_active = false;
+                            // `ssh -N host` with no session channel and no port
+                            // forwards has nothing left to do once stdin closes;
+                            // exit like OpenSSH instead of waiting forever.
+                            let no_forwards = self.config.local_forwards.is_empty()
+                                && self.config.remote_forwards.is_empty()
+                                && self.config.dynamic_forwards.is_empty()
+                                && self.config.local_streamlocal.is_empty()
+                                && self.config.remote_streamlocal.is_empty()
+                                && self.config.stdio_forward.is_none();
+                            if session_id.is_none() && no_forwards {
+                                should_exit = true;
+                            }
                             if let Some(rid) = stdio_forward_remote_id {
                                 let eof = build_channel_eof(rid);
                                 let _ = self.queue_send(&eof, &mut pending_write);
@@ -1870,10 +1932,7 @@ impl SshClient {
                     }
                 }
 
-                packet = async {
-                    let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-                    receive_encrypted_packet(stream, &mut self.transport, false, aead).await
-                } => {
+                packet = self.recv_packet() => {
                     last_any_packet = std::time::Instant::now();
                     match packet {
                         Ok(payload) if !payload.is_empty() => {
@@ -2185,6 +2244,20 @@ impl SshClient {
                                         }
                                     }
                                 }
+                                msg::SSH_MSG_KEXINIT => {
+                                    // Server-initiated rekey: it already sent its
+                                    // KEXINIT; continue the exchange with it.
+                                    match self.perform_rekey_with_kex(payload.clone()).await {
+                                        Ok(deferred) => {
+                                            for d in deferred {
+                                                self.deferred_packets.push_back(d);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("rekey failed (continuing): {:?}", e);
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -2319,6 +2392,8 @@ impl SshClient {
         // top of the loop (where `self` is freely borrowable for forwarding
         // channel pumps), avoiding borrow conflicts with the select futures.
         let mut pending_packets: VecDeque<Vec<u8>> = VecDeque::new();
+        // Set when a slave sends `-O exit` / `-O stop`; the master loop breaks.
+        let mut master_exit_requested = false;
 
         // Persist: track when the last session closed.
         let persist_start: Option<std::time::Instant> = None;
@@ -2492,6 +2567,17 @@ impl SshClient {
                                     pending_send.push_back(req);
                                 }
                             }
+                            crate::control::ControlRequest::Check => {
+                                if let Some(resp) = &resp_tx {
+                                    let _ = resp.send(crate::control::ControlResponse::Ok(std::process::id()));
+                                }
+                            }
+                            crate::control::ControlRequest::Exit => {
+                                if let Some(resp) = &resp_tx {
+                                    let _ = resp.send(crate::control::ControlResponse::Ok(std::process::id()));
+                                }
+                                master_exit_requested = true;
+                            }
                         }
                     }
                 }
@@ -2541,9 +2627,13 @@ impl SshClient {
                     // Wake up periodically to evaluate ControlPersist timeout.
                 }
             }
+
+            if master_exit_requested {
+                break;
+            }
         }
 
-        eprintln!("ControlMaster: exiting (idle or no sessions)");
+        eprintln!("ControlMaster: exiting");
         let _ = self.send_disconnect().await;
         Ok(0)
     }
@@ -2803,22 +2893,42 @@ impl SshClient {
         let aead = self.is_aead();
         let local_id = self.channel_manager.alloc_channel(msg::SSH_CHANNEL_TYPE_DIRECT_TCPIP, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
         let msg_bytes = build_direct_tcpip_open(local_id, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE, host, port, orig_ip, orig_port);
-        let (tx, rx) = oneshot::channel();
-        self.pending_open.insert(local_id, tx);
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-        send_encrypted_packet(stream, &msg_bytes, &mut self.transport, false, aead).await?;
-        match rx.await {
-            Ok(Ok((remote_id, _w, _m))) => {
-                self.channel_manager.set_remote_id(local_id, remote_id);
-                Ok(local_id)
-            }
-            Ok(Err(e)) => {
-                self.channel_manager.close_channel(local_id);
-                Err(e)
-            }
-            Err(_) => {
-                self.channel_manager.close_channel(local_id);
-                Err(SshError::Channel("open cancelled".into()))
+        {
+            let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+            send_encrypted_packet(stream, &msg_bytes, &mut self.transport, false, aead).await?;
+        }
+        // Read packets inline until this channel's open confirmation/failure
+        // arrives. ProxyJump calls this before any event loop is running, so the
+        // confirmation cannot be delivered via `pending_open` (which the event
+        // loop resolves); block here instead.
+        loop {
+            let pkt = {
+                let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+                receive_encrypted_packet(stream, &mut self.transport, false, aead).await?
+            };
+            match pkt.first() {
+                Some(&msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
+                    if let Ok((recipient, sender, w, _m)) = parse_channel_open_confirmation(&pkt) {
+                        if recipient == local_id {
+                            self.channel_manager.set_remote_id(recipient, sender);
+                            self.channel_manager.set_peer_window(recipient, w);
+                            return Ok(recipient);
+                        }
+                    }
+                }
+                Some(&msg::SSH_MSG_CHANNEL_OPEN_FAILURE) => {
+                    if let Ok((recipient, reason, message)) = parse_channel_open_failure(&pkt) {
+                        if recipient == local_id {
+                            self.channel_manager.close_channel(recipient);
+                            return Err(SshError::Channel(format!("open failed: {} ({})", message, reason)));
+                        }
+                    }
+                }
+                Some(&msg::SSH_MSG_DISCONNECT) => {
+                    self.channel_manager.close_channel(local_id);
+                    return Err(SshError::Protocol("connection closed during direct-tcpip open".into()));
+                }
+                _ => {}
             }
         }
     }
@@ -2880,19 +2990,90 @@ impl SshClient {
             .unwrap_or(false)
     }
 
-    pub async fn perform_rekey(&mut self) -> Result<()> {
+    /// Send one encrypted packet. The rekey byte counter is not checked here;
+    /// callers trigger client-initiated rekey from the main loop / setup.
+    async fn send_packet(&mut self, payload: &[u8], is_new_keys: bool) -> Result<()> {
+        let aead = self.is_aead();
+        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+        send_encrypted_packet(stream, payload, &mut self.transport, is_new_keys, aead).await
+    }
+
+    /// Receive one encrypted packet. If the peer initiates a rekey (KEXINIT
+    /// arrives unexpectedly), complete the rekey inline and continue reading,
+    /// so synchronous setup paths (channel open / exec) transparently survive
+    /// a server-initiated rekey.
+    async fn recv_packet(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(p) = self.deferred_packets.pop_front() {
+                return Ok(p);
+            }
+            let aead = self.is_aead();
+            let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
+            let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            if p.first() == Some(&msg::SSH_MSG_KEXINIT) {
+                drop(stream);
+                let deferred = self.perform_rekey_with_kex(p).await?;
+                for d in deferred {
+                    self.deferred_packets.push_back(d);
+                }
+                continue;
+            }
+            // OpenSSH's server sends hostkeys-prove-00@openssh.com (and other
+            // server-initiated GLOBAL_REQUESTs) unprompted; skip them and
+            // honour want_reply so synchronous setup paths see the next packet.
+            if p.first() == Some(&msg::SSH_MSG_GLOBAL_REQUEST) {
+                if let Ok((_name, want_reply, _)) = parse_global_request(&p) {
+                    if want_reply {
+                        let resp = build_request_failure();
+                        self.send_packet(&resp, false).await?;
+                    }
+                }
+                continue;
+            }
+            // SSH_MSG_DEBUG / SSH_MSG_IGNORE may arrive at any time (OpenSSH
+            // sends DEBUG after auth with key options); skip them so the setup
+            // path sees the real response.
+            if p.first() == Some(&msg::SSH_MSG_DEBUG) || p.first() == Some(&msg::SSH_MSG_IGNORE) {
+                continue;
+            }
+            return Ok(p);
+        }
+    }
+
+    pub async fn perform_rekey(&mut self) -> Result<Vec<Vec<u8>>> {
+        self.perform_rekey_inner(None).await
+    }
+
+    /// Handle a server-initiated rekey: the server has already sent its
+    /// KEXINIT (received by the main loop as `server_kex`). Use it directly
+    /// instead of waiting for a second one.
+    pub async fn perform_rekey_with_kex(&mut self, server_kex: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+        self.perform_rekey_inner(Some(server_kex)).await
+    }
+
+    async fn perform_rekey_inner(&mut self, pre_server_kex: Option<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
         use ssh_core::transport::KexState;
         if self.transport.state != KexState::Established {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.transport.state = KexState::RekeyInProgress;
         let aead = self.is_aead();
         let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
 
-        let client_kex_init = self.transport.prepare_rekey();
+        // Non-kex packets (e.g. a CHANNEL_SUCCESS for a pre-rekey request)
+        // that arrive while waiting for the KEXDH_REPLY. They are replayed by
+        // the caller after the rekey completes.
+        let mut deferred: Vec<Vec<u8>> = Vec::new();
+
+        let client_kex_init = self.transport.prepare_rekey(false);
         send_encrypted_packet(stream, &client_kex_init, &mut self.transport, false, aead).await?;
 
-        let server_kex = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+        let server_kex = if let Some(k) = pre_server_kex {
+            k
+        } else {
+            let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            p
+        };
         if server_kex.first() != Some(&msg::SSH_MSG_KEXINIT) {
             return Err(SshError::KexFailed("expected KEXINIT during rekey".into()));
         }
@@ -2907,19 +3088,24 @@ impl SshClient {
 
         let (server_host_key_blob, server_pub_key, server_sig_blob, shared_secret, exchange_hash, kex_hash_name) =
             if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
-                let (min, nbits, max) = if negotiation.kex_algorithm.contains("sha256") {
-                    (2048u32, 4096u32, 8192u32)
-                } else {
-                    (2048u32, 2048u32, 4096u32)
-                };
+                // RFC 4419 §3: modern servers reject the legacy REQUEST_OLD
+                // (30) form, so rekey must use the same REQUEST (34) message
+                // as the initial exchange.
+                let (min, nbits, max) = (2048u32, 3072u32, 8192u32);
                 let mut req = Vec::new();
-                req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD);
+                req.push(msg::SSH_MSG_KEX_DH_GEX_REQUEST);
                 min.encode(&mut req)?;
                 nbits.encode(&mut req)?;
                 max.encode(&mut req)?;
                 send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
 
-                let group_msg = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                let group_msg = loop {
+                    let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                    if p.first() == Some(&msg::SSH_MSG_KEX_DH_GEX_GROUP) {
+                        break p;
+                    }
+                    deferred.push(p);
+                };
                 if group_msg.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_GROUP) {
                     return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_GROUP".into()));
                 }
@@ -2930,6 +3116,20 @@ impl SshClient {
                 let g_bytes = g_mp.clone();
                 let p_bu = num_bigint::BigUint::from_bytes_be(&p_mp);
                 let g_bu = num_bigint::BigUint::from_bytes_be(&g_mp);
+                let p_bits = p_bu.bits();
+                if p_bits < u64::from(min) || p_bits > u64::from(max) {
+                    return Err(SshError::Protocol(format!(
+                        "group-exchange modulus is {} bits, outside requested [{}, {}]",
+                        p_bits, min, max
+                    )));
+                }
+                if g_bu <= num_bigint::BigUint::from(1u32)
+                    || g_bu >= &p_bu - num_bigint::BigUint::from(1u32)
+                {
+                    return Err(SshError::Protocol(
+                        "group-exchange generator out of range".into(),
+                    ));
+                }
                 let exp_bytes = if negotiation.kex_algorithm.contains("sha256") { 512 } else { 256 };
                 let gex_name: &'static str = if negotiation.kex_algorithm.contains("sha256") {
                     "diffie-hellman-group-exchange-sha256"
@@ -2946,7 +3146,13 @@ impl SshClient {
                 SshMpInt(client_pub.clone()).encode(&mut init_msg)?;
                 send_encrypted_packet(stream, &init_msg, &mut self.transport, false, aead).await?;
 
-                let reply = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                let reply = loop {
+                    let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                    if p.first() == Some(&msg::SSH_MSG_KEX_DH_GEX_REPLY) {
+                        break p;
+                    }
+                    deferred.push(p);
+                };
                 if reply.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_REPLY) {
                     return Err(SshError::Protocol("expected SSH_MSG_KEX_DH_GEX_REPLY".into()));
                 }
@@ -2978,10 +3184,18 @@ impl SshClient {
                 kex.generate_keypair()?;
                 let mut dh_payload = Vec::new();
                 dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-                dh_payload.extend(SshBytes(kex.public_key_bytes()).0);
+                SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
                 send_encrypted_packet(stream, &dh_payload, &mut self.transport, false, aead).await?;
 
-                let reply = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                let reply = loop {
+                    let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                    if p.first() == Some(&msg::SSH_MSG_KEXDH_REPLY) {
+                        break p;
+                    }
+                    // Not part of the key exchange: a response to a pre-rekey
+                    // request. Replay it after the rekey completes.
+                    deferred.push(p);
+                };
                 let mut r = &reply[1..];
                 let host_key_blob = SshBytes::decode(&mut r)?.0;
                 let srv_pub = SshBytes::decode(&mut r)?.0;
@@ -3002,6 +3216,7 @@ impl SshClient {
                     &kex.public_key_bytes(),
                     &srv_pub,
                     &shared,
+                    negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
                 );
                 (host_key_blob, srv_pub, sig_blob, shared, exch_hash, hash_name)
             };
@@ -3029,7 +3244,7 @@ impl SshClient {
         self.transport.state = KexState::Established;
         self.transport.last_rekey_bytes = self.transport.total_bytes();
         self.transport.last_rekey_instant = std::time::Instant::now();
-        Ok(())
+        Ok(deferred)
     }
 }
 
@@ -3224,6 +3439,8 @@ async fn connect_via_proxy_jump(
         }
         jump_client.handshake().await?;
         jump_client.authenticate().await?;
+        // OpenSSH does not use a SSH_MSG_SERVICE_REQUEST for "ssh-connection":
+        // after userauth success the client opens a direct-tcpip channel directly.
 
         let (next_host, next_port): (&str, u32) = if is_last {
             (target_host, target_port as u32)
@@ -3632,10 +3849,10 @@ fn parse_global_request(payload: &[u8]) -> Result<(String, bool, Vec<u8>)> {
 
 async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin + ?Sized), payload: &[u8]) -> Result<()> {
     let base = 1 + payload.len();
-    let remainder = base % 8;
-    let mut padding_len = if remainder == 0 { 0 } else { 8 - remainder };
-    if padding_len < 4 { padding_len += 8; }
-    let packet_len_field = (4 + base + padding_len) as u32;
+    let padding_len = ssh_core::transport::compute_packet_padding(base, 8, true);
+    // RFC 4253 §6: packet_length is the body length (padding_length + payload +
+    // padding), NOT including the 4-byte packet_length field itself.
+    let packet_len_field = (base + padding_len) as u32;
     let mut packet = Vec::with_capacity(4 + (base + padding_len) as usize);
     packet.extend_from_slice(&packet_len_field.to_be_bytes());
     packet.push(padding_len as u8);
@@ -3652,10 +3869,10 @@ async fn receive_raw_packet(stream: &mut (impl AsyncRead + Unpin + ?Sized)) -> R
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let total_len = u32::from_be_bytes(len_buf) as usize;
-    if total_len < 12 || total_len > 256 * 1024 {
+    if total_len < 5 || total_len > 256 * 1024 {
         return Err(SshError::InvalidPacket(format!("invalid packet size: {}", total_len)));
     }
-    let body_len = total_len - 4;
+    let body_len = total_len;
     let mut body = vec![0u8; body_len];
     stream.read_exact(&mut body).await?;
 
@@ -3677,18 +3894,40 @@ fn build_encrypted_packet(
     payload: &[u8],
     aead: bool,
 ) -> Result<Vec<u8>> {
-    let block_size = if aead { 8 } else {
-        transport.client_to_server_cipher.as_ref()
-            .map(|c| c.block_size())
-            .unwrap_or(8)
-    };
+    // Packet padding is always aligned to the cipher's block size. AES-GCM
+    // reports 16 (it is an AEAD, but the *padding* rule is still
+    // packet_length % 16 == 0); chacha20-poly1305 reports 8; before any cipher
+    // exists (KEX/NEWKEYS) fall back to the RFC 4253 minimum of 8.
+    let block_size = transport.client_to_server_cipher.as_ref()
+        .map(|c| c.block_size())
+        .unwrap_or(8);
+
+    let has_cipher = transport.client_to_server_cipher.is_some();
+    let etm = transport.client_to_server_mac.as_ref()
+        .map(|m| m.is_etm()).unwrap_or(false);
+    let chachapoly = transport.client_to_server_cipher.as_ref()
+        .map(|c| c.is_chachapoly()).unwrap_or(false);
+    // RFC 4253 §6.4 / RFC 6668: a non-ETM MAC (or the pre-key "none" cipher)
+    // encrypts packet_length as part of the first cipher block; ETM and AEAD
+    // ciphers leave packet_length in the clear (authenticated as AAD). OpenSSH's
+    // chacha20-poly1305@openssh.com is the exception: it encrypts packet_length
+    // with a separate header key (still authenticated by Poly1305).
+    //
+    // OpenSSH computes aadlen = (mac && etm) || authlen ? 4 : 0. For chacha and
+    // other AEAD ciphers authlen != 0, so aadlen=4 regardless: the *padding*
+    // rule is packet_length % block_size == 0 (same as ETM). But chacha still
+    // *encrypts* the 4-byte length field on the wire with the header key.
+    let length_encrypted_on_wire = chachapoly || !has_cipher || (!aead && !etm);
+    // aadlen is only meaningful once a cipher/MAC is in place. Raw packets
+    // (NEWKEYS, KEX before the key exchange) use aadlen=0, so packet_length
+    // must satisfy (4 + packet_length) % block_size == 0.
+    let padding_uses_aadlen = has_cipher && (aead || (etm && has_cipher) || chachapoly);
 
     let base = 1 + payload.len();
-    let remainder = base % block_size;
-    let mut padding_len = if remainder == 0 { 0 } else { block_size - remainder };
-    if padding_len < 4 { padding_len += block_size; }
+    let padding_len = ssh_core::transport::compute_packet_padding(base, block_size, !padding_uses_aadlen);
     let body_len = base + padding_len;
-    let packet_len_field = (4 + body_len) as u32;
+    // RFC 4253 §6: packet_length excludes its own 4-byte field.
+    let packet_len_field = body_len as u32;
 
     let mut packet = Vec::with_capacity(4 + body_len);
     packet.extend_from_slice(&packet_len_field.to_be_bytes());
@@ -3700,38 +3939,70 @@ fn build_encrypted_packet(
 
     let seq = transport.outgoing_seq;
 
-    if aead {
-        if let Some(ref mut cipher) = transport.client_to_server_cipher {
-            let plaintext = packet[4..].to_vec();
-            let ciphertext = cipher.encrypt(seq, &plaintext)?;
-            packet.truncate(4);
-            packet.extend_from_slice(&ciphertext);
+    if std::env::var("NS_DEBUG_PKT").is_ok() {
+        eprintln!("CLIENT send type={} seq={} body_len={} block={} aead={} etm={} pktlen_field={}", payload.first().copied().unwrap_or(0), seq, body_len, block_size, aead, etm, packet_len_field);
+        if payload.first() == Some(&5u8) {
+            let hex: String = packet.iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("CLIENT SERVICE packet(decrypted view) hex={}", hex);
         }
+    }
 
+    // Non-ETM MAC covers the plaintext packet (RFC 4253 §6.4):
+    // H(seq || packet_length || padding_length || payload || padding).
+    // Compute it before encrypting.
+    let mut non_etm_tag = None;
+    if !aead && !etm {
         if let Some(ref mac) = transport.client_to_server_mac {
             if mac.tag_len() > 0 {
-                let mac_data = &packet[4..];
-                let tag = mac.compute_tag(seq, mac_data)?;
-                packet.extend_from_slice(&tag);
-            }
-        }
-    } else {
-        if let Some(ref mut cipher) = transport.client_to_server_cipher {
-            let plaintext = packet[4..].to_vec();
-            let ciphertext = cipher.encrypt(seq, &plaintext)?;
-            packet.truncate(4);
-            packet.extend_from_slice(&ciphertext);
-        }
-
-        if let Some(ref mac) = transport.client_to_server_mac {
-            if mac.tag_len() > 0 {
-                let mac_data = &packet[4..];
-                let tag = mac.compute_tag(seq, mac_data)?;
-                packet.extend_from_slice(&tag);
+                non_etm_tag = Some(mac.compute_tag(seq, &packet)?);
             }
         }
     }
 
+    if let Some(ref mut cipher) = transport.client_to_server_cipher {
+        if length_encrypted_on_wire {
+            // Non-ETM / chacha: encrypt the entire packet (packet_length
+            // included). For chacha, encrypt() returns ciphertext || tag.
+            let ciphertext = cipher.encrypt(seq, &packet)?;
+            packet = ciphertext;
+        } else {
+            // ETM/AEAD: keep packet_length plaintext, encrypt the body only.
+            // AES-GCM authenticates the cleartext length as AAD (OpenSSH
+            // cipher-gcm.c uses aadlen=4); ETM MACs are handled separately.
+            let plaintext = packet[4..].to_vec();
+            let ciphertext = if cipher.is_aead() && !cipher.is_chachapoly() {
+                cipher.encrypt_with_aad(seq, &packet[..4], &plaintext)?
+            } else {
+                cipher.encrypt(seq, &plaintext)?
+            };
+            packet.truncate(4);
+            packet.extend_from_slice(&ciphertext);
+        }
+    }
+
+    if let Some(ref mac) = transport.client_to_server_mac {
+        if mac.tag_len() > 0 {
+            if etm {
+                // ETM: MAC over seq || packet_length || ciphertext (RFC 6668).
+                let tag = mac.compute_tag(seq, &packet)?;
+                packet.extend_from_slice(&tag);
+            } else if !aead {
+                // Non-ETM: append the MAC computed over the plaintext packet.
+                if let Some(t) = non_etm_tag {
+                    packet.extend_from_slice(&t);
+                }
+            }
+        }
+    }
+
+    if std::env::var("NS_DEBUG_PKT").is_ok() {
+        if payload.first() == Some(&5u8) {
+            let hex: String = packet.iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("CLIENT SERVICE wire hex={} (len={})", hex, packet.len());
+        }
+    }
+
+    transport.bytes_out += packet.len() as u64;
     transport.outgoing_seq += 1;
     Ok(packet)
 }
@@ -3781,63 +4052,199 @@ async fn receive_encrypted_packet(
 ) -> Result<Vec<u8>> {
     let seq = transport.incoming_seq;
 
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
+    let etm = transport.server_to_client_mac.as_ref()
+        .map(|m| m.is_etm()).unwrap_or(false);
+    let chachapoly = transport.server_to_client_cipher.as_ref()
+        .map(|c| c.is_chachapoly()).unwrap_or(false);
+    // RFC 4253 §6.4 / RFC 6668: a non-ETM MAC (or pre-key "none") encrypts the
+    // 4-byte packet_length field as part of the first cipher block; ETM and
+    // AEAD ciphers leave it in the clear (authenticated as AAD). OpenSSH's
+    // chacha20-poly1305@openssh.com encrypts it with a separate header key.
+    let packet_length_encrypted = !aead && !etm;
 
-    let packet_len = u32::from_be_bytes(len_buf) as usize;
-    if packet_len > 256 * 1024 || packet_len < 12 {
-        return Err(SshError::InvalidPacket(format!("invalid packet size: {}", packet_len)));
-    }
-    let body_len = packet_len - 4;
+    let block_size = transport.server_to_client_cipher.as_ref()
+        .map(|c| c.block_size())
+        .unwrap_or(8)
+        .max(8);
 
-    let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body).await?;
-    let ciphertext = body.clone();
+    let mut wire_len: usize = 0;
 
-    if aead {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
-            let decrypted = cipher.decrypt(seq, &body)?;
-            body = decrypted;
+    let body: Vec<u8> = if chachapoly {
+        // chacha20-poly1305@openssh.com: the 4-byte packet_length is encrypted
+        // with the header key; read it and decrypt_length to learn the body
+        // length. The Poly1305 tag is appended after the ciphertext and is
+        // verified by `cipher.decrypt` (which expects ciphertext || tag).
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let plen = if let Some(ref cipher) = transport.server_to_client_cipher {
+            cipher.decrypt_length(seq, &len_buf)?
+        } else {
+            u32::from_be_bytes(len_buf)
+        } as usize;
+        if plen > 256 * 1024 || plen < 5 || plen % block_size != 0 {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
         }
-
+        let mut ct = len_buf.to_vec();
+        let mut body_ct = vec![0u8; plen];
+        stream.read_exact(&mut body_ct).await?;
+        ct.extend_from_slice(&body_ct);
+        if let Some(ref mut cipher) = transport.server_to_client_cipher {
+            let tlen = cipher.tag_len();
+            if tlen > 0 {
+                let mut tag = vec![0u8; tlen];
+                stream.read_exact(&mut tag).await?;
+                ct.extend_from_slice(&tag);
+            }
+        }
+        let plain = if let Some(ref mut cipher) = transport.server_to_client_cipher {
+            cipher.decrypt(seq, &ct)?
+        } else {
+            ct.clone()
+        };
+        // packet_length(4) + body + tag, all consumed from the wire.
+        wire_len = ct.len();
+        // Strip the leading 4-byte packet_length (now decrypted).
+        if plain.len() < 4 {
+            return Err(SshError::Protocol("chacha packet too short".into()));
+        }
+        plain[4..].to_vec()
+    } else if packet_length_encrypted {
+        // Read the first cipher block, decrypt it to learn packet_length.
+        let mut first_block = vec![0u8; block_size];
+        stream.read_exact(&mut first_block).await?;
+        let plain_first = if let Some(ref mut cipher) = transport.server_to_client_cipher {
+            cipher.decrypt(seq, &first_block)?
+        } else {
+            first_block.clone()
+        };
+        let plen = u32::from_be_bytes([plain_first[0], plain_first[1], plain_first[2], plain_first[3]]) as usize;
+        if plen > 256 * 1024 || plen < 5 {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
+        }
+        // Read the remainder of the encrypted body: the cipher stream covers
+        // packet_length plus the body, i.e. `4 + plen` bytes. Reject a payload
+        // that is shorter than one cipher block (or misaligned) before
+        // subtracting, otherwise `4 + plen - block_size` underflows for a
+        // maliciously tiny packet_length.
+        if 4 + plen < block_size || (4 + plen) % block_size != 0 {
+            return Err(SshError::InvalidPacket(format!(
+                "invalid non-ETM packet size: {} (block size {})",
+                plen, block_size
+            )));
+        }
+        let rest_len = 4 + plen - block_size;
+        let mut rest = vec![0u8; rest_len];
+        stream.read_exact(&mut rest).await?;
+        // block_size + rest_len (+ non-ETM MAC tag) covers the whole packet.
+        wire_len = 4 + plen
+            + transport.server_to_client_mac.as_ref().map(|m| m.tag_len()).unwrap_or(0);
+        // Decrypt the remainder (cipher state continues from the first block).
+        let mut plain_body = if let Some(ref mut cipher) = transport.server_to_client_cipher {
+            cipher.decrypt(seq, &rest)?
+        } else {
+            rest.clone()
+        };
+        let mut full = plain_first.clone();
+        full.append(&mut plain_body);
+        // Non-ETM MAC is verified over seq || packet_length || padding_length ||
+        // payload || padding (RFC 4253 §6.4) — i.e. seq || full plaintext packet.
         if let Some(ref mac) = transport.server_to_client_mac {
-            if mac.tag_len() > 0 {
+            if mac.tag_len() > 0 && !mac.is_etm() {
                 let mut tag_buf = vec![0u8; mac.tag_len()];
                 stream.read_exact(&mut tag_buf).await?;
-                if !mac.verify_tag(seq, &ciphertext, &tag_buf)? {
+                if !mac.verify_tag(seq, &full, &tag_buf)? {
                     return Err(SshError::DecryptionFailed);
                 }
             }
         }
+        // Strip the leading 4-byte packet_length: the remaining bytes are the
+        // plaintext body (padding_len || payload || padding).
+        full[4..].to_vec()
     } else {
-        if let Some(ref mut cipher) = transport.server_to_client_cipher {
-            let decrypted = cipher.decrypt(seq, &body)?;
-            body = decrypted;
+        // ETM / AEAD: packet_length is plaintext.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let plen = u32::from_be_bytes(len_buf) as usize;
+        // ETM and AEAD both use aadlen=4, so packet_length must be block-aligned.
+        if plen > 256 * 1024 || plen < 5 || plen % block_size != 0 {
+            return Err(SshError::InvalidPacket(format!("invalid packet size: {}", plen)));
+        }
+        let mut body = vec![0u8; plen];
+        stream.read_exact(&mut body).await?;
+        // packet_length(4) + body + (AEAD or ETM/MAC tag).
+        let mut tag_bytes = 0usize;
+
+        // AEAD ciphers append the auth tag to the ciphertext; the tag is not
+        // counted in packet_length, so read it here and append it so
+        // `cipher.decrypt` (which expects ciphertext || tag) works.
+        if aead {
+            if let Some(ref mut cipher) = transport.server_to_client_cipher {
+                let tlen = cipher.tag_len();
+                if tlen > 0 {
+                    let mut tag = vec![0u8; tlen];
+                    stream.read_exact(&mut tag).await?;
+                    body.extend_from_slice(&tag);
+                    tag_bytes += tlen;
+                }
+            }
         }
 
+        // ETM MAC is verified over seq || packet_length || ciphertext (RFC 6668),
+        // before decryption; the plaintext is not available yet.
         if let Some(ref mac) = transport.server_to_client_mac {
-            if mac.tag_len() > 0 {
+            if mac.tag_len() > 0 && mac.is_etm() {
                 let mut tag_buf = vec![0u8; mac.tag_len()];
                 stream.read_exact(&mut tag_buf).await?;
-                if !mac.verify_tag(seq, &ciphertext, &tag_buf)? {
+                tag_bytes += mac.tag_len();
+                let mut etm_input = Vec::with_capacity(4 + body.len());
+                etm_input.extend_from_slice(&len_buf);
+                etm_input.extend_from_slice(&body);
+                if !mac.verify_tag(seq, &etm_input, &tag_buf)? {
                     return Err(SshError::DecryptionFailed);
                 }
             }
         }
-    }
 
+        let mut body_plain = if let Some(ref mut cipher) = transport.server_to_client_cipher {
+            if aead {
+                // AES-GCM authenticates the cleartext packet_length as AAD.
+                cipher.decrypt_with_aad(seq, &len_buf, &body)?
+            } else {
+                cipher.decrypt(seq, &body)?
+            }
+        } else {
+            body.clone()
+        };
+
+        // Non-ETM MAC is verified over seq || packet_length || padding_length ||
+        // payload || padding (RFC 4253 §6.4), after decryption.
+        if let Some(ref mac) = transport.server_to_client_mac {
+            if mac.tag_len() > 0 && !mac.is_etm() {
+                let mut tag_buf = vec![0u8; mac.tag_len()];
+                stream.read_exact(&mut tag_buf).await?;
+                tag_bytes += mac.tag_len();
+                let mut plain_input = Vec::with_capacity(4 + body_plain.len());
+                plain_input.extend_from_slice(&len_buf);
+                plain_input.extend_from_slice(&body_plain);
+                if !mac.verify_tag(seq, &plain_input, &tag_buf)? {
+                    return Err(SshError::DecryptionFailed);
+                }
+            }
+        }
+
+        // packet_length(4) + body + auth tag.
+        wire_len = 4 + plen + tag_bytes;
+        body_plain
+    };
+
+    transport.bytes_in += wire_len as u64;
     transport.incoming_seq += 1;
 
     if body.is_empty() {
         return Err(SshError::Protocol("empty packet".into()));
     }
 
-    let padding_len = body[0] as usize;
-    if padding_len >= body.len() {
-        return Err(SshError::InvalidPacket("invalid padding".into()));
-    }
-
-    Ok(body[1..body.len() - padding_len].to_vec())
+    unpack_packet_body(&body)
 }
 
 impl SshClient {
@@ -4251,10 +4658,6 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
                 eprintln!("ns-ssh: authentication failed");
                 return 1;
             }
-            if client.request_connection_service().await.is_err() {
-                eprintln!("ns-ssh: connection service request failed");
-                return 1;
-            }
             if config.add_keys_to_agent {
                 client.add_loaded_keys_to_agent().await;
             }
@@ -4271,10 +4674,6 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
         }
         if client.authenticate().await.is_err() {
             eprintln!("ns-ssh: authentication failed");
-            return 1;
-        }
-        if client.request_connection_service().await.is_err() {
-            eprintln!("ns-ssh: connection service request failed");
             return 1;
         }
         if config.add_keys_to_agent {
@@ -4466,5 +4865,34 @@ mod tests {
         assert!(is_localhost_host("::ffff:127.0.0.1"));
         assert!(!is_localhost_host("example.com"));
         assert!(!is_localhost_host("192.168.1.5"));
+    }
+
+    /// Regression: a non-ETM peer sends `packet_length = 5` with a 16-byte
+    /// cipher block. The old `4 + plen - block_size` subtracted 16 from 9 and
+    /// panicked (debug) / wrapped (release). It must now be a clean
+    /// `InvalidPacket` error.
+    #[tokio::test]
+    async fn non_etm_packet_length_shorter_than_block_is_rejected() {
+        fn configured_cipher() -> Box<dyn ssh_core::cipher::SshCipher> {
+            let mut c = ssh_core::cipher::create_cipher("aes128-ctr").unwrap();
+            c.set_key(&[0x42u8; 16]).unwrap();
+            c.set_iv(&[0x24u8; 16]).unwrap();
+            c
+        }
+
+        // First cipher block whose plaintext begins with packet_length = 5.
+        let mut block = vec![0u8; 16];
+        block[3] = 5;
+        let wire = configured_cipher().encrypt(0, &block).unwrap();
+
+        let mut transport = SshTransport::new();
+        // Fresh cipher state for the receiving side (the encryptor's IV moved).
+        transport.server_to_client_cipher = Some(configured_cipher());
+
+        let mut reader: &[u8] = &wire;
+        let err = receive_encrypted_packet(&mut reader, &mut transport, false, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SshError::InvalidPacket(_)), "got {:?}", err);
     }
 }

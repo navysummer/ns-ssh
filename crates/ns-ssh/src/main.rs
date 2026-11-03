@@ -108,8 +108,8 @@ struct SshArgs {
     #[arg(short = 'W', value_parser = parse_stdio_forward)]
     stdio_forward: Option<(String, u16)>,
 
-    #[arg(short = 's', long)]
-    subsystem: Option<String>,
+    #[arg(short = 's')]
+    subsystem_request: bool,
 
     #[arg(short = 'R', long, action = clap::ArgAction::Append)]
     remote_forwards: Vec<String>,
@@ -143,6 +143,18 @@ struct SshArgs {
 
     #[arg(short = 'k')]
     disable_forwarding: bool,
+
+    #[arg(short = 'M')]
+    control_master: bool,
+
+    #[arg(short = 'S')]
+    control_path: Option<String>,
+
+    #[arg(short = 'O')]
+    control_command: Option<String>,
+
+    #[arg(short = 'x')]
+    disable_x11_forwarding: bool,
 
     target: Option<String>,
 
@@ -272,6 +284,9 @@ fn main() {
     if args.forward_x11 || args.forward_x11_trusted {
         config.forward_x11 = true;
     }
+    if args.disable_x11_forwarding {
+        config.forward_x11 = false;
+    }
 
     if !args.forward_x11_trusted {
         // -Y sets trusted; -X sets untrusted; for simplicity both enable forwarding
@@ -329,8 +344,15 @@ fn main() {
     if let Some((host, port)) = args.stdio_forward {
         config.stdio_forward = Some((host, port));
     }
-    if let Some(ref sub) = args.subsystem {
-        config.subsystem = Some(sub.clone());
+    if args.subsystem_request {
+        // OpenSSH: `ssh -s host subsystem` — the subsystem name is the first
+        // command argument; `-s` itself is a boolean flag.
+        let sub = args.command.first().cloned().unwrap_or_default();
+        if sub.is_empty() {
+            eprintln!("ns-ssh: subsystem name required with -s");
+            std::process::exit(1);
+        }
+        config.subsystem = Some(sub);
     }
 
     for spec in &args.local_forwards {
@@ -358,6 +380,35 @@ fn main() {
 
     if args.no_remote_command {
         config.no_remote_command = true;
+    }
+
+    // -M / -S are short aliases for -o ControlMaster=yes / -o ControlPath=...
+    if args.control_master {
+        config.control_master = true;
+        config.control_master_auto = false;
+    }
+    if let Some(ref cp) = args.control_path {
+        config.control_path = Some(cp.clone());
+    }
+
+    // -O <command>: send a ControlMaster command (check/exit/stop) to the
+    // master at the control socket and exit without opening a session.
+    if let Some(ref cmd) = args.control_command {
+        let Some(ref sock) = config.control_path else {
+            eprintln!("ns-ssh: -O requires ControlPath (-S) to locate the control socket");
+            std::process::exit(1);
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let code = rt.block_on(async {
+            match tokio::net::UnixStream::connect(sock).await {
+                Ok(s) => crate::control::run_control_command(s, cmd).await,
+                Err(e) => {
+                    eprintln!("ns-ssh: Control socket {} not connected: {}", sock, e);
+                    255
+                }
+            }
+        });
+        std::process::exit(code);
     }
 
     if args.print_config {
@@ -489,11 +540,19 @@ fn print_effective_config(cfg: &ResolvedConfig) {
     if let Some(b) = &cfg.bind_address {
         println!("bindaddress {}", b);
     }
-    for (port, host, lport) in &cfg.local_forwards {
-        println!("localforward {} {} {}", port, host, lport);
+    for (bind, port, host, lport) in &cfg.local_forwards {
+        if bind.is_empty() {
+            println!("localforward {} {} {}", port, host, lport);
+        } else {
+            println!("localforward {}:{} {} {}", bind, port, host, lport);
+        }
     }
-    for (port, host, lport) in &cfg.remote_forwards {
-        println!("remoteforward {} {} {}", port, host, lport);
+    for (bind, port, host, lport) in &cfg.remote_forwards {
+        if bind.is_empty() {
+            println!("remoteforward {} {} {}", port, host, lport);
+        } else {
+            println!("remoteforward {}:{} {} {}", bind, port, host, lport);
+        }
     }
     for port in &cfg.dynamic_forwards {
         println!("dynamicforward {}", port);
@@ -676,18 +735,7 @@ fn run_scp_mode() -> i32 {
     for opt in &options {
         let mut it = opt.splitn(2, '=');
         if let (Some(k), Some(v)) = (it.next(), it.next()) {
-            match k.to_lowercase().as_str() {
-                "user" => config.user = v.to_string(),
-                "identityfile" | "identity_file" => {
-                    config.identity_file = Some(std::path::PathBuf::from(v));
-                }
-                "port" => {
-                    if let Ok(p) = v.parse::<u16>() {
-                        config.port = p;
-                    }
-                }
-                _ => {}
-            }
+            apply_ssh_option(&mut config, &k.to_lowercase(), v.trim());
         }
     }
 
@@ -1541,28 +1589,7 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some((key, value)) = opt.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim();
-            match key.as_str() {
-                "port" => { if let Ok(p) = value.parse() { resolved.port = p; } }
-                "user" => resolved.user = value.to_string(),
-                "hostname" => resolved.hostname = value.to_string(),
-                "identityfile" | "identity_file" => {
-                    resolved.identity_file = Some(std::path::PathBuf::from(value));
-                }
-                "identitiesonly" | "identities_only" => resolved.identities_only = value != "no",
-                "batchmode" | "batch_mode" => resolved.batch_mode = value != "no",
-                "compression" => resolved.compression = value != "no",
-                "userknownhostsfile" | "user_known_hosts_file" => {
-                    resolved.user_known_hosts_file = Some(std::path::PathBuf::from(value));
-                }
-                "globalknownhostsfile" | "global_known_hosts_file" => {
-                    resolved.global_known_hosts_file = Some(std::path::PathBuf::from(value));
-                }
-                "hashknownhosts" | "hash_known_hosts" => resolved.hash_known_hosts = value != "no",
-                "stricthostkeychecking" | "strict_host_key_checking" => {
-                    resolved.strict_host_key_checking = config::HostKeyChecking::parse(value);
-                }
-                _ => {}
-            }
+            apply_ssh_option(&mut resolved, &key, value);
         }
     }
 
@@ -2011,139 +2038,146 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
         if let Some((key, value)) = opt.split_once('=') {
             let key = key.trim().to_lowercase();
             let value = value.trim();
-            match key.as_str() {
-                "port" => {
-                    if let Ok(p) = value.parse() {
-                        resolved.port = p;
-                    }
-                }
-                "user" | "login_name" => resolved.user = value.to_string(),
-                "hostname" => resolved.hostname = value.to_string(),
-                "identityfile" | "identity_file" => {
-                    resolved.identity_file = Some(std::path::PathBuf::from(value));
-                }
-                "identitiesonly" | "identities_only" => resolved.identities_only = value != "no",
-                "stricthostkeychecking" | "strict_host_key_checking" => {
-                    resolved.strict_host_key_checking = config::HostKeyChecking::parse(value);
-                }
-                "hashknownhosts" | "hash_known_hosts" => resolved.hash_known_hosts = value != "no",
-                "userknownhostsfile" | "user_known_hosts_file" => {
-                    resolved.user_known_hosts_file = Some(std::path::PathBuf::from(value));
-                }
-                "globalknownhostsfile" | "global_known_hosts_file" => {
-                    resolved.global_known_hosts_file = Some(std::path::PathBuf::from(value));
-                }
-                "connecttimeout" | "connect_timeout" => {
-                    if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }
-                }
-                "serveraliveinterval" | "server_alive_interval" => {
-                    if let Ok(v) = value.parse::<u32>() { resolved.server_alive_interval = Some(v); }
-                }
-                "serveralivecountmax" | "server_alive_count_max" => {
-                    if let Ok(v) = value.parse::<u32>() { resolved.server_alive_count_max = Some(v); }
-                }
-                "batchmode" | "batch_mode" => resolved.batch_mode = value != "no",
-                "passwordauthentication" | "password_authentication" => resolved.password_authentication = value != "no",
-                "pubkeyauthentication" | "pubkey_authentication" => resolved.pubkey_authentication = value != "no",
-                "kbdinteractiveauthentication" | "kbd_interactive_authentication" => resolved.kbd_interactive_authentication = value != "no",
-                "preferredauthentications" | "preferred_authentications" => {
-                    resolved.preferred_authentications = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
-                }
-                "hostkeyalgorithms" | "host_key_algorithms" => {
-                    resolved.host_key_algorithms = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
-                }
-                "kexalgorithms" | "kex_algorithms" => {
-                    resolved.kex_algorithms = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
-                }
-                "ciphers" => {
-                    resolved.ciphers = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
-                }
-                "macs" => {
-                    resolved.macs = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
-                }
-                "forwardagent" | "forward_agent" => resolved.forward_agent = value != "no",
-                "forwardx11" | "forward_x11" => resolved.forward_x11 = value != "no",
-                "compression" => resolved.compression = value != "no",
-                "proxyjump" | "proxy_jump" => resolved.proxy_jump = Some(value.to_string()),
-                "proxycommand" | "proxy_command" => resolved.proxy_command = Some(value.to_string()),
-                "bindaddress" | "bind_address" => resolved.bind_address = Some(value.to_string()),
-                "requesttty" | "request_tty" => resolved.request_tty = value != "no",
-                "sendenv" | "send_env" => {
-                    resolved.send_env = value.split_whitespace().map(|s| s.to_string()).collect();
-                }
-                "setenv" | "set_env" => {
-                    if let Some((k, v)) = value.split_once('=') {
-                        resolved.set_env.push((k.trim().to_string(), v.trim().to_string()));
-                    }
-                }
-                "loglevel" | "log_level" => resolved.log_level = Some(value.to_string()),
-                "exitonforwardfailure" | "exit_on_forward_failure" => resolved.exit_on_forward_failure = value != "no",
-                "remotecommand" | "remote_command" => resolved.remote_command = Some(value.to_string()),
-                "addkeystoagent" | "add_keys_to_agent" => resolved.add_keys_to_agent = value != "no",
-                "controlmaster" | "control_master" => {
-                    match value {
-                        "yes" => { resolved.control_master = true; resolved.control_master_auto = false; }
-                        "auto" => { resolved.control_master = true; resolved.control_master_auto = true; }
-                        _ => { resolved.control_master = false; resolved.control_master_auto = false; }
-                    }
-                }
-                "controlpath" | "control_path" => resolved.control_path = Some(value.to_string()),
-                "controlpersist" | "control_persist" => {
-                    if value != "no" {
-                        if let Ok(v) = value.parse::<u32>() { resolved.control_persist = Some(v); }
-                    } else {
-                        resolved.control_persist = None;
-                    }
-                }
-                "hostkeyalias" | "host_key_alias" => resolved.host_key_alias = Some(value.to_string()),
-                "fingerprinthash" | "fingerprint_hash" => resolved.fingerprint_hash = value.to_ascii_lowercase(),
-                "visualhostkey" | "visual_host_key" => resolved.visual_host_key = value != "no",
-                "checkhostip" | "check_host_ip" => resolved.check_host_ip = value != "no",
-                "numberofpasswordprompts" | "number_of_password_prompts" => {
-                    if let Ok(v) = value.parse::<u32>() { resolved.number_of_password_prompts = v; }
-                }
-                "connectionattempts" | "connection_attempts" => {
-                    if let Ok(v) = value.parse::<u32>() { resolved.connection_attempts = v; }
-                }
-                "verifyhostkeydns" | "verify_host_key_dns" => resolved.verify_host_key_dns = value.to_ascii_lowercase(),
-                "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
-                    resolved.no_host_authentication_for_localhost = value != "no";
-                }
-                "addressfamily" | "address_family" => {
-                    match value.to_ascii_lowercase().as_str() {
-                        "inet" | "ipv4" => { resolved.prefer_ipv4 = true; resolved.prefer_ipv6 = false; }
-                        "inet6" | "ipv6" => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = true; }
-                        _ => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = false; }
-                    }
-                }
-                "escapechar" | "escape_char" => resolved.escape_char = value.to_string(),
-                "localcommand" | "local_command" => resolved.local_command = Some(value.to_string()),
-                "permitlocalcommand" | "permit_local_command" => resolved.permit_local_command = value != "no",
-                "gatewayports" | "gateway_ports" => resolved.gateway_ports = value != "no",
-                "tcpkeepalive" | "tcp_keep_alive" => resolved.tcp_keep_alive = value != "no",
-                "logfile" | "log_file" => resolved.log_file = Some(std::path::PathBuf::from(value)),
-                "rekeylimit" | "rekey_limit" => {
-                    if let Some((bytes, secs)) = config::parse_rekey_limit(value) {
-                        resolved.rekey_limit_bytes = bytes;
-                        resolved.rekey_limit_time = secs;
-                    }
-                }
-                "identityagent" | "identity_agent" => {
-                    if value != "none" {
-                        resolved.identity_agent = Some(value.to_string());
-                    } else {
-                        resolved.identity_agent = None;
-                    }
-                }
-                "pubkeyacceptedalgorithms" | "pubkey_accepted_algorithms" | "pubkeyacceptedkeytypes" => {
-                    resolved.pubkey_accepted_algorithms = Some(config::resolve_pubkey_algorithms(value));
-                }
-                _ => {}
-            }
+            apply_ssh_option(&mut resolved, &key, value);
         }
     }
 
     resolved
+}
+
+/// Apply a single `-o key=value` option to a resolved config. Shared by the
+/// main ssh path, SCP mode, and SFTP mode so every option is honored
+/// consistently (e.g. `UserKnownHostsFile`, `StrictHostKeyChecking`).
+fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
+    match key {
+        "port" => {
+            if let Ok(p) = value.parse() {
+                resolved.port = p;
+            }
+        }
+        "user" | "login_name" => resolved.user = value.to_string(),
+        "hostname" => resolved.hostname = value.to_string(),
+        "identityfile" | "identity_file" => {
+            resolved.identity_file = Some(std::path::PathBuf::from(value));
+        }
+        "identitiesonly" | "identities_only" => resolved.identities_only = value != "no",
+        "stricthostkeychecking" | "strict_host_key_checking" => {
+            resolved.strict_host_key_checking = config::HostKeyChecking::parse(value);
+        }
+        "hashknownhosts" | "hash_known_hosts" => resolved.hash_known_hosts = value != "no",
+        "userknownhostsfile" | "user_known_hosts_file" => {
+            resolved.user_known_hosts_file = Some(std::path::PathBuf::from(value));
+        }
+        "globalknownhostsfile" | "global_known_hosts_file" => {
+            resolved.global_known_hosts_file = Some(std::path::PathBuf::from(value));
+        }
+        "connecttimeout" | "connect_timeout" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }
+        }
+        "serveraliveinterval" | "server_alive_interval" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.server_alive_interval = Some(v); }
+        }
+        "serveralivecountmax" | "server_alive_count_max" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.server_alive_count_max = Some(v); }
+        }
+        "batchmode" | "batch_mode" => resolved.batch_mode = value != "no",
+        "passwordauthentication" | "password_authentication" => resolved.password_authentication = value != "no",
+        "pubkeyauthentication" | "pubkey_authentication" => resolved.pubkey_authentication = value != "no",
+        "kbdinteractiveauthentication" | "kbd_interactive_authentication" => resolved.kbd_interactive_authentication = value != "no",
+        "preferredauthentications" | "preferred_authentications" => {
+            resolved.preferred_authentications = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
+        "hostkeyalgorithms" | "host_key_algorithms" => {
+            resolved.host_key_algorithms = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
+        "kexalgorithms" | "kex_algorithms" => {
+            resolved.kex_algorithms = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
+        "ciphers" => {
+            resolved.ciphers = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
+        "macs" => {
+            resolved.macs = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
+        "forwardagent" | "forward_agent" => resolved.forward_agent = value != "no",
+        "forwardx11" | "forward_x11" => resolved.forward_x11 = value != "no",
+        "compression" => resolved.compression = value != "no",
+        "proxyjump" | "proxy_jump" => resolved.proxy_jump = Some(value.to_string()),
+        "proxycommand" | "proxy_command" => resolved.proxy_command = Some(value.to_string()),
+        "bindaddress" | "bind_address" => resolved.bind_address = Some(value.to_string()),
+        "requesttty" | "request_tty" => resolved.request_tty = value != "no",
+        "sendenv" | "send_env" => {
+            resolved.send_env = value.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        "setenv" | "set_env" => {
+            if let Some((k, v)) = value.split_once('=') {
+                resolved.set_env.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        "loglevel" | "log_level" => resolved.log_level = Some(value.to_string()),
+        "exitonforwardfailure" | "exit_on_forward_failure" => resolved.exit_on_forward_failure = value != "no",
+        "remotecommand" | "remote_command" => resolved.remote_command = Some(value.to_string()),
+        "addkeystoagent" | "add_keys_to_agent" => resolved.add_keys_to_agent = value != "no",
+        "controlmaster" | "control_master" => {
+            match value {
+                "yes" => { resolved.control_master = true; resolved.control_master_auto = false; }
+                "auto" => { resolved.control_master = true; resolved.control_master_auto = true; }
+                _ => { resolved.control_master = false; resolved.control_master_auto = false; }
+            }
+        }
+        "controlpath" | "control_path" => resolved.control_path = Some(value.to_string()),
+        "controlpersist" | "control_persist" => {
+            if value != "no" {
+                if let Ok(v) = value.parse::<u32>() { resolved.control_persist = Some(v); }
+            } else {
+                resolved.control_persist = None;
+            }
+        }
+        "hostkeyalias" | "host_key_alias" => resolved.host_key_alias = Some(value.to_string()),
+        "fingerprinthash" | "fingerprint_hash" => resolved.fingerprint_hash = value.to_ascii_lowercase(),
+        "visualhostkey" | "visual_host_key" => resolved.visual_host_key = value != "no",
+        "checkhostip" | "check_host_ip" => resolved.check_host_ip = value != "no",
+        "numberofpasswordprompts" | "number_of_password_prompts" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.number_of_password_prompts = v; }
+        }
+        "connectionattempts" | "connection_attempts" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.connection_attempts = v; }
+        }
+        "verifyhostkeydns" | "verify_host_key_dns" => resolved.verify_host_key_dns = value.to_ascii_lowercase(),
+        "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
+            resolved.no_host_authentication_for_localhost = value != "no";
+        }
+        "addressfamily" | "address_family" => {
+            match value.to_ascii_lowercase().as_str() {
+                "inet" | "ipv4" => { resolved.prefer_ipv4 = true; resolved.prefer_ipv6 = false; }
+                "inet6" | "ipv6" => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = true; }
+                _ => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = false; }
+            }
+        }
+        "escapechar" | "escape_char" => resolved.escape_char = value.to_string(),
+        "localcommand" | "local_command" => resolved.local_command = Some(value.to_string()),
+        "permitlocalcommand" | "permit_local_command" => resolved.permit_local_command = value != "no",
+        "gatewayports" | "gateway_ports" => resolved.gateway_ports = value != "no",
+        "tcpkeepalive" | "tcp_keep_alive" => resolved.tcp_keep_alive = value != "no",
+        "logfile" | "log_file" => resolved.log_file = Some(std::path::PathBuf::from(value)),
+        "rekeylimit" | "rekey_limit" => {
+            if let Some((bytes, secs)) = config::parse_rekey_limit(value) {
+                resolved.rekey_limit_bytes = bytes;
+                resolved.rekey_limit_time = secs;
+            }
+        }
+        "identityagent" | "identity_agent" => {
+            if value != "none" {
+                resolved.identity_agent = Some(value.to_string());
+            } else {
+                resolved.identity_agent = None;
+            }
+        }
+        "pubkeyacceptedalgorithms" | "pubkey_accepted_algorithms" | "pubkeyacceptedkeytypes" => {
+            resolved.pubkey_accepted_algorithms = Some(config::resolve_pubkey_algorithms(value));
+        }
+        _ => {}
+    }
 }
 
 fn parse_target(target: &str, config: &mut ResolvedConfig) {

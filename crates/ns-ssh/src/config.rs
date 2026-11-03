@@ -228,8 +228,10 @@ pub struct ResolvedConfig {
     pub request_tty: bool,
     pub remote_command: Option<String>,
     pub add_keys_to_agent: bool,
-    pub local_forwards: Vec<(u16, String, u16)>,
-    pub remote_forwards: Vec<(u16, String, u16)>,
+    /// TCP forwards as `(bind_addr, bind_port, host, connect_port)`. A forward
+    /// with an empty `bind_addr` uses the global BindAddress / GatewayPorts policy.
+    pub local_forwards: Vec<(String, u16, String, u16)>,
+    pub remote_forwards: Vec<(String, u16, String, u16)>,
     pub dynamic_forwards: Vec<u16>,
     /// StreamLocal `-L local_socket:remote_socket` forwards (Unix sockets).
     pub local_streamlocal: Vec<(String, String)>,
@@ -320,7 +322,9 @@ impl ResolvedConfig {
             macs: None,
             log_level: None,
             exit_on_forward_failure: false,
-            send_env: vec!["LANG".into(), "LC_*".into()],
+            // OpenSSH's default `SendEnv` is empty; variables are only sent when
+            // the user opts in via `-o SendEnv`/config `SendEnv`.
+            send_env: Vec::new(),
             set_env: Vec::new(),
             request_tty: false,
             remote_command: None,
@@ -983,19 +987,67 @@ fn simple_glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-pub fn parse_forward_spec(spec: &str) -> Option<(u16, String, u16)> {
-    let parts: Vec<&str> = spec.split(':').collect();
+/// Split on `:` but ignore colons inside bracketed IPv6 literals (`[::1]`).
+fn split_colon_outside_brackets(spec: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_brackets = false;
+    for (i, c) in spec.char_indices() {
+        match c {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            ':' if !in_brackets => {
+                parts.push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&spec[start..]);
+    parts
+}
+
+/// Parse an OpenSSH TCP forward spec (`-L`/`-R`, `LocalForward`/`RemoteForward`)
+/// into `(bind_addr, bind_port, host, connect_port)`.
+///
+/// Accepted forms (OpenSSH `[bind_address:]port:host:hostport`):
+/// - `port:host:hostport`  (no bind address → `bind_addr` is empty, caller applies
+///   its global BindAddress / GatewayPorts policy)
+/// - `bind_address:port:host:hostport`
+/// - `port:hostport`       (local-only shorthand; host defaults to 127.0.0.1)
+///
+/// IPv6 addresses must be bracketed (`[::1]:31400:host:22`); brackets are
+/// stripped from the returned bind_addr and host.
+pub fn parse_forward_spec(spec: &str) -> Option<(String, u16, String, u16)> {
+    let parts: Vec<&str> = split_colon_outside_brackets(spec);
+    let strip_brackets = |s: &str| -> String {
+        if s.len() >= 2 && s.starts_with('[') && s.ends_with(']') {
+            s[1..s.len() - 1].to_string()
+        } else {
+            s.to_string()
+        }
+    };
     match parts.len() {
+        // bind_address:port:host:hostport
+        4 => {
+            let bind_addr = strip_brackets(parts[0]);
+            let bind_port: u16 = parts[1].parse().ok()?;
+            let host = strip_brackets(parts[2]);
+            let connect_port: u16 = parts[3].parse().ok()?;
+            Some((bind_addr, bind_port, host, connect_port))
+        }
+        // port:host:hostport
         3 => {
             let bind_port: u16 = parts[0].parse().ok()?;
-            let host = parts[1].to_string();
+            let host = strip_brackets(parts[1]);
             let connect_port: u16 = parts[2].parse().ok()?;
-            Some((bind_port, host, connect_port))
+            Some((String::new(), bind_port, host, connect_port))
         }
+        // port:hostport
         2 => {
             let bind_port: u16 = parts[0].parse().ok()?;
             let connect_port: u16 = parts[1].parse().ok()?;
-            Some((bind_port, "127.0.0.1".to_string(), connect_port))
+            Some((String::new(), bind_port, "127.0.0.1".to_string(), connect_port))
         }
         _ => None,
     }
@@ -1188,6 +1240,34 @@ mod tests {
         assert_eq!(parse_streamlocal_forward("8080:localhost:22"), None);
         // Empty fields -> not StreamLocal.
         assert_eq!(parse_streamlocal_forward("/tmp/lsock:"), None);
+    }
+
+    #[test]
+    fn tcp_forward_spec_parsing() {
+        // `port:host:hostport` (no bind address -> empty bind_addr).
+        assert_eq!(
+            parse_forward_spec("8080:example.com:22"),
+            Some(("".to_string(), 8080, "example.com".to_string(), 22))
+        );
+        // `bind_address:port:host:hostport` carries the bind address.
+        assert_eq!(
+            parse_forward_spec("127.0.0.1:8080:example.com:22"),
+            Some(("127.0.0.1".to_string(), 8080, "example.com".to_string(), 22))
+        );
+        // `port:hostport` local-only shorthand (host defaults to 127.0.0.1).
+        assert_eq!(
+            parse_forward_spec("8080:22"),
+            Some(("".to_string(), 8080, "127.0.0.1".to_string(), 22))
+        );
+        // Bracketed IPv6 bind address is stripped.
+        assert_eq!(
+            parse_forward_spec("[::1]:8080:example.com:22"),
+            Some(("::1".to_string(), 8080, "example.com".to_string(), 22))
+        );
+        // Invalid specs.
+        assert_eq!(parse_forward_spec(""), None);
+        assert_eq!(parse_forward_spec("8080"), None);
+        assert_eq!(parse_forward_spec("a:b:c:d:e"), None);
     }
 
     #[test]

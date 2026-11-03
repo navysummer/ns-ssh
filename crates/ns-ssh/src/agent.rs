@@ -151,8 +151,8 @@ impl SshAgent {
 
         let mut payload = Vec::new();
         payload.push(SSH_AGENTC_SIGN_REQUEST);
-        payload.extend(SshBytes(public_key_blob.to_vec()).0);
-        payload.extend(SshBytes(data.to_vec()).0);
+        SshBytes(public_key_blob.to_vec()).encode(&mut payload)?;
+        SshBytes(data.to_vec()).encode(&mut payload)?;
         payload.extend(flags.to_be_bytes());
 
         let mut request = Vec::new();

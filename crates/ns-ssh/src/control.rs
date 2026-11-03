@@ -19,6 +19,9 @@ pub const CTRL_DATA: u8 = 0x02;
 pub const CTRL_EOF: u8 = 0x03;
 pub const CTRL_CLOSE: u8 = 0x04;
 pub const CTRL_WINDOW_CHANGE: u8 = 0x05;
+// ControlMaster commands (`ssh -O ...`).
+pub const CTRL_CHECK: u8 = 0x06;
+pub const CTRL_EXIT: u8 = 0x07;
 
 // Response types (master -> slave).
 pub const CTRL_OPEN_CONFIRM: u8 = 0x81;
@@ -28,6 +31,8 @@ pub const CTRL_EXTENDED_DATA: u8 = 0x84;
 pub const CTRL_EOF_RESP: u8 = 0x85;
 pub const CTRL_CLOSE_RESP: u8 = 0x86;
 pub const CTRL_EXIT_STATUS: u8 = 0x87;
+pub const CTRL_OK: u8 = 0x88;
+pub const CTRL_ERR: u8 = 0x89;
 
 /// A request from a slave to open a session channel on the master.
 #[derive(Debug, Clone)]
@@ -57,6 +62,10 @@ pub enum ControlRequest {
     Eof { request_id: u32 },
     Close { request_id: u32 },
     WindowChange { request_id: u32, width: u32, height: u32 },
+    /// `ssh -O check`: report whether the master is running.
+    Check,
+    /// `ssh -O exit` / `ssh -O stop`: terminate the master.
+    Exit,
 }
 
 /// A frame sent by the master back to a slave.
@@ -69,6 +78,11 @@ pub enum ControlResponse {
     Eof { request_id: u32 },
     Close { request_id: u32 },
     ExitStatus { request_id: u32, code: u32 },
+    /// Command acknowledged (used by `-O check` / `-O exit`); carries the
+    /// master process id.
+    Ok(u32),
+    /// Command failed with a message.
+    Error(String),
 }
 
 /// Encode a request payload (the caller frames it with a length prefix).
@@ -132,6 +146,8 @@ pub fn encode_request(req: &ControlRequest) -> Result<Vec<u8>> {
             width.encode(&mut payload)?;
             height.encode(&mut payload)?;
         }
+        ControlRequest::Check => payload.push(CTRL_CHECK),
+        ControlRequest::Exit => payload.push(CTRL_EXIT),
     }
     Ok(payload)
 }
@@ -200,6 +216,8 @@ pub fn decode_request(data: &[u8]) -> Result<ControlRequest> {
             let height = u32::decode(&mut r)?;
             Ok(ControlRequest::WindowChange { request_id, width, height })
         }
+        CTRL_CHECK => Ok(ControlRequest::Check),
+        CTRL_EXIT => Ok(ControlRequest::Exit),
         _ => Err(SshError::Protocol(format!("unknown control request type {}", ty))),
     }
 }
@@ -241,6 +259,14 @@ pub fn encode_response(resp: &ControlResponse) -> Result<Vec<u8>> {
             payload.push(CTRL_EXIT_STATUS);
             request_id.encode(&mut payload)?;
             code.encode(&mut payload)?;
+        }
+        ControlResponse::Ok(pid) => {
+            payload.push(CTRL_OK);
+            pid.encode(&mut payload)?;
+        }
+        ControlResponse::Error(msg) => {
+            payload.push(CTRL_ERR);
+            SshString::new(msg).encode(&mut payload)?;
         }
     }
     Ok(payload)
@@ -289,6 +315,14 @@ pub fn decode_response(data: &[u8]) -> Result<ControlResponse> {
             let code = u32::decode(&mut r)?;
             Ok(ControlResponse::ExitStatus { request_id, code })
         }
+        CTRL_OK => {
+            let pid = u32::decode(&mut r)?;
+            Ok(ControlResponse::Ok(pid))
+        }
+        CTRL_ERR => {
+            let msg = SshString::decode(&mut r)?.as_str()?.to_string();
+            Ok(ControlResponse::Error(msg))
+        }
         _ => Err(SshError::Protocol(format!("unknown control response type {}", ty))),
     }
 }
@@ -316,6 +350,47 @@ pub async fn write_frame(stream: &mut (impl AsyncWriteExt + Unpin), payload: &[u
     stream.write_all(payload).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Send a ControlMaster command (`ssh -O check` / `-O exit`) over the socket
+/// and wait for the master's acknowledgement. Returns the exit code (0 on
+/// success, 255 if the master is not running).
+pub async fn run_control_command(socket: UnixStream, command: &str) -> i32 {
+    let mut sock = socket;
+    let req = match command.to_lowercase().as_str() {
+        "check" => ControlRequest::Check,
+        "exit" | "stop" => ControlRequest::Exit,
+        other => {
+            eprintln!("ns-ssh: unsupported control command: {}", other);
+            return 1;
+        }
+    };
+    let frame = match encode_request(&req) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("ns-ssh: failed to encode control command: {}", e); return 1; }
+    };
+    if write_frame(&mut sock, &frame).await.is_err() {
+        eprintln!("ns-ssh: failed to send control command to master");
+        return 255;
+    }
+    let Some(frame) = (match read_frame(&mut sock).await {
+        Ok(f) => f,
+        Err(e) => { eprintln!("ns-ssh: control socket error: {}", e); return 255; }
+    }) else {
+        eprintln!("ns-ssh: control socket closed by master");
+        return 255;
+    };
+    match decode_response(&frame) {
+        Ok(ControlResponse::Ok(pid)) => {
+            match req {
+                ControlRequest::Check => eprintln!("Master running (pid={})", pid),
+                _ => {}
+            }
+            0
+        }
+        Ok(ControlResponse::Error(msg)) => { eprintln!("ns-ssh: {}", msg); 1 }
+        _ => { eprintln!("ns-ssh: unexpected response from master"); 1 }
+    }
 }
 
 /// Connect to the master's control socket and run a session as a slave.

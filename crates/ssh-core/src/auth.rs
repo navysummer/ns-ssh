@@ -17,33 +17,33 @@ pub fn build_userauth_request(
 ) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(msg::SSH_MSG_USERAUTH_REQUEST);
-    payload.extend(SshString::new(username).0);
-    payload.extend(SshString::new(service).0);
+    SshString::new(username).encode(&mut payload).unwrap();
+    SshString::new(service).encode(&mut payload).unwrap();
 
     match method {
         AuthMethod::Password(password) => {
-            payload.extend(SshString::new("password").0);
+            SshString::new("password").encode(&mut payload).unwrap();
             payload.push(0);
-            payload.extend(SshString::new(password).0);
+            SshString::new(password).encode(&mut payload).unwrap();
         }
         AuthMethod::PublicKey(signer) => {
-            payload.extend(SshString::new("publickey").0);
+            SshString::new("publickey").encode(&mut payload).unwrap();
             payload.push(1);
-            payload.extend(SshString::new(signer.algorithm_name()).0);
+            SshString::new(signer.algorithm_name()).encode(&mut payload).unwrap();
             let pub_key = signer.public_key_bytes();
-            payload.extend(SshBytes(pub_key).0);
+            SshBytes(pub_key).encode(&mut payload).unwrap();
 
             let sign_data = build_sign_data(username, service, signer.as_ref());
             let signature = signer.sign(&sign_data).unwrap_or_default();
-            payload.extend(SshBytes(signature).0);
+            SshBytes(signature).encode(&mut payload).unwrap();
         }
         AuthMethod::KeyboardInteractive(_) => {
-            payload.extend(SshString::new("keyboard-interactive").0);
-            payload.extend(SshString::new("").0);
-            payload.extend(SshString::new("").0);
+            SshString::new("keyboard-interactive").encode(&mut payload).unwrap();
+            SshString::new("").encode(&mut payload).unwrap();
+            SshString::new("").encode(&mut payload).unwrap();
         }
         AuthMethod::None => {
-            payload.extend(SshString::new("none").0);
+            SshString::new("none").encode(&mut payload).unwrap();
         }
     }
 
