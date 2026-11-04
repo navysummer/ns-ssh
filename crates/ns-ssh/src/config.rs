@@ -192,6 +192,28 @@ pub struct HostConfig {
     /// ChannelTimeout: per-channel-type idle timeouts (e.g. `session=5m`).
     #[serde(default)]
     pub channel_timeouts: Option<Vec<(String, u64)>>,
+
+    /// KnownHostsCommand: command whose output is consulted as known_hosts.
+    #[serde(default)]
+    pub known_hosts_command: Option<String>,
+    /// CanonicalizeHostname: no/yes/always/accept-always.
+    #[serde(default)]
+    pub canonicalize_hostname: Option<String>,
+    /// CanonicalDomains: suffixes tried during canonicalization.
+    #[serde(default)]
+    pub canonical_domains: Option<Vec<String>>,
+    /// CanonicalizeMaxDots (default 1).
+    #[serde(default)]
+    pub canonicalize_max_dots: Option<u32>,
+    /// CanonicalizeFallbackLocal (default no).
+    #[serde(default)]
+    pub canonicalize_fallback_local: Option<bool>,
+    /// CanonicalizePermittedCNAMEs rules (`source:target`, comma separated).
+    #[serde(default)]
+    pub canonicalize_permitted_cnames: Option<Vec<String>>,
+    /// UpdateHostKeys: yes/no/ask. Parsed for compatibility.
+    #[serde(default)]
+    pub update_host_keys: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +361,17 @@ pub struct ResolvedConfig {
     pub permit_remote_open: Vec<String>,
     /// ChannelTimeout entries: `(channel type, idle seconds)`.
     pub channel_timeouts: Vec<(String, u64)>,
+    /// KnownHostsCommand output is consulted for host key verification.
+    pub known_hosts_command: Option<String>,
+    /// CanonicalizeHostname mode (`no` by default).
+    pub canonicalize_hostname: Option<String>,
+    pub canonical_domains: Vec<String>,
+    pub canonicalize_max_dots: u32,
+    pub canonicalize_fallback_local: bool,
+    /// CanonicalizePermittedCNAMEs rules.
+    pub canonicalize_permitted_cnames: Option<Vec<String>>,
+    /// UpdateHostKeys setting (recorded, not enforced).
+    pub update_host_keys: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -426,7 +459,162 @@ impl ResolvedConfig {
             required_rsa_size: 1024,
             permit_remote_open: Vec::new(),
             channel_timeouts: Vec::new(),
+            known_hosts_command: None,
+            canonicalize_hostname: None,
+            canonical_domains: Vec::new(),
+            canonicalize_max_dots: 1,
+            canonicalize_fallback_local: false,
+            canonicalize_permitted_cnames: None,
+            update_host_keys: None,
         }
+    }
+
+    /// Apply OpenSSH `CanonicalizeHostname`: when the target is not an IP
+    /// literal, try the `CanonicalDomains` suffixes (unless it already has more
+    /// dots than `CanonicalizeMaxDots`), then optionally follow a DNS CNAME
+    /// permitted by `CanonicalizePermittedCNAMEs`. Rewrites `hostname` in place
+    /// so subsequent resolution and known_hosts checks use the canonical name.
+    pub fn apply_canonicalization(&mut self) -> Result<()> {
+        let mode = self
+            .canonicalize_hostname
+            .as_deref()
+            .unwrap_or("no")
+            .to_ascii_lowercase();
+        let enabled = match mode.as_str() {
+            "always" => true,
+            "yes" => {
+                // With `yes`, proxied connections are left untouched; `always`
+                // applies canonicalization to them too.
+                let proxy_command = self
+                    .proxy_command
+                    .as_deref()
+                    .map(|p| !p.is_empty() && p != "none")
+                    .unwrap_or(false);
+                let proxy_jump = self
+                    .proxy_jump
+                    .as_deref()
+                    .map(|p| !p.is_empty() && p != "none")
+                    .unwrap_or(false);
+                !proxy_command && !proxy_jump
+            }
+            _ => false,
+        };
+        if !enabled {
+            return Ok(());
+        }
+
+        let raw = self.hostname.trim_end_matches('.').to_string();
+        if raw.is_empty() || is_ip_literal(&raw) {
+            return Ok(());
+        }
+
+        let dot_count = raw.matches('.').count();
+        let mut candidates = vec![raw.clone()];
+        if dot_count <= self.canonicalize_max_dots as usize {
+            for domain in &self.canonical_domains {
+                let domain = domain.trim_matches('.');
+                if !domain.is_empty() {
+                    candidates.push(format!("{}.{}", raw, domain));
+                }
+            }
+        }
+        let mut canonical = match candidates.into_iter().find(|name| resolves(name)) {
+            Some(name) => name,
+            None => {
+                if self.canonicalize_fallback_local {
+                    return Ok(());
+                }
+                return Err(SshError::Config(format!(
+                    "Could not resolve hostname {}: no address associated with name",
+                    raw
+                )));
+            }
+        };
+
+        // `CanonicalizePermittedCNAMEs` defaults to following no CNAMEs at all;
+        // only rules that match both the source and the target are followed.
+        if let Some(rules) = &self.canonicalize_permitted_cnames {
+            if !rules.is_empty() {
+                if let Some(target) = crate::dns_sshfp::lookup_cname(&canonical) {
+                    if let Some(rewritten) = cname_rewrite(rules, &canonical, &target) {
+                        canonical = rewritten;
+                    }
+                }
+            }
+        }
+
+        if canonical != raw {
+            self.hostname = canonical;
+        }
+        Ok(())
+    }
+}
+
+/// True when `host` is a bare IPv4/IPv6 literal (bracketed IPv6 included).
+fn is_ip_literal(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Resolve `name` using the system resolver; a single address is enough to
+/// consider the name canonicalizable.
+fn resolves(name: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (name, 22u16)
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Apply `from>to` CNAME rules. Each rule is a pair of glob patterns; `*` in
+/// either side matches any substring (and is substituted from `from` into
+/// `to`). Returns the rewritten name when a rule permits the CNAME.
+fn cname_rewrite(rules: &[String], from: &str, to: &str) -> Option<String> {
+    for rule in rules {
+        let (from_pattern, to_pattern) = match rule.split_once('>') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let capture = match glob_capture(from_pattern.trim(), from) {
+            Some(capture) => capture,
+            None => continue,
+        };
+        let to_pattern = to_pattern.trim();
+        let target = if to_pattern.contains('*') {
+            match capture {
+                Some(captured) => to_pattern.replacen('*', captured, 1),
+                None => continue,
+            }
+        } else {
+            to_pattern.to_string()
+        };
+        if target == to {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Match a pattern containing at most one `*` (and `?`) against `text`,
+/// returning the substring captured by `*` (`Some(None)` when there is no
+/// wildcard).
+fn glob_capture<'a>(pattern: &str, text: &'a str) -> Option<Option<&'a str>> {
+    if let Some(star) = pattern.find('*') {
+        let prefix = &pattern[..star];
+        let suffix = &pattern[star + 1..];
+        if suffix.contains('*') {
+            // More than one wildcard: match without capturing.
+            return simple_glob_match(pattern, text).then_some(None);
+        }
+        if text.len() >= prefix.len() + suffix.len()
+            && text.starts_with(prefix)
+            && text.ends_with(suffix)
+        {
+            return Some(Some(&text[prefix.len()..text.len() - suffix.len()]));
+        }
+        None
+    } else {
+        simple_glob_match(pattern, text).then_some(None)
     }
 }
 
@@ -637,6 +825,13 @@ impl SshConfig {
         let mut required_rsa_size = None;
         let mut permit_remote_open: Option<Vec<String>> = None;
         let mut channel_timeouts: Option<Vec<(String, u64)>> = None;
+        let mut known_hosts_command: Option<String> = None;
+        let mut canonicalize_hostname: Option<String> = None;
+        let mut canonical_domains: Option<Vec<String>> = None;
+        let mut canonicalize_max_dots: Option<u32> = None;
+        let mut canonicalize_fallback_local: Option<bool> = None;
+        let mut canonicalize_permitted_cnames: Option<Vec<String>> = None;
+        let mut update_host_keys: Option<String> = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -726,6 +921,13 @@ impl SshConfig {
                              required_rsa_size: required_rsa_size.take(),
                              permit_remote_open: permit_remote_open.take(),
                              channel_timeouts: channel_timeouts.take(),
+                             known_hosts_command: known_hosts_command.take(),
+                             canonicalize_hostname: canonicalize_hostname.take(),
+                             canonical_domains: canonical_domains.take(),
+                             canonicalize_max_dots: canonicalize_max_dots.take(),
+                             canonicalize_fallback_local: canonicalize_fallback_local.take(),
+                             canonicalize_permitted_cnames: canonicalize_permitted_cnames.take(),
+                             update_host_keys: update_host_keys.take(),
                          });
                     }
                     current_host = Some(value.to_string());
@@ -802,6 +1004,13 @@ impl SshConfig {
                              required_rsa_size: required_rsa_size.take(),
                              permit_remote_open: permit_remote_open.take(),
                              channel_timeouts: channel_timeouts.take(),
+                             known_hosts_command: known_hosts_command.take(),
+                             canonicalize_hostname: canonicalize_hostname.take(),
+                             canonical_domains: canonical_domains.take(),
+                             canonicalize_max_dots: canonicalize_max_dots.take(),
+                             canonicalize_fallback_local: canonicalize_fallback_local.take(),
+                             canonicalize_permitted_cnames: canonicalize_permitted_cnames.take(),
+                             update_host_keys: update_host_keys.take(),
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
@@ -908,6 +1117,33 @@ impl SshConfig {
                 "controlpersist" | "control_persist" => control_persist = Some(value.to_string()),
                 "gatewayports" | "gateway_ports" => gateway_ports = Some(yes(value)),
                 "clearallforwardings" | "clear_all_forwardings" => clear_all_forwardings = Some(yes(value)),
+                "knownhostscommand" | "known_hosts_command" => known_hosts_command = Some(value.to_string()),
+                "canonicalizehostname" | "canonicalize_hostname" => {
+                    canonicalize_hostname = Some(value.to_ascii_lowercase());
+                }
+                "canonicaldomains" | "canonical_domains" => {
+                    canonical_domains = Some(
+                        value.split_whitespace().map(|s| s.to_string()).collect(),
+                    );
+                }
+                "canonicalizemaxdots" | "canonicalize_max_dots" => {
+                    canonicalize_max_dots = value.parse().ok();
+                }
+                "canonicalizefallbacklocal" | "canonicalize_fallback_local" => {
+                    canonicalize_fallback_local = Some(yes(value));
+                }
+                "canonicalizepermittedcnames" | "canonicalize_permitted_cnames" => {
+                    canonicalize_permitted_cnames = Some(if value.eq_ignore_ascii_case("none") {
+                        Vec::new()
+                    } else {
+                        value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    });
+                }
+                "updatehostkeys" | "update_host_keys" => update_host_keys = Some(value.to_ascii_lowercase()),
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
@@ -922,20 +1158,13 @@ impl SshConfig {
                 | "sessiontype" | "session_type"
                 | "revokedhostkeys" | "revoked_host_keys"
                 | "securitykeyprovider" | "security_key_provider"
-                | "knownhostscommand" | "known_hosts_command"
                 | "enableescapecommandline" | "enable_escape_commandline"
                 | "enablesshkeysign" | "enable_ssh_keysign"
                 | "forkafterauthentication" | "fork_after_authentication"
                 | "obscurekeystroketiming" | "obscure_keystroke_timing"
                 | "proxyusefdpass" | "proxy_use_fdpass"
                 | "tunneldevice" | "tunnel_device"
-                | "updatehostkeys" | "update_host_keys"
                 | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
-                | "canonicaldomains" | "canonical_domains"
-                | "canonicalizehostname" | "canonicalize_hostname"
-                | "canonicalizemaxdots" | "canonicalize_max_dots"
-                | "canonicalizefallbacklocal" | "canonicalize_fallback_local"
-                | "canonicalizepermittedcnames" | "canonicalize_permitted_cnames"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
                 | "usekeychain" | "use_keychain"
@@ -1050,6 +1279,13 @@ impl SshConfig {
                 required_rsa_size,
                 permit_remote_open: permit_remote_open.clone(),
                 channel_timeouts: channel_timeouts.clone(),
+                known_hosts_command: known_hosts_command.clone(),
+                canonicalize_hostname: canonicalize_hostname.clone(),
+                canonical_domains: canonical_domains.clone(),
+                canonicalize_max_dots,
+                canonicalize_fallback_local,
+                canonicalize_permitted_cnames: canonicalize_permitted_cnames.clone(),
+                update_host_keys: update_host_keys.clone(),
             });
         }
 
@@ -1126,6 +1362,13 @@ impl SshConfig {
                     required_rsa_size,
                     permit_remote_open: permit_remote_open.clone(),
                     channel_timeouts: channel_timeouts.clone(),
+                    known_hosts_command: known_hosts_command.clone(),
+                    canonicalize_hostname: canonicalize_hostname.clone(),
+                    canonical_domains: canonical_domains.clone(),
+                    canonicalize_max_dots,
+                    canonicalize_fallback_local,
+                    canonicalize_permitted_cnames: canonicalize_permitted_cnames.clone(),
+                    update_host_keys: update_host_keys.clone(),
                 },
             });
         }
@@ -1520,6 +1763,61 @@ mod tests {
         assert!(simple_glob_match("host?", "host1"));
         assert!(!simple_glob_match("host?", "host12"));
         assert!(simple_glob_match("config.d/*.conf", "config.d/a.conf"));
+    }
+
+    #[test]
+    fn canonicalization_directives_parse() {
+        let cfg = SshConfig::parse(
+            "Host canon\n\
+             \x20 CanonicalizeHostname yes\n\
+             \x20 CanonicalDomains example.com corp.example.com\n\
+             \x20 CanonicalizeMaxDots 2\n\
+             \x20 CanonicalizeFallbackLocal no\n\
+             \x20 CanonicalizePermittedCNAMEs *.example.com>*.example.net,*.other>*.alt\n\
+             \x20 UpdateHostKeys yes\n\
+             \x20 KnownHostsCommand /usr/bin/find-key %h\n",
+        )
+        .unwrap();
+        let host = &cfg.hosts[0];
+        assert_eq!(host.canonicalize_hostname.as_deref(), Some("yes"));
+        assert_eq!(
+            host.canonical_domains.as_deref(),
+            Some(&["example.com".to_string(), "corp.example.com".to_string()][..])
+        );
+        assert_eq!(host.canonicalize_max_dots, Some(2));
+        assert_eq!(host.canonicalize_fallback_local, Some(false));
+        let cnames = host.canonicalize_permitted_cnames.as_ref().unwrap();
+        assert_eq!(cnames.len(), 2);
+        assert_eq!(cnames[0], "*.example.com>*.example.net");
+        assert_eq!(host.update_host_keys.as_deref(), Some("yes"));
+        assert_eq!(
+            host.known_hosts_command.as_deref(),
+            Some("/usr/bin/find-key %h")
+        );
+    }
+
+    #[test]
+    fn cname_rules_require_source_and_target_match() {
+        let rules = vec!["*.example.com>*.example.net".to_string()];
+        assert_eq!(
+            cname_rewrite(&rules, "a.example.com", "a.example.net").as_deref(),
+            Some("a.example.net")
+        );
+        assert_eq!(cname_rewrite(&rules, "a.example.com", "b.example.net"), None);
+        assert_eq!(cname_rewrite(&rules, "a.example.com", "a.other.net"), None);
+        // A target without a wildcard must match the CNAME target verbatim.
+        let rules = vec!["*.corp>fixed.example.net".to_string()];
+        assert_eq!(
+            cname_rewrite(&rules, "x.corp", "fixed.example.net").as_deref(),
+            Some("fixed.example.net")
+        );
+    }
+
+    #[test]
+    fn ip_literals_skip_canonicalization() {
+        assert!(is_ip_literal("127.0.0.1"));
+        assert!(is_ip_literal("[::1]"));
+        assert!(!is_ip_literal("example.com"));
     }
 
     #[test]

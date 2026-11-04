@@ -2699,6 +2699,60 @@ fn client_accepts_host_certificate_via_cert_authority() {
     );
 }
 
+/// `KnownHostsCommand` output is treated as a known_hosts file: under strict
+/// checking the connection succeeds only when the command supplies the key.
+#[test]
+fn client_trusts_known_hosts_command_output() {
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh-keygen not available");
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("known-hosts-command");
+    let port = free_port();
+
+    // Pre-create the host key so its `.pub` exists for the command to serve.
+    let (_host_key, host_pub) = generate_ed25519_key(&dir, "host_key_ed25519");
+    let (server, id_path, kh) = launch_test_server(&dir, port);
+
+    let command = format!(
+        "KnownHostsCommand=sed 's/^/127.0.0.1 /' {}",
+        host_pub.display()
+    );
+    let opts = vec![
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        command,
+    ];
+    let (ok, stdout, stderr) =
+        run_client_echo(&user, port, &id_path, &kh, &opts, "echo kh-command-ok");
+
+    // Without the command, strict mode must reject the unknown host key.
+    let strict = vec![
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+    ];
+    let (ok_without, _, stderr_without) =
+        run_client_echo(&user, port, &id_path, &kh, &strict, "echo should-not-run");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        ok && stdout.contains("kh-command-ok"),
+        "KnownHostsCommand output should be trusted: stderr={stderr} server_stdout={} server_stderr={}",
+        String::from_utf8_lossy(&server_out.stdout),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        !ok_without,
+        "strict host key checking must reject an unknown key without KnownHostsCommand: stderr={stderr_without}"
+    );
+}
+
 /// `ExposeAuthInfo` must put the accepted method and public key into the file
 /// named by `SSH_USER_AUTH`.
 #[test]

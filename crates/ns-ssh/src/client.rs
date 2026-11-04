@@ -249,6 +249,18 @@ fn host_cert_status(
     port: u16,
     cert: &Certificate,
 ) -> HostKeyStatus {
+    let mut trusted_cas = user_kh.cert_authorities_for(host, port);
+    trusted_cas.extend(global_kh.cert_authorities_for(host, port));
+    host_cert_status_with_cas(host, cert, &trusted_cas)
+}
+
+/// Verify a host certificate against an explicit list of trusted CA keys
+/// (used for both the known_hosts files and `KnownHostsCommand` output).
+fn host_cert_status_with_cas(
+    host: &str,
+    cert: &Certificate,
+    trusted_cas: &[Vec<u8>],
+) -> HostKeyStatus {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -259,9 +271,6 @@ fn host_cert_status(
     {
         return HostKeyStatus::Changed;
     }
-
-    let mut trusted_cas = user_kh.cert_authorities_for(host, port);
-    trusted_cas.extend(global_kh.cert_authorities_for(host, port));
     if trusted_cas.is_empty() {
         return HostKeyStatus::Unknown;
     }
@@ -272,6 +281,91 @@ fn host_cert_status(
         return HostKeyStatus::Unknown;
     }
     HostKeyStatus::Known
+}
+
+/// Expand `KnownHostsCommand` tokens (`%h`, `%H`, `%L`, `%p`, `%r`, `%u`,
+/// `%t`, `%I`, `%K`, `%%`). Unknown tokens are preserved verbatim.
+fn expand_known_hosts_command(
+    command: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+    key_type: &str,
+    key_b64: &str,
+    peer_ip: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(command.len() + 64);
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let token = match chars.next() {
+            Some(t) => t,
+            None => {
+                out.push('%');
+                break;
+            }
+        };
+        match token {
+            '%' => out.push('%'),
+            'h' | 'H' => out.push_str(host),
+            'L' => out.push_str(&local_hostname()),
+            'p' => out.push_str(&port.to_string()),
+            'r' => out.push_str(user),
+            'u' => out.push_str(&std::env::var("USER").unwrap_or_default()),
+            't' => out.push_str(key_type),
+            'I' => out.push_str(peer_ip.unwrap_or("")),
+            'K' => out.push_str(key_b64),
+            other => {
+                out.push('%');
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+fn local_hostname() -> String {
+    #[cfg(unix)]
+    unsafe {
+        let mut buf = [0u8; 256];
+        if libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).to_string();
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_default()
+}
+
+/// Run `KnownHostsCommand` and parse its output as a known_hosts file.
+/// Returns `None` when the command fails or cannot be spawned.
+fn run_known_hosts_command(
+    command: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+    key_type: &str,
+    key_blob: &[u8],
+    peer_ip: Option<&str>,
+) -> Option<KnownHosts> {
+    let key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        key_blob,
+    );
+    let expanded =
+        expand_known_hosts_command(command, host, port, user, key_type, &key_b64, peer_ip);
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&expanded)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(KnownHosts::from_content(&stdout))
 }
 
 /// Decode a plain public key blob (starting with its key type) into the
@@ -581,6 +675,9 @@ impl SshClient {
     }
 
     pub async fn connect(&mut self) -> Result<()> {
+        // CanonicalizeHostname rewrites the target before any resolution or
+        // host-key lookup, matching OpenSSH's ordering.
+        self.config.apply_canonicalization()?;
         let target_host = self.config.hostname.clone();
         let target_port = self.config.port;
         let connect_timeout = self.config.connect_timeout;
@@ -939,6 +1036,42 @@ impl SshClient {
                         self.config.port,
                         cert,
                     );
+                }
+            }
+
+            // KnownHostsCommand: consult an external key source when the key
+            // was not found in the known_hosts files (or via a CA entry).
+            if status == HostKeyStatus::Unknown {
+                if let Some(command) = self.config.known_hosts_command.as_deref() {
+                    if !command.is_empty() && command != "none" {
+                        if let Some(cmd_kh) = run_known_hosts_command(
+                            command,
+                            &lookup_host,
+                            self.config.port,
+                            &self.config.user,
+                            &host_key_type,
+                            &server_host_key_blob,
+                            self.peer_ip.as_deref(),
+                        ) {
+                            let mut cmd_status = cmd_kh.check(
+                                &lookup_host,
+                                self.config.port,
+                                &host_key_type,
+                                &server_host_key_blob,
+                            );
+                            if cmd_status != HostKeyStatus::Known {
+                                if let Some(cert) = &host_cert {
+                                    let trusted =
+                                        cmd_kh.cert_authorities_for(&lookup_host, self.config.port);
+                                    cmd_status =
+                                        host_cert_status_with_cas(&lookup_host, cert, &trusted);
+                                }
+                            }
+                            if cmd_status != HostKeyStatus::Unknown {
+                                status = cmd_status;
+                            }
+                        }
+                    }
                 }
             }
 

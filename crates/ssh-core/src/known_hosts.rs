@@ -28,6 +28,26 @@ impl KnownHosts {
         KnownHosts { entries, file_path: path }
     }
 
+    /// Build a view from in-memory content, e.g. the output of
+    /// `KnownHostsCommand`.
+    pub fn from_content(content: &str) -> Self {
+        let entries = content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    None
+                } else {
+                    Self::parse_line(line)
+                }
+            })
+            .collect();
+        KnownHosts {
+            entries,
+            file_path: PathBuf::new(),
+        }
+    }
+
     pub fn default_client_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))

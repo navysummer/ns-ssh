@@ -1604,6 +1604,27 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
+        if let Some(v) = &h.known_hosts_command {
+            resolved.known_hosts_command = Some(v.clone());
+        }
+        if let Some(v) = &h.canonicalize_hostname {
+            resolved.canonicalize_hostname = Some(v.clone());
+        }
+        if let Some(v) = &h.canonical_domains {
+            resolved.canonical_domains = v.clone();
+        }
+        if let Some(v) = h.canonicalize_max_dots {
+            resolved.canonicalize_max_dots = v;
+        }
+        if let Some(v) = h.canonicalize_fallback_local {
+            resolved.canonicalize_fallback_local = v;
+        }
+        if let Some(v) = &h.canonicalize_permitted_cnames {
+            resolved.canonicalize_permitted_cnames = Some(v.clone());
+        }
+        if let Some(v) = &h.update_host_keys {
+            resolved.update_host_keys = Some(v.clone());
+        }
     }
 
     for opt in options {
@@ -1931,6 +1952,27 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &host_config.channel_timeouts {
                 resolved.channel_timeouts = v.clone();
             }
+            if let Some(v) = &host_config.known_hosts_command {
+                resolved.known_hosts_command = Some(v.clone());
+            }
+            if let Some(v) = &host_config.canonicalize_hostname {
+                resolved.canonicalize_hostname = Some(v.clone());
+            }
+            if let Some(v) = &host_config.canonical_domains {
+                resolved.canonical_domains = v.clone();
+            }
+            if let Some(v) = host_config.canonicalize_max_dots {
+                resolved.canonicalize_max_dots = v;
+            }
+            if let Some(v) = host_config.canonicalize_fallback_local {
+                resolved.canonicalize_fallback_local = v;
+            }
+            if let Some(v) = &host_config.canonicalize_permitted_cnames {
+                resolved.canonicalize_permitted_cnames = Some(v.clone());
+            }
+            if let Some(v) = &host_config.update_host_keys {
+                resolved.update_host_keys = Some(v.clone());
+            }
             if let Some(v) = host_config.clear_all_forwardings {
                 if v {
                     resolved.local_forwards.clear();
@@ -2160,6 +2202,27 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &mc.channel_timeouts {
                 resolved.channel_timeouts = v.clone();
             }
+            if let Some(v) = &mc.known_hosts_command {
+                resolved.known_hosts_command = Some(v.clone());
+            }
+            if let Some(v) = &mc.canonicalize_hostname {
+                resolved.canonicalize_hostname = Some(v.clone());
+            }
+            if let Some(v) = &mc.canonical_domains {
+                resolved.canonical_domains = v.clone();
+            }
+            if let Some(v) = mc.canonicalize_max_dots {
+                resolved.canonicalize_max_dots = v;
+            }
+            if let Some(v) = mc.canonicalize_fallback_local {
+                resolved.canonicalize_fallback_local = v;
+            }
+            if let Some(v) = &mc.canonicalize_permitted_cnames {
+                resolved.canonicalize_permitted_cnames = Some(v.clone());
+            }
+            if let Some(v) = &mc.update_host_keys {
+                resolved.update_host_keys = Some(v.clone());
+            }
         }
     }
 
@@ -2301,6 +2364,33 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "channeltimeout" | "channel_timeout" => {
             resolved.channel_timeouts = config::parse_channel_timeout(value);
+        }
+        "knownhostscommand" | "known_hosts_command" => {
+            resolved.known_hosts_command = Some(value.to_string());
+        }
+        "canonicalizehostname" | "canonicalize_hostname" => {
+            resolved.canonicalize_hostname = Some(value.to_ascii_lowercase());
+        }
+        "canonicaldomains" | "canonical_domains" => {
+            resolved.canonical_domains =
+                value.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        "canonicalizemaxdots" | "canonicalize_max_dots" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.canonicalize_max_dots = v; }
+        }
+        "canonicalizefallbacklocal" | "canonicalize_fallback_local" => {
+            resolved.canonicalize_fallback_local = value != "no";
+        }
+        "canonicalizepermittedcnames" | "canonicalize_permitted_cnames" => {
+            resolved.canonicalize_permitted_cnames = Some(if value.eq_ignore_ascii_case("none") {
+                Vec::new()
+            } else {
+                value.split(',').map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()).collect()
+            });
+        }
+        "updatehostkeys" | "update_host_keys" => {
+            resolved.update_host_keys = Some(value.to_ascii_lowercase());
         }
         "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
             resolved.no_host_authentication_for_localhost = value != "no";
