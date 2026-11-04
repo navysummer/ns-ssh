@@ -2668,15 +2668,13 @@ impl SshClient {
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("DEBUG main loop: receive error: {}", e);
-                            return Ok(0);
+                            return Err(e);
                         }
                     }
                 }
                 ev = event_rx.recv() => {
                     match ev {
                         Some(ev) => {
-                            eprintln!("DEBUG main loop: event={:?}", std::mem::discriminant(&ev));
                             pending_events.push_back(ev)
                         },
                         None => return Ok(0),
@@ -2937,7 +2935,6 @@ impl SshClient {
         let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
         loop {
             let pkt = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-            eprintln!("DEBUG await_request_reply: type={}", pkt.first().copied().unwrap_or(0));
             match pkt.first() {
                 Some(&msg::SSH_MSG_CHANNEL_SUCCESS) | Some(&msg::SSH_MSG_CHANNEL_FAILURE) => return Ok(()),
                 _ => {}
