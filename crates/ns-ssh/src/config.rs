@@ -235,23 +235,125 @@ pub struct MatchConfig {
     pub config: HostConfig,
 }
 
+/// Context in which client `Match` conditions are evaluated.
+pub struct MatchContext<'a> {
+    /// Effective target host (after `HostName` substitution).
+    pub host: &'a str,
+    /// Host as given on the command line, before any substitution.
+    pub original_host: &'a str,
+    /// Remote user being authenticated as.
+    pub user: &'a str,
+    /// Local user running the client.
+    pub local_user: &'a str,
+    /// Configuration tags accumulated so far (see `Tag`).
+    pub tags: &'a [String],
+}
+
+/// Match a comma-separated pattern list against `text`, with `!` negation
+/// and `*`/`?` globs — OpenSSH's match_pattern_list semantics: a negated
+/// match fails the condition, a positive match satisfies it.
+fn match_pattern_list(list: &str, text: &str) -> bool {
+    for p in list.split(',') {
+        let p = p.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if let Some(neg) = p.strip_prefix('!') {
+            if neg == text || ((neg.contains('*') || neg.contains('?')) && glob_match(neg, text)) {
+                return false;
+            }
+        } else if p == text || ((p.contains('*') || p.contains('?')) && glob_match(p, text)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the addresses of local network interfaces (for `Match localnetwork`).
+fn local_network_addrs() -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifaddrs) != 0 {
+            return out;
+        }
+        let mut cur = ifaddrs;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() {
+                let family = (*ifa.ifa_addr).sa_family as i32;
+                if family == libc::AF_INET {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                        u32::from_be(sa.sin_addr.s_addr),
+                    )));
+                } else if family == libc::AF_INET6 {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                        sa.sin6_addr.s6_addr,
+                    )));
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifaddrs);
+    }
+    out
+}
+
+/// Match one `localnetwork` pattern (exact, glob, or CIDR) against an address.
+fn local_addr_match(pattern: &str, addr: &std::net::IpAddr) -> bool {
+    let text = addr.to_string();
+    if let Some((net, bits)) = pattern.split_once('/') {
+        if let (Ok(net_ip), Ok(bits)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u32>()) {
+            return match (net_ip, addr) {
+                (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) if bits <= 32 => {
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    u32::from(n) & mask == u32::from(*a) & mask
+                }
+                (std::net::IpAddr::V6(n), std::net::IpAddr::V6(a)) if bits <= 128 => {
+                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                    u128::from(n) & mask == u128::from(*a) & mask
+                }
+                _ => false,
+            };
+        }
+    }
+    pattern == text
+        || ((pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, &text))
+}
+
 impl MatchConfig {
-    /// Check whether this Match block applies to the given host and user.
-    /// `tags` are the configuration tags accumulated so far (see `Tag`).
-    pub fn matches(&self, target_host: &str, target_user: &str, tags: &[String]) -> bool {
+    /// Check whether this Match block applies in the given context.
+    pub fn matches(&self, ctx: &MatchContext<'_>) -> bool {
         for (key, value) in &self.conditions {
             match key.as_str() {
+                "all" => {}
+                // ns-ssh resolves configuration in a single pass, which is the
+                // final pass; there is no canonicalization pass.
+                "final" => {}
+                "canonical" => return false,
                 "host" => {
-                    let matched = value.split(',').any(|p| {
-                        let p = p.trim();
-                        p == target_host || (p.contains('*') && glob_match(p, target_host))
-                    });
-                    if !matched { return false; }
+                    if !match_pattern_list(value, ctx.host) { return false; }
+                }
+                "originalhost" => {
+                    if !match_pattern_list(value, ctx.original_host) { return false; }
                 }
                 "user" => {
-                    let matched = value.split(',').any(|p| {
-                        let p = p.trim();
-                        p == target_user || (p.contains('*') && glob_match(p, target_user))
+                    if !match_pattern_list(value, ctx.user) { return false; }
+                }
+                "localuser" => {
+                    if !match_pattern_list(value, ctx.local_user) { return false; }
+                }
+                "localnetwork" => {
+                    let matched = local_network_addrs().iter().any(|addr| {
+                        value.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| {
+                            if let Some(neg) = p.strip_prefix('!') {
+                                !local_addr_match(neg, addr)
+                            } else {
+                                local_addr_match(p, addr)
+                            }
+                        })
                     });
                     if !matched { return false; }
                 }
@@ -263,14 +365,29 @@ impl MatchConfig {
                     let matched = value.split(',').any(|p| {
                         let p = p.trim();
                         if let Some(neg) = p.strip_prefix('!') {
-                            !tags.iter().any(|t| tag_pattern_match(neg, t))
+                            !ctx.tags.iter().any(|t| tag_pattern_match(neg, t))
                         } else {
-                            tags.iter().any(|t| tag_pattern_match(p, t))
+                            ctx.tags.iter().any(|t| tag_pattern_match(p, t))
                         }
                     });
                     if !matched { return false; }
                 }
-                _ => {} // unknown conditions are ignored
+                "exec" => {
+                    // Run the command via the user's shell; the condition is
+                    // satisfied when it exits with status 0 (OpenSSH semantics).
+                    let ok = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(value)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if !ok { return false; }
+                }
+                // Validated at parse time; unreachable.
+                _ => return false,
             }
         }
         true
@@ -1175,9 +1292,35 @@ impl SshConfig {
                     let mut conditions = Vec::new();
                     for cond in value.split(',') {
                         let cond = cond.trim();
-                        if let Some((k, v)) = cond.split_once(' ') {
-                            conditions.push((k.trim().to_lowercase(), v.trim().to_string()));
+                        if cond.is_empty() {
+                            continue;
                         }
+                        let (k, v) = match cond.split_once(' ') {
+                            Some((k, v)) => (k.trim().to_lowercase(), v.trim().to_string()),
+                            None => (cond.to_lowercase(), String::new()),
+                        };
+                        match k.as_str() {
+                            "all" | "canonical" | "final" => conditions.push((k, String::new())),
+                            "host" | "originalhost" | "user" | "localuser"
+                            | "localnetwork" | "tagged" | "exec" => {
+                                if v.is_empty() {
+                                    return Err(SshError::Config(format!(
+                                        "Match condition '{}' requires an argument",
+                                        k
+                                    )));
+                                }
+                                conditions.push((k, v));
+                            }
+                            _ => {
+                                return Err(SshError::Config(format!(
+                                    "unsupported Match condition '{}'",
+                                    k
+                                )));
+                            }
+                        }
+                    }
+                    if conditions.is_empty() {
+                        return Err(SshError::Config("Match requires a criterion".to_string()));
                     }
                     current_match_conditions = Some(conditions);
                 }
@@ -2062,14 +2205,73 @@ Match tagged !jump
 
         let tags = vec!["jump".to_string(), "extra".to_string()];
         let no_tags: Vec<String> = Vec::new();
+        fn ctx(tags: &[String]) -> MatchContext<'_> {
+            MatchContext {
+                host: "bastion",
+                original_host: "bastion",
+                user: "u",
+                local_user: "u",
+                tags,
+            }
+        }
         // `Match tagged jump` applies when the tag is active.
-        assert!(cfg.match_blocks[0].matches("bastion", "u", &tags));
-        assert!(!cfg.match_blocks[0].matches("bastion", "u", &no_tags));
+        assert!(cfg.match_blocks[0].matches(&ctx(&tags)));
+        assert!(!cfg.match_blocks[0].matches(&ctx(&no_tags)));
         // `Match tagged missing` does not apply.
-        assert!(!cfg.match_blocks[1].matches("bastion", "u", &tags));
+        assert!(!cfg.match_blocks[1].matches(&ctx(&tags)));
         // `Match tagged !jump` applies only when the tag is absent.
-        assert!(!cfg.match_blocks[2].matches("bastion", "u", &tags));
-        assert!(cfg.match_blocks[2].matches("bastion", "u", &no_tags));
+        assert!(!cfg.match_blocks[2].matches(&ctx(&tags)));
+        assert!(cfg.match_blocks[2].matches(&ctx(&no_tags)));
+    }
+
+    #[test]
+    fn match_extended_conditions() {
+        fn mkctx<'a>(
+            host: &'a str,
+            orig: &'a str,
+            user: &'a str,
+            local: &'a str,
+            tags: &'a [String],
+        ) -> MatchContext<'a> {
+            MatchContext { host, original_host: orig, user, local_user: local, tags }
+        }
+        let tags: Vec<String> = Vec::new();
+        let parse = |line: &str| SshConfig::parse(line).unwrap().match_blocks.remove(0);
+
+        // `Match all` always applies.
+        assert!(parse("Match all\n  Port 22\n").matches(&mkctx("h", "h", "u", "lu", &tags)));
+        // `Match final` applies (single-pass resolution is the final pass).
+        assert!(parse("Match final\n  Port 22\n").matches(&mkctx("h", "h", "u", "lu", &tags)));
+        // `Match canonical` never applies (no canonicalization pass).
+        assert!(!parse("Match canonical\n  Port 22\n").matches(&mkctx("h", "h", "u", "lu", &tags)));
+
+        // `originalhost` sees the command-line host, not the HostName value.
+        let mb = parse("Match originalhost jump\n  Port 22\n");
+        assert!(mb.matches(&mkctx("10.0.0.1", "jump", "u", "lu", &tags)));
+        assert!(!mb.matches(&mkctx("jump", "10.0.0.1", "u", "lu", &tags)));
+
+        // `localuser` matches the local account name.
+        let mb = parse("Match localuser alice\n  Port 22\n");
+        assert!(mb.matches(&mkctx("h", "h", "bob", "alice", &tags)));
+        assert!(!mb.matches(&mkctx("h", "h", "bob", "bob", &tags)));
+
+        // `localnetwork` matches against local interface addresses; the
+        // loopback address is always present.
+        let mb = parse("Match localnetwork 127.0.0.0/8\n  Port 22\n");
+        assert!(mb.matches(&mkctx("h", "h", "u", "lu", &tags)));
+        let mb = parse("Match localnetwork 203.0.113.0/24\n  Port 22\n");
+        assert!(!mb.matches(&mkctx("h", "h", "u", "lu", &tags)));
+
+        // `exec` runs the command and checks its exit status.
+        assert!(parse("Match exec true\n  Port 22\n").matches(&mkctx("h", "h", "u", "lu", &tags)));
+        assert!(!parse("Match exec false\n  Port 22\n").matches(&mkctx("h", "h", "u", "lu", &tags)));
+
+        // Unknown conditions are a parse error (not silently ignored).
+        assert!(SshConfig::parse("Match bogus x\n  Port 22\n").is_err());
+        // A condition missing its argument is an error too.
+        assert!(SshConfig::parse("Match user\n  Port 22\n").is_err());
+        // Bare `Match` with no criterion is an error.
+        assert!(SshConfig::parse("Match\n  Port 22\n").is_err());
     }
 
     #[test]

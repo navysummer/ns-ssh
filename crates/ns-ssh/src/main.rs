@@ -2013,7 +2013,14 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
         // Apply matching Match blocks (OpenSSH: Match blocks are applied AFTER Host blocks)
         let target_host = target.as_str();
         for match_block in &ssh_config.match_blocks {
-            if !match_block.matches(target_host, &resolved.user, &tags) {
+            let match_ctx = crate::config::MatchContext {
+                host: &resolved.hostname,
+                original_host: target_host,
+                user: &resolved.user,
+                local_user: &default_user,
+                tags: &tags,
+            };
+            if !match_block.matches(&match_ctx) {
                 continue;
             }
             // Tags set by a matching block become visible to subsequent blocks.
