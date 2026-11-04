@@ -2057,7 +2057,9 @@ impl SshClient {
                                         let local_id = self.channel_manager.get_channel(recipient).map(|c| c.local_id);
                                         if req_type == "exit-status" {
                                             let mut r = &payload[10 + req_type.len()..];
-                                            exit_code = u32::decode(&mut r)? as i32;
+                                            if let Ok(code) = u32::decode(&mut r) {
+                                                exit_code = code as i32;
+                                            }
                                         } else if req_type == "exit-signal" {
                                             // string signal, boolean core-dumped,
                                             // string error-message, string language
@@ -4724,39 +4726,39 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
                             None
                         },
                     };
-                    return crate::control::run_control_slave(sock, req, config.batch_mode).await.unwrap_or(1);
+                    return crate::control::run_control_slave(sock, req, config.batch_mode).await.unwrap_or(255);
                 }
             }
             // Become the master: establish a connection, then serve.
             if client.connect().await.is_err() {
                 eprintln!("ns-ssh: connect to {}:{} failed", config.hostname, config.port);
-                return 1;
+                return 255;
             }
             if client.handshake().await.is_err() {
                 eprintln!("ns-ssh: handshake failed");
-                return 1;
+                return 255;
             }
             if client.authenticate().await.is_err() {
                 eprintln!("ns-ssh: authentication failed");
-                return 1;
+                return 255;
             }
             if config.add_keys_to_agent {
                 client.add_loaded_keys_to_agent().await;
             }
-            return client.run_control_master(&path, config.control_persist).await.unwrap_or(1);
+            return client.run_control_master(&path, config.control_persist).await.unwrap_or(255);
         }
 
         if client.connect().await.is_err() {
             eprintln!("ns-ssh: connect to {}:{} failed", config.hostname, config.port);
-            return 1;
+            return 255;
         }
         if let Err(e) = client.handshake().await {
             eprintln!("ns-ssh: handshake failed: {}", e);
-            return 1;
+            return 255;
         }
         if client.authenticate().await.is_err() {
             eprintln!("ns-ssh: authentication failed");
-            return 1;
+            return 255;
         }
         if config.add_keys_to_agent {
             client.add_loaded_keys_to_agent().await;
@@ -4789,9 +4791,9 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
         if let Some(ref sub) = config.subsystem {
             let sid = match client.request_session_subsystem(sub).await {
                 Ok(sid) => sid,
-                Err(e) => { eprintln!("ns-ssh: subsystem request failed: {}", e); return 1; }
+                Err(e) => { eprintln!("ns-ssh: subsystem request failed: {}", e); return 255; }
             };
-            return client.run_event_loop(Some(sid)).await.unwrap_or(1);
+            return client.run_event_loop(Some(sid)).await.unwrap_or(255);
         }
 
         // -W host:port stdio forwarding
@@ -4804,14 +4806,14 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
                 }
                 Err(e) => {
                     eprintln!("ns-ssh: session request failed: {}", e);
-                    return 1;
+                    return 255;
                 }
             }
         } else {
             None
         };
 
-        client.run_event_loop(session_id).await.unwrap_or(1)
+        client.run_event_loop(session_id).await.unwrap_or(255)
     })
 }
 
