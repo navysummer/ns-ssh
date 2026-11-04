@@ -454,6 +454,24 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "loglevel" | "log_level" => o.log_level = Some(value.to_string()),
         "hostbasedauthentication" | "hostbased_auth" => o.hostbased_auth = Some(value == "yes"),
         "ignorerhosts" | "ignore_rhosts" => o.ignore_rhosts = Some(value == "yes"),
+        // Known OpenSSH directives accepted inside Match blocks but not enforced.
+        "authenticationmethods" | "authentication_methods"
+        | "authorizedprincipalsfile" | "authorized_principals_file"
+        | "casignaturealgorithms" | "ca_signature_algorithms"
+        | "channeltimeout" | "channel_timeout"
+        | "exposeauthinfo" | "expose_auth_info"
+        | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
+        | "hostcertificate" | "host_certificate"
+        | "pubkeyauthoptions" | "pubkey_auth_options"
+        | "requiredrsasize" | "required_rsa_size"
+        | "revokedkeys" | "revoked_keys"
+        | "streamlocalbindmask" | "stream_local_bind_mask"
+        | "streamlocalbindunlink" | "stream_local_bind_unlink"
+        | "trustedusercakeys" | "trusted_user_ca_keys"
+        | "disableforwarding" | "disable_forwarding"
+        | "permittunnel" | "permit_tunnel" => {
+            // Accepted; not enforced.
+        }
         _ => return Err(SshError::Config(format!(
             "unknown directive '{}' in Match block",
             key
@@ -1159,6 +1177,48 @@ impl ServerConfig {
                     // OpenSSH: LogVerbose = LogLevel VERBOSE
                     config.log_level = Some("VERBOSE".to_string());
                 }
+                // Known OpenSSH directives accepted but not enforced. Accepting
+                // them keeps real-world sshd_config files loadable; enforcement
+                // is tracked in docs/openssh-gap-audit.md.
+                "authenticationmethods" | "authentication_methods"
+                | "authorizedprincipalsfile" | "authorized_principals_file"
+                | "authorizedprincipalscommand" | "authorized_principals_command"
+                | "authorizedprincipalscommanduser" | "authorized_principals_command_user"
+                | "casignaturealgorithms" | "ca_signature_algorithms"
+                | "channeltimeout" | "channel_timeout"
+                | "exposeauthinfo" | "expose_auth_info"
+                | "gssapiauthentication" | "gssapi_authentication"
+                | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
+                | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
+                | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
+                | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
+                | "hostcertificate" | "host_certificate"
+                | "hostkeyagent" | "host_key_agent"
+                | "kerberosauthentication" | "kerberos_authentication"
+                | "kerberosgetafstoken" | "kerberos_get_afs_token"
+                | "kerberosorlocalpasswd" | "kerberos_or_local_passwd"
+                | "kerberosticketcleanup" | "kerberos_ticket_cleanup"
+                | "modulifile" | "moduli_file"
+                | "pamservicename" | "pam_service_name"
+                | "permituserrc" | "permit_user_rc"
+                | "persourcemaxstartups" | "per_source_max_startups"
+                | "persourcenetblocksize" | "per_source_net_block_size"
+                | "persourcepenalties" | "per_source_penalties"
+                | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
+                | "pubkeyauthoptions" | "pubkey_auth_options"
+                | "rdomain" | "refuseconnection" | "refuse_connection"
+                | "requiredrsasize" | "required_rsa_size"
+                | "revokedkeys" | "revoked_keys"
+                | "securitykeyprovider" | "security_key_provider"
+                | "sshdssessionpath" | "sshd_session_path"
+                | "streamlocalbindmask" | "stream_local_bind_mask"
+                | "streamlocalbindunlink" | "stream_local_bind_unlink"
+                | "trustedusercakeys" | "trusted_user_ca_keys"
+                | "unusedconnectiontimeout" | "unused_connection_timeout"
+                | "versionaddendum" | "version_addendum"
+                | "xauthlocation" | "xauth_location" => {
+                    // Accepted; not enforced.
+                }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",
                     key
@@ -1338,5 +1398,15 @@ Match All
         assert!(ServerConfig::parse(
             "Match User alice\n    ForceCommand /bin/echo\n    TypoDirective no\n"
         ).is_err());
+    }
+
+    #[test]
+    fn unimplemented_openssh_directives_do_not_fatal() {
+        assert!(ServerConfig::parse(
+            "AuthenticationMethods publickey\n\
+             RequiredRSASize 2048\n\
+             TrustedUserCAKeys /tmp/ca.pub\n\
+             ChannelTimeout session=5m\n"
+        ).is_ok());
     }
 }

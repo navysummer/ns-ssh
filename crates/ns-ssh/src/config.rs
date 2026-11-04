@@ -518,6 +518,10 @@ impl SshConfig {
     pub fn parse(content: &str) -> Result<Self> {
         let mut hosts = Vec::new();
         let mut match_blocks = Vec::new();
+        // IgnoreUnknown: comma-separated patterns whose directives are skipped
+        // instead of treated as fatal. Matches OpenSSH's escape hatch for the
+        // strict unknown-directive check introduced by L06/V03.
+        let mut ignore_unknown: Vec<String> = Vec::new();
         let mut current_host: Option<String> = None;
         let mut current_match_conditions: Option<Vec<(String, String)>> = None;
         let mut hostname = None;
@@ -820,11 +824,58 @@ impl SshConfig {
                 "controlpersist" | "control_persist" => control_persist = Some(value.to_string()),
                 "gatewayports" | "gateway_ports" => gateway_ports = Some(yes(value)),
                 "clearallforwardings" | "clear_all_forwardings" => clear_all_forwardings = Some(yes(value)),
+                // Known OpenSSH directives that we accept but do not enforce.
+                // Accepting them keeps real-world configs loadable; enforcement
+                // is tracked separately (see docs/openssh-gap-audit.md).
+                "bindinterface" | "bind_interface"
+                | "kbdinteractivedevices" | "kbd_interactive_devices"
+                | "syslogfacility" | "syslog_facility"
+                | "xauthlocation" | "xauth_location"
+                | "requiredrsasize" | "required_rsa_size"
+                | "hostbasedauthentication" | "hostbased_authentication"
+                | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
+                | "casignaturealgorithms" | "ca_signature_algorithms"
+                | "channeltimeout" | "channel_timeout"
+                | "permitremoteopen" | "permit_remote_open"
+                | "stdinnull" | "stdin_null"
+                | "sessiontype" | "session_type"
+                | "streamlocalbindmask" | "stream_local_bind_mask"
+                | "streamlocalbindunlink" | "stream_local_bind_unlink"
+                | "certificatefile" | "certificate_file"
+                | "revokedhostkeys" | "revoked_host_keys"
+                | "securitykeyprovider" | "security_key_provider"
+                | "knownhostscommand" | "known_hosts_command"
+                | "enableescapecommandline" | "enable_escape_commandline"
+                | "enablesshkeysign" | "enable_ssh_keysign"
+                | "forkafterauthentication" | "fork_after_authentication"
+                | "obscurekeystroketiming" | "obscure_keystroke_timing"
+                | "proxyusefdpass" | "proxy_use_fdpass"
+                | "tunneldevice" | "tunnel_device"
+                | "updatehostkeys" | "update_host_keys"
+                | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command" => {
+                    // Accepted; not enforced.
+                }
+                "ignoreunknown" | "ignore_unknown" => {
+                    for tok in value.split(',') {
+                        let t = tok.trim().to_ascii_lowercase().replace(['_', '-'], "");
+                        if !t.is_empty() {
+                            ignore_unknown.push(t);
+                        }
+                    }
+                }
                 "include" => { /* ignored */ }
-                _ => return Err(SshError::Config(format!(
-                    "unknown directive: {}",
-                    key
-                ))),
+                _ => {
+                    let norm = key.replace(['_', '-'], "");
+                    let ignored = ignore_unknown.iter().any(|p| {
+                        p == &norm || (p.contains('*') && glob_match(p, &norm))
+                    });
+                    if !ignored {
+                        return Err(SshError::Config(format!(
+                            "unknown directive: {}",
+                            key
+                        )));
+                    }
+                }
             }
         }
 
@@ -1394,5 +1445,28 @@ mod tests {
     #[test]
     fn unknown_directive_in_host_block_is_fatal() {
         assert!(SshConfig::parse("Host foo\n  TypoDirective yes\n").is_err());
+    }
+
+    #[test]
+    fn ignore_unknown_suppresses_fatal() {
+        // IgnoreUnknown must appear before the unknown directive, like OpenSSH.
+        assert!(SshConfig::parse(
+            "IgnoreUnknown TypoDirective\nHost foo\n  TypoDirective yes\n"
+        ).is_ok());
+    }
+
+    #[test]
+    fn ignore_unknown_supports_wildcards() {
+        assert!(SshConfig::parse(
+            "IgnoreUnknown Typo*\nHost foo\n  TypoDirective yes\n"
+        ).is_ok());
+    }
+
+    #[test]
+    fn unimplemented_openssh_directives_do_not_fatal() {
+        // These are valid OpenSSH client directives we accept but do not enforce.
+        assert!(SshConfig::parse(
+            "Host foo\n  RequiredRSASize 2048\n  ChannelTimeout 5m\n  SessionType none\n"
+        ).is_ok());
     }
 
