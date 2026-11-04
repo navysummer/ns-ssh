@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::collections::HashMap;
 use serde::Deserialize;
+use ssh_core::error::{SshError, Result};
 
 /// Match a glob pattern (supports `*` and `?`) against text. Used for `Include` globs.
 fn simple_glob_match(pattern: &str, text: &str) -> bool {
@@ -356,7 +357,7 @@ fn glob_any(patterns: &str, text: &str) -> bool {
 }
 
 /// Apply a single directive to a MatchOverrides, for directives valid in `Match` blocks.
-fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) {
+fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Result<()> {
     match key {
         "forcecommand" | "force_command" => o.force_command = Some(value.to_string()),
         "permitrootlogin" | "permit_root_login" => o.permit_root_login_mode = Some(value.to_lowercase()),
@@ -433,8 +434,12 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) {
         "loglevel" | "log_level" => o.log_level = Some(value.to_string()),
         "hostbasedauthentication" | "hostbased_auth" => o.hostbased_auth = Some(value == "yes"),
         "ignorerhosts" | "ignore_rhosts" => o.ignore_rhosts = Some(value == "yes"),
-        _ => {}
+        _ => return Err(SshError::Config(format!(
+            "unknown directive '{}' in Match block",
+            key
+        ))),
     }
+    Ok(())
 }
 
 /// Match an address pattern: exact, glob, or CIDR prefix.
@@ -762,7 +767,7 @@ impl ServerConfig {
         }
         let mut seen: Vec<PathBuf> = Vec::new();
         let content = Self::collect_config(path, 0, &mut seen);
-        Self::parse(&content)
+        Self::parse(&content).expect("failed to parse server config")
     }
 
     /// Recursively read a config file, expanding `Include` directives (with glob
@@ -874,7 +879,7 @@ impl ServerConfig {
         }
     }
 
-    pub fn parse(content: &str) -> Self {
+    pub fn parse(content: &str) -> Result<Self> {
         let mut config = ServerConfig::default();
         let mut current_match: Option<ServerMatch> = None;
         let mut host_key_seen = false;
@@ -901,7 +906,7 @@ impl ServerConfig {
 
             // Directives inside a Match block populate its overrides.
             if let Some(m) = current_match.as_mut() {
-                apply_match_override(&mut m.overrides, &key, value);
+                apply_match_override(&mut m.overrides, &key, value)?;
                 continue;
             }
 
@@ -1107,7 +1112,13 @@ impl ServerConfig {
                 "include" => {
                     // Handled during load (collect_config). Ignore here for raw parse().
                 }
-                _ => {}
+                "usepam" | "use_pam" => {
+                    // PAM authentication is not implemented; accept the directive silently.
+                }
+                _ => return Err(SshError::Config(format!(
+                    "unknown directive: {}",
+                    key
+                ))),
             }
         }
 
@@ -1115,7 +1126,7 @@ impl ServerConfig {
             config.match_blocks.push(m);
         }
 
-        config
+        Ok(config)
     }
 
     pub fn get_host_key_files(&self) -> Vec<PathBuf> {
@@ -1181,7 +1192,7 @@ Match User alice,root
 Match Address 10.0.0.0/8
     X11Forwarding yes
 ";
-        let cfg = ServerConfig::parse(content);
+        let cfg = ServerConfig::parse(content).unwrap();
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.match_blocks.len(), 2);
 
@@ -1206,7 +1217,7 @@ Match Address 192.168.1.0/24
     ForceCommand echo N
 Match All
     Banner /etc/banner
-");
+").unwrap();
         // User alice matches; group/staff not; address not.
         let r = cfg.resolve_for_match("alice", &["staff".to_string()], "srv", "10.0.0.5");
         assert_eq!(r.force_command.as_deref(), Some("echo A"));
@@ -1235,7 +1246,7 @@ Match All
 
     #[test]
     fn host_key_replaces_defaults() {
-        let cfg = ServerConfig::parse("HostKey /tmp/custom_ed25519\nHostKey /tmp/custom_rsa\n");
+        let cfg = ServerConfig::parse("HostKey /tmp/custom_ed25519\nHostKey /tmp/custom_rsa\n").unwrap();
         assert_eq!(cfg.host_key_files, vec!["/tmp/custom_ed25519".to_string(), "/tmp/custom_rsa".to_string()]);
     }
 
@@ -1248,7 +1259,7 @@ Match All
              HostKeyAlgorithms ssh-ed25519\n\
              StrictModes no\n\
              PermitTTY no\n",
-        );
+        ).unwrap();
         assert_eq!(cfg.kex_algorithms.as_deref(), Some("curve25519-sha256"));
         assert_eq!(cfg.ciphers.as_deref(), Some("aes256-ctr"));
         assert_eq!(cfg.macs.as_deref(), Some("hmac-sha2-256"));
@@ -1265,11 +1276,23 @@ Match All
              PrintLastLog no\n\
              TCPKeepAlive no\n\
              PermitEmptyPasswords yes\n",
-        );
+        ).unwrap();
         assert!(!cfg.ignore_rhosts);
         assert!(cfg.hostbased_auth);
         assert!(!cfg.print_last_log);
         assert!(!cfg.tcp_keep_alive);
         assert!(cfg.permit_empty_passwords);
+    }
+
+    #[test]
+    fn unknown_directive_is_fatal() {
+        assert!(ServerConfig::parse("Port 22\nTypoDirective yes\n").is_err());
+    }
+
+    #[test]
+    fn unknown_directive_in_match_block_is_fatal() {
+        assert!(ServerConfig::parse(
+            "Match User alice\n    ForceCommand /bin/echo\n    TypoDirective no\n"
+        ).is_err());
     }
 }

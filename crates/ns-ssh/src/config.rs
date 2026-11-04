@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use serde::Deserialize;
+use ssh_core::error::{SshError, Result};
 
 /// OpenSSH `StrictHostKeyChecking` mode: `yes`, `no`, or `ask`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,8 +129,6 @@ pub struct HostConfig {
     pub add_keys_to_agent: Option<String>,
     #[serde(default)]
     pub no_host_authentication_for_localhost: Option<bool>,
-    #[serde(default)]
-    pub enable_ssh_keysign: Option<bool>,
     #[serde(default)]
     pub verify_host_key_dns: Option<String>,
     #[serde(default)]
@@ -360,7 +359,10 @@ impl ResolvedConfig {
             check_host_ip: true,
             number_of_password_prompts: 3,
             connection_attempts: 1,
-            verify_host_key_dns: "ask".to_string(),
+            // OpenSSH's default is "no"; doing an SSHFP lookup for every
+            // connection is both a surprise and a wire-visible leak of the
+            // target hostname.
+            verify_host_key_dns: "no".to_string(),
             no_host_authentication_for_localhost: false,
             rekey_limit_bytes: 1 << 30,
             rekey_limit_time: 3600,
@@ -387,7 +389,7 @@ impl SshConfig {
 
         let mut seen: Vec<PathBuf> = Vec::new();
         let content = Self::collect_config(path, 0, &mut seen);
-        Self::parse(&content)
+        Self::parse(&content).expect("failed to parse client config")
     }
 
     /// Recursively read a config file, expanding `Include` directives. Returns the
@@ -501,7 +503,7 @@ impl SshConfig {
     }
 
     /// Parse a single config file (no include expansion) from raw text.
-    pub fn parse(content: &str) -> Self {
+    pub fn parse(content: &str) -> Result<Self> {
         let mut hosts = Vec::new();
         let mut match_blocks = Vec::new();
         let mut current_host: Option<String> = None;
@@ -545,7 +547,6 @@ impl SshConfig {
         let mut remote_command = None;
         let mut add_keys_to_agent = None;
         let mut no_host_authentication_for_localhost = None;
-        let mut enable_ssh_keysign = None;
         let mut verify_host_key_dns = None;
         let mut address_family = None;
         let mut escape_char = None;
@@ -622,7 +623,6 @@ impl SshConfig {
                             remote_command: remote_command.take(),
                             add_keys_to_agent: add_keys_to_agent.take(),
                              no_host_authentication_for_localhost: no_host_authentication_for_localhost.take(),
-                             enable_ssh_keysign: enable_ssh_keysign.take(),
                              verify_host_key_dns: verify_host_key_dns.take(),
                              address_family: address_family.take(),
                              escape_char: escape_char.take(),
@@ -686,7 +686,6 @@ impl SshConfig {
                             remote_command: remote_command.take(),
                             add_keys_to_agent: add_keys_to_agent.take(),
                              no_host_authentication_for_localhost: no_host_authentication_for_localhost.take(),
-                             enable_ssh_keysign: enable_ssh_keysign.take(),
                              verify_host_key_dns: verify_host_key_dns.take(),
                              address_family: address_family.take(),
                              escape_char: escape_char.take(),
@@ -768,7 +767,7 @@ impl SshConfig {
                 "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
                     no_host_authentication_for_localhost = Some(yes(value))
                 }
-                "enablesshkeysign" | "enable_ssh_keysign" => enable_ssh_keysign = Some(yes(value)),
+
                 "verifyhostkeydns" | "verify_host_key_dns" => verify_host_key_dns = Some(value.to_string()),
                 "addressfamily" | "address_family" => address_family = Some(value.to_string()),
                 "escapechar" | "escape_char" => escape_char = Some(value.to_string()),
@@ -789,7 +788,10 @@ impl SshConfig {
                     pubkey_accepted_algorithms = Some(value.to_string());
                 }
                 "include" => { /* ignored */ }
-                _ => {}
+                _ => return Err(SshError::Config(format!(
+                    "unknown directive: {}",
+                    key
+                ))),
             }
         }
 
@@ -836,7 +838,6 @@ impl SshConfig {
                 remote_command: remote_command.clone(),
                 add_keys_to_agent: add_keys_to_agent.clone(),
                 no_host_authentication_for_localhost,
-                enable_ssh_keysign,
                 verify_host_key_dns: verify_host_key_dns.clone(),
                 address_family: address_family.clone(),
                 escape_char: escape_char.clone(),
@@ -900,7 +901,6 @@ impl SshConfig {
                     remote_command: remote_command.clone(),
                     add_keys_to_agent: add_keys_to_agent.clone(),
                     no_host_authentication_for_localhost,
-                    enable_ssh_keysign,
                     verify_host_key_dns: verify_host_key_dns.clone(),
                     address_family: address_family.clone(),
                     escape_char: escape_char.clone(),
@@ -920,16 +920,9 @@ impl SshConfig {
             });
         }
 
-        SshConfig { hosts, match_blocks }
+        Ok(SshConfig { hosts, match_blocks })
     }
 
-    pub fn find_host(&self, host: &str) -> Option<&HostConfig> {
-        self.hosts.iter().find(|h| {
-            h.host == host
-                || h.host.contains('*')
-                || glob_match(&h.host, host)
-        })
-    }
 }
 
 pub fn glob_match(pattern: &str, text: &str) -> bool {
@@ -1071,7 +1064,7 @@ pub fn parse_streamlocal_forward(spec: &str) -> Option<(String, String)> {
     Some((parts[0].to_string(), parts[1].to_string()))
 }
 
-pub fn parse_stdio_forward(spec: &str) -> Result<(String, u16), String> {
+pub fn parse_stdio_forward(spec: &str) -> std::result::Result<(String, u16), String> {
     let (host, port) = spec.rsplit_once(':').ok_or_else(|| format!("invalid stdio forward: {}", spec))?;
     let port: u16 = port.parse().map_err(|_| format!("invalid port: {}", port))?;
     if host.is_empty() {
@@ -1354,3 +1347,9 @@ mod tests {
         assert_eq!(cfg.hosts[0].port, Some(2222));
         assert_eq!(cfg.hosts[0].user.as_deref(), Some("alice"));
     }
+
+    #[test]
+    fn unknown_directive_in_host_block_is_fatal() {
+        assert!(SshConfig::parse("Host foo\n  TypoDirective yes\n").is_err());
+    }
+
