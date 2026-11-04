@@ -4,10 +4,15 @@ use crate::cipher::SshCipher;
 use crate::mac::SshMac;
 use crate::kex::*;
 use crate::msg;
-use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 pub const MAX_PACKET_SIZE: usize = 256 * 1024;
+
+/// Pseudo KEX algorithms from the strict-kex proposal (Terrapin mitigation).
+/// Each side advertises its own name; strict mode is active only when both the
+/// client's `...-c-...` and the server's `...-s-...` names were exchanged.
+pub const KEX_STRICT_CLIENT: &str = "kex-strict-c-v00@openssh.com";
+pub const KEX_STRICT_SERVER: &str = "kex-strict-s-v00@openssh.com";
 
 const DEFAULT_KEX: &[&str] = &[
     "curve25519-sha256",
@@ -83,7 +88,7 @@ fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&'a [String]>) -> Ve
             .chain(list.iter().skip(1).map(|s| s.trim()))
             .collect();
 
-            if let Some(rest) = first.strip_prefix('+') {
+            if let Some(_rest) = first.strip_prefix('+') {
                 // Append the listed algorithms to the defaults (dedup, keep order).
                 let mut out: Vec<&str> = defaults.to_vec();
                 for item in items {
@@ -136,6 +141,8 @@ pub struct AlgorithmNegotiation {
     pub server_to_client_mac: String,
     pub client_to_server_compression: String,
     pub server_to_client_compression: String,
+    /// Both strict-kex pseudo algorithms were present in the exchange.
+    pub strict_kex: bool,
 }
 
 pub struct SshTransport {
@@ -148,6 +155,14 @@ pub struct SshTransport {
     pub server_to_client_mac: Option<Box<dyn SshMac>>,
     pub client_to_server_compression: String,
     pub server_to_client_compression: String,
+    /// Strict KEX was negotiated (both pseudo algorithms were advertised).
+    /// When true, non-KEX packets are rejected during key exchange and the
+    /// sequence numbers reset to zero after NEWKEYS.
+    pub strict_kex: bool,
+    /// The peer's KEXINIT for the current exchange has been received. Until
+    /// that point generic packets already in flight are legal (strict KEX only
+    /// binds senders after they know the exchange started).
+    pub strict_kex_peer_kexinit: bool,
     pub compression_active_c2s: bool,
     pub compression_active_s2c: bool,
     pub compression_enabled: bool,
@@ -183,6 +198,8 @@ impl SshTransport {
             server_to_client_mac: None,
             client_to_server_compression: "none".to_string(),
             server_to_client_compression: "none".to_string(),
+            strict_kex: false,
+            strict_kex_peer_kexinit: false,
             compression_active_c2s: false,
             compression_active_s2c: false,
             compression_enabled: true,
@@ -208,6 +225,7 @@ impl SshTransport {
         kex_algorithms: Option<&[String]>,
         ciphers: Option<&[String]>,
         macs: Option<&[String]>,
+        is_server: bool,
     ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(msg::SSH_MSG_KEXINIT);
@@ -215,7 +233,11 @@ impl SshTransport {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
         payload.extend_from_slice(&cookie);
 
-        let kex_list: Vec<&str> = filter_algos(DEFAULT_KEX, kex_algorithms);
+        let mut kex_list: Vec<&str> = filter_algos(DEFAULT_KEX, kex_algorithms);
+        // Terrapin mitigation: always advertise our strict-kex pseudo algorithm.
+        // The peer detects it in this name-list; it is never selected as a real
+        // key exchange (see `choose_kex_algorithm`).
+        kex_list.push(if is_server { KEX_STRICT_SERVER } else { KEX_STRICT_CLIENT });
         payload.extend(encode_name_list(&kex_list));
 
         let host_key_list: Vec<&str> = match host_key_algorithms {
@@ -253,6 +275,9 @@ impl SshTransport {
     }
 
     pub fn prepare_rekey(&mut self, is_server: bool) -> Vec<u8> {
+        // A fresh exchange starts; in-flight generic packets are legal until
+        // the peer's KEXINIT arrives.
+        self.strict_kex_peer_kexinit = false;
         let mut cookie = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
         let mut payload = Vec::new();
@@ -306,7 +331,12 @@ impl SshTransport {
         let server_comps_cs = SshNameList::decode(&mut sr)?;
         let server_comps_sc = SshNameList::decode(&mut sr)?;
 
-        let kex = choose_algorithm(&client_kex_algos.0, &server_kex_algos.0)
+        // Strict KEX (Terrapin mitigation) requires the client to advertise
+        // `-c-` and the server to advertise `-s-`; either name alone is inert.
+        let strict_kex = client_kex_algos.0.iter().any(|a| a == KEX_STRICT_CLIENT)
+            && server_kex_algos.0.iter().any(|a| a == KEX_STRICT_SERVER);
+
+        let kex = choose_kex_algorithm(&client_kex_algos.0, &server_kex_algos.0)
             .ok_or_else(|| SshError::KexFailed("no common key exchange algorithm".into()))?;
         let host_key = choose_algorithm(&client_host_key.0, &server_host_key.0)
             .ok_or_else(|| SshError::KexFailed("no common host key algorithm".into()))?;
@@ -345,7 +375,43 @@ impl SshTransport {
             server_to_client_mac: mac_sc,
             client_to_server_compression: comp_cs,
             server_to_client_compression: comp_sc,
+            strict_kex,
         })
+    }
+
+    /// Message types allowed on the wire while a strict KEX is in progress.
+    /// The Terrapin draft forbids generic transport messages (IGNORE, DEBUG,
+    /// UNIMPLEMENTED, EXT_INFO) between KEXINIT and NEWKEYS.
+    pub fn is_allowed_during_strict_kex(msg_type: u8) -> bool {
+        matches!(msg_type, msg::SSH_MSG_DISCONNECT | msg::SSH_MSG_KEXINIT | msg::SSH_MSG_NEWKEYS)
+            || (msg::SSH_MSG_KEXDH_INIT..=msg::SSH_MSG_KEX_DH_GEX_REQUEST).contains(&msg_type)
+    }
+
+    /// Reject a non-KEX packet received while strict KEX is active. Called from
+    /// every packet reader so the rule applies uniformly to core, client-local
+    /// and server-local transport implementations.
+    pub fn check_strict_kex_packet(&self, payload: &[u8]) -> Result<()> {
+        if !self.strict_kex || !self.strict_kex_peer_kexinit || self.state == KexState::Established {
+            return Ok(());
+        }
+        match payload.first() {
+            Some(&t) if Self::is_allowed_during_strict_kex(t) => Ok(()),
+            Some(&t) => Err(SshError::Protocol(format!(
+                "strict KEX: message {} is not allowed during key exchange (state={:?}, incoming_seq={})",
+                t, self.state, self.incoming_seq
+            ))),
+            None => Err(SshError::Protocol("strict KEX: empty packet".into())),
+        }
+    }
+
+    /// After both NEWKEYS have crossed under strict KEX, both sequence
+    /// numbers restart at zero. In non-strict mode they keep counting (as
+    /// OpenSSH did before strict KEX existed).
+    pub fn reset_sequences_after_newkeys(&mut self) {
+        if self.strict_kex {
+            self.outgoing_seq = 0;
+            self.incoming_seq = 0;
+        }
     }
 
     pub fn create_kex_algorithm(name: &str) -> Result<Box<dyn KexAlgorithm>> {
@@ -383,6 +449,9 @@ impl SshTransport {
             "ext-info-c" | "ext-info-s" => {
                 Err(SshError::UnsupportedAlgorithm("ext-info is a pseudo-kex, not negotiable alone".into()))
             }
+            KEX_STRICT_CLIENT | KEX_STRICT_SERVER => Err(SshError::UnsupportedAlgorithm(
+                "strict-kex is a pseudo-kex, not negotiable alone".into(),
+            )),
             _ => Err(SshError::UnsupportedAlgorithm(format!("kex: {}", name))),
         }
     }
@@ -449,6 +518,20 @@ fn choose_algorithm(client: &[String], server: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Like `choose_algorithm`, but never returns a pseudo algorithm: strict-kex
+/// names appear in the KEX name-list yet have no key exchange implementation.
+fn choose_kex_algorithm(client: &[String], server: &[String]) -> Option<String> {
+    client
+        .iter()
+        .filter(|c| !is_pseudo_kex(c))
+        .find(|c| server.contains(c))
+        .cloned()
+}
+
+fn is_pseudo_kex(name: &str) -> bool {
+    name == KEX_STRICT_CLIENT || name == KEX_STRICT_SERVER || name == "ext-info-c" || name == "ext-info-s"
 }
 
 pub async fn send_version_string(stream: &mut (impl AsyncWrite + Unpin), version: &[u8]) -> Result<()> {
@@ -605,7 +688,7 @@ pub async fn send_encrypted_packet(
     let mac = transport.client_to_server_mac.as_ref();
     let block_size = cipher.block_size().max(8);
     let seq = transport.outgoing_seq;
-    let mut wire_len: usize;
+    let wire_len: usize;
 
     if is_aead {
         let chachapoly = cipher.is_chachapoly();
@@ -704,6 +787,7 @@ pub async fn receive_encrypted_packet(
         let payload = receive_raw_packet(stream).await?;
         let base = 1 + payload.len();
         transport.bytes_in += (4 + base + compute_packet_padding(base, 8, true)) as u64;
+        transport.check_strict_kex_packet(&payload)?;
         return Ok(payload);
     }
 
@@ -781,15 +865,17 @@ pub async fn receive_encrypted_packet(
         payload
     };
 
-    if !is_newkeys
+    let payload = if !is_newkeys
         && (transport.server_to_client_compression == "zlib"
             || (transport.server_to_client_compression == "zlib@openssh.com"
                 && transport.compression_active_s2c))
     {
-        Ok(zlib_decompress(&payload)?)
+        zlib_decompress(&payload)?
     } else {
-        Ok(payload)
-    }
+        payload
+    };
+    transport.check_strict_kex_packet(&payload)?;
+    Ok(payload)
 }
 
 pub async fn send_encrypted_packet_server(
@@ -819,7 +905,7 @@ pub async fn send_encrypted_packet_server(
     let mac = transport.server_to_client_mac.as_ref().unwrap();
     let block_size = cipher.block_size().max(8);
     let seq = transport.outgoing_seq;
-    let mut wire_len: usize;
+    let wire_len: usize;
 
     if is_aead {
         let chachapoly = cipher.is_chachapoly();
@@ -915,6 +1001,7 @@ pub async fn receive_encrypted_packet_server(
         let payload = receive_raw_packet(stream).await?;
         let base = 1 + payload.len();
         transport.bytes_in += (4 + base + compute_packet_padding(base, 8, true)) as u64;
+        transport.check_strict_kex_packet(&payload)?;
         return Ok(payload);
     }
 
@@ -989,15 +1076,17 @@ pub async fn receive_encrypted_packet_server(
         payload
     };
 
-    if !is_newkeys
+    let payload = if !is_newkeys
         && (transport.client_to_server_compression == "zlib"
             || (transport.client_to_server_compression == "zlib@openssh.com"
                 && transport.compression_active_c2s))
     {
-        Ok(zlib_decompress(&payload)?)
+        zlib_decompress(&payload)?
     } else {
-        Ok(payload)
-    }
+        payload
+    };
+    transport.check_strict_kex_packet(&payload)?;
+    Ok(payload)
 }
 
 /// Read an ETM packet: packet_length is cleartext, the MAC covers
@@ -1165,10 +1254,10 @@ mod tests {
         // Both sides enable compression -> zlib is chosen (RFC 4253 order).
         let mut c = SshTransport::new();
         c.compression_enabled = true;
-        let c_init = c.build_kex_init(None, None, None, None);
+        let c_init = c.build_kex_init(None, None, None, None, false);
         let mut s = SshTransport::new();
         s.compression_enabled = true;
-        let s_init = s.build_kex_init(None, None, None, None);
+        let s_init = s.build_kex_init(None, None, None, None, true);
         let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
         assert_eq!(neg.client_to_server_compression, "zlib@openssh.com");
         assert_eq!(neg.server_to_client_compression, "zlib@openssh.com");
@@ -1176,13 +1265,75 @@ mod tests {
         // Both disabled (the default) -> none is chosen.
         let mut c2 = SshTransport::new();
         c2.compression_enabled = false;
-        let c2_init = c2.build_kex_init(None, None, None, None);
+        let c2_init = c2.build_kex_init(None, None, None, None, false);
         let mut s2 = SshTransport::new();
         s2.compression_enabled = false;
-        let s2_init = s2.build_kex_init(None, None, None, None);
+        let s2_init = s2.build_kex_init(None, None, None, None, true);
         let neg2 = SshTransport::negotiate_algorithms(&c2_init, &s2_init).unwrap();
         assert_eq!(neg2.client_to_server_compression, "none");
         assert_eq!(neg2.server_to_client_compression, "none");
+    }
+
+    #[test]
+    fn strict_kex_is_enabled_only_when_both_sides_advertise_it() {
+        let mut c = SshTransport::new();
+        let c_init = c.build_kex_init(None, None, None, None, false);
+        let mut s = SshTransport::new();
+        let s_init = s.build_kex_init(None, None, None, None, true);
+
+        let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
+        assert!(neg.strict_kex);
+        // The pseudo algorithm must never be selected as the real KEX.
+        assert!(!is_pseudo_kex(&neg.kex_algorithm));
+
+        // A peer that advertises only the client pseudo (an older server that
+        // does not implement strict KEX) leaves strict mode off, preserving
+        // compatibility.
+        let mut legacy_server = SshTransport::new();
+        let legacy_init = legacy_server.build_kex_init(None, None, None, None, false);
+        let neg_legacy = SshTransport::negotiate_algorithms(&c_init, &legacy_init).unwrap();
+        assert!(!neg_legacy.strict_kex);
+    }
+
+    #[test]
+    fn strict_kex_rejects_non_kex_packets_until_newkeys() {
+        let mut t = SshTransport::new();
+        t.strict_kex = true;
+        t.state = KexState::KexDhInitSent;
+
+        // Before the peer's KEXINIT arrives, packets already in flight are
+        // legal (strict KEX only binds senders once the exchange is known).
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_CHANNEL_WINDOW_ADJUST]).is_ok());
+
+        t.strict_kex_peer_kexinit = true;
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_IGNORE]).is_err());
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_DEBUG]).is_err());
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_KEXINIT]).is_ok());
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_KEXDH_INIT]).is_ok());
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_NEWKEYS]).is_ok());
+
+        // After NEWKEYS generic messages are legal again.
+        t.state = KexState::Established;
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_IGNORE]).is_ok());
+    }
+
+    #[test]
+    fn strict_kex_resets_sequence_numbers_after_newkeys() {
+        let mut t = SshTransport::new();
+        t.strict_kex = true;
+        t.outgoing_seq = 3;
+        t.incoming_seq = 2;
+        t.reset_sequences_after_newkeys();
+        assert_eq!(t.outgoing_seq, 0);
+        assert_eq!(t.incoming_seq, 0);
+
+        // Without strict KEX the counters must keep counting.
+        let mut plain = SshTransport::new();
+        plain.outgoing_seq = 3;
+        plain.incoming_seq = 2;
+        plain.reset_sequences_after_newkeys();
+        assert_eq!(plain.outgoing_seq, 3);
+        assert_eq!(plain.incoming_seq, 2);
     }
 
     /// Build a raw packet body: padding_length, payload, padding.
