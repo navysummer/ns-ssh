@@ -773,6 +773,7 @@ impl SshConfig {
                 "ciphers" | "ciphers_strict" => ciphers = Some(value.to_string()),
                 "macs" | "macs_strict" => macs = Some(value.to_string()),
                 "loglevel" | "log_level" | "verbose" => log_level = Some(value.to_string()),
+                "logverbose" | "log_verbose" => log_level = Some("VERBOSE".to_string()),
                 "exitonforwardfailure" | "exit_on_forward_failure" => exit_on_forward_failure = Some(yes(value)),
                 "sendenv" | "send_env" => for tok in value.split_whitespace() { push_list(&mut send_env, tok); },
                 "setenv" | "set_env" => for tok in value.split_whitespace() { push_list(&mut set_env, tok); },
