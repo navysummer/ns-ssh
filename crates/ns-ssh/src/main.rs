@@ -1707,6 +1707,18 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
     let mut resolved = ResolvedConfig::default_for_user(&default_user);
 
     if let Some(ref target) = args.target {
+        // Configuration tags accumulated while scanning the config (OpenSSH
+        // `Tag` / `Match tagged`). Command-line `-o Tag=...` is processed
+        // first by OpenSSH, so those tags are visible to every block.
+        let mut tags: Vec<String> = Vec::new();
+        for opt in &args.options {
+            if let Some((k, v)) = opt.trim().split_once('=') {
+                if k.trim().eq_ignore_ascii_case("tag") {
+                    tags.extend(v.trim().split_whitespace().map(|s| s.to_string()));
+                }
+            }
+        }
+
         let host_configs: Vec<&config::HostConfig> = ssh_config.hosts.iter().filter(|h| {
             let t = target.as_str();
             h.host.split(',').map(str::trim).any(|p| {
@@ -1719,6 +1731,7 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
         }).collect();
 
         for host_config in host_configs {
+            tags.extend(host_config.tags.iter().cloned());
             if resolved.hostname.is_empty() {
                 resolved.hostname = host_config.hostname.clone().unwrap_or_else(|| target.clone());
             } else if let Some(h) = &host_config.hostname {
@@ -1993,9 +2006,11 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
         // Apply matching Match blocks (OpenSSH: Match blocks are applied AFTER Host blocks)
         let target_host = target.as_str();
         for match_block in &ssh_config.match_blocks {
-            if !match_block.matches(target_host, &resolved.user) {
+            if !match_block.matches(target_host, &resolved.user, &tags) {
                 continue;
             }
+            // Tags set by a matching block become visible to subsequent blocks.
+            tags.extend(match_block.config.tags.iter().cloned());
             let mc = &match_block.config;
             if resolved.hostname.is_empty() {
                 resolved.hostname = mc.hostname.clone().unwrap_or_else(|| target.clone());

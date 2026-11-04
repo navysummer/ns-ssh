@@ -97,6 +97,10 @@ pub struct HostConfig {
     pub tcp_keep_alive: Option<bool>,
     /// IPQoS: raw value (`[interactive [bulk]]`, class names or integers).
     pub ip_qos: Option<String>,
+    /// Tag: configuration tags accumulated in this block, matchable by
+    /// `Match tagged`.
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub batch_mode: Option<bool>,
     #[serde(default)]
@@ -226,7 +230,8 @@ pub struct MatchConfig {
 
 impl MatchConfig {
     /// Check whether this Match block applies to the given host and user.
-    pub fn matches(&self, target_host: &str, target_user: &str) -> bool {
+    /// `tags` are the configuration tags accumulated so far (see `Tag`).
+    pub fn matches(&self, target_host: &str, target_user: &str, tags: &[String]) -> bool {
         for (key, value) in &self.conditions {
             match key.as_str() {
                 "host" => {
@@ -243,11 +248,32 @@ impl MatchConfig {
                     });
                     if !matched { return false; }
                 }
+                "tagged" => {
+                    // Pattern list: a negated pattern matching an active tag
+                    // fails the condition; otherwise at least one pattern must
+                    // be satisfied (a positive match, or a negated pattern
+                    // that does not match — consistent with Host handling).
+                    let matched = value.split(',').any(|p| {
+                        let p = p.trim();
+                        if let Some(neg) = p.strip_prefix('!') {
+                            !tags.iter().any(|t| tag_pattern_match(neg, t))
+                        } else {
+                            tags.iter().any(|t| tag_pattern_match(p, t))
+                        }
+                    });
+                    if !matched { return false; }
+                }
                 _ => {} // unknown conditions are ignored
             }
         }
         true
     }
+}
+
+/// Match a tag against a pattern (exact or `*`/`?` glob), like OpenSSH's
+/// `Match tagged`.
+fn tag_pattern_match(pattern: &str, tag: &str) -> bool {
+    pattern == tag || ((pattern.contains('*') || pattern.contains('?')) && glob_match(pattern, tag))
 }
 
 #[derive(Debug, Clone)]
@@ -789,6 +815,7 @@ impl SshConfig {
         let mut server_alive_count_max = None;
         let mut tcp_keep_alive = None;
         let mut ip_qos = None;
+        let mut tags: Vec<String> = Vec::new();
         let mut batch_mode = None;
         let mut password_authentication = None;
         let mut pubkey_authentication = None;
@@ -843,6 +870,99 @@ impl SshConfig {
         let mut canonicalize_permitted_cnames: Option<Vec<String>> = None;
         let mut update_host_keys: Option<String> = None;
 
+        // Flush the pending Match block (if any) into `match_blocks`. Uses
+        // take() semantics so directives never leak into the next block;
+        // previously only the trailing Match block was flushed and any
+        // earlier ones silently merged into it.
+        macro_rules! flush_match_block {
+            () => {
+                if let Some(conditions) = current_match_conditions.take() {
+                    match_blocks.push(MatchConfig {
+                        conditions,
+                        config: HostConfig {
+                            host: String::new(),
+                            hostname: hostname.take(),
+                            user: user.take(),
+                            port: port.take(),
+                            identity_file: identity_file.take(),
+                            certificate_file: certificate_file.take(),
+                            identities_only: identities_only.take(),
+                            forward_agent: forward_agent.take(),
+                            forward_x11: forward_x11.take(),
+                            forward_x11_trusted: forward_x11_trusted.take(),
+                            forward_x11_timeout: forward_x11_timeout.take(),
+                            stream_local_bind_mask: stream_local_bind_mask.take(),
+                            stream_local_bind_unlink: stream_local_bind_unlink.take(),
+                            compression: compression.take(),
+                            strict_host_key_checking: strict_host_key_checking.take(),
+                            hash_known_hosts: hash_known_hosts.take(),
+                            user_known_hosts_file: user_known_hosts_file.take(),
+                            global_known_hosts_file: global_known_hosts_file.take(),
+                            connect_timeout: connect_timeout.take(),
+                            server_alive_interval: server_alive_interval.take(),
+                            server_alive_count_max: server_alive_count_max.take(),
+                            tcp_keep_alive: tcp_keep_alive.take(),
+                            ip_qos: ip_qos.take(),
+                            tags: std::mem::take(&mut tags),
+                            batch_mode: batch_mode.take(),
+                            password_authentication: password_authentication.take(),
+                            pubkey_authentication: pubkey_authentication.take(),
+                            kbd_interactive_authentication: kbd_interactive_authentication.take(),
+                            preferred_authentications: preferred_authentications.take(),
+                            host_key_algorithms: host_key_algorithms.take(),
+                            kex_algorithms: kex_algorithms.take(),
+                            ciphers: ciphers.take(),
+                            macs: macs.take(),
+                            log_level: log_level.take(),
+                            exit_on_forward_failure: exit_on_forward_failure.take(),
+                            send_env: send_env.take(),
+                            set_env: set_env.take(),
+                            proxy_jump: proxy_jump.take(),
+                            proxy_command: proxy_command.take(),
+                            bind_address: bind_address.take(),
+                            local_forward: local_forward.take(),
+                            remote_forward: remote_forward.take(),
+                            dynamic_forward: dynamic_forward.take(),
+                            request_tty: request_tty.take(),
+                            remote_command: remote_command.take(),
+                            add_keys_to_agent: add_keys_to_agent.take(),
+                            no_host_authentication_for_localhost: no_host_authentication_for_localhost.take(),
+                            verify_host_key_dns: verify_host_key_dns.take(),
+                            address_family: address_family.take(),
+                            escape_char: escape_char.take(),
+                            subsystem: subsystem.take(),
+                            local_command: local_command.take(),
+                            permit_local_command: permit_local_command.take(),
+                            host_key_alias: host_key_alias.take(),
+                            fingerprint_hash: fingerprint_hash.take(),
+                            visual_host_key: visual_host_key.take(),
+                            check_host_ip: check_host_ip.take(),
+                            number_of_password_prompts: number_of_password_prompts.take(),
+                            connection_attempts: connection_attempts.take(),
+                            rekey_limit: rekey_limit.take(),
+                            identity_agent: identity_agent.take(),
+                            pubkey_accepted_algorithms: pubkey_accepted_algorithms.take(),
+                            control_master: control_master.take(),
+                            control_path: control_path.take(),
+                            control_persist: control_persist.take(),
+                            gateway_ports: gateway_ports.take(),
+                            clear_all_forwardings: clear_all_forwardings.take(),
+                            required_rsa_size: required_rsa_size.take(),
+                            permit_remote_open: permit_remote_open.take(),
+                            channel_timeouts: channel_timeouts.take(),
+                            known_hosts_command: known_hosts_command.take(),
+                            canonicalize_hostname: canonicalize_hostname.take(),
+                            canonical_domains: canonical_domains.take(),
+                            canonicalize_max_dots: canonicalize_max_dots.take(),
+                            canonicalize_fallback_local: canonicalize_fallback_local.take(),
+                            canonicalize_permitted_cnames: canonicalize_permitted_cnames.take(),
+                            update_host_keys: update_host_keys.take(),
+                        },
+                    });
+                }
+            };
+        }
+
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
         let push_list = |list: &mut Option<Vec<String>>, v: &str| {
@@ -861,6 +981,8 @@ impl SshConfig {
 
             match key.as_str() {
                 "host" => {
+                    // A new Host block ends any open Match block.
+                    flush_match_block!();
                     if let Some(h) = current_host.take() {
                         hosts.push(HostConfig {
                             host: h,
@@ -886,6 +1008,7 @@ impl SshConfig {
                             server_alive_count_max: server_alive_count_max.take(),
                             tcp_keep_alive: tcp_keep_alive.take(),
                             ip_qos: ip_qos.take(),
+                            tags: std::mem::take(&mut tags),
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
@@ -970,6 +1093,7 @@ impl SshConfig {
                             server_alive_count_max: server_alive_count_max.take(),
                             tcp_keep_alive: tcp_keep_alive.take(),
                             ip_qos: ip_qos.take(),
+                            tags: std::mem::take(&mut tags),
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
@@ -1026,6 +1150,7 @@ impl SshConfig {
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
+                    flush_match_block!();
                     let mut conditions = Vec::new();
                     for cond in value.split(',') {
                         let cond = cond.trim();
@@ -1071,6 +1196,11 @@ impl SshConfig {
                 "serveralivecountmax" | "server_alive_count_max" => server_alive_count_max = parse_u32(value),
                 "tcpkeepalive" | "tcp_keep_alive" => tcp_keep_alive = Some(yes(value)),
                 "ipqos" | "ip_qos" => ip_qos = Some(value.to_string()),
+                "tag" => {
+                    // OpenSSH: one tag per directive; repeated directives and
+                    // whitespace-separated tokens accumulate within the block.
+                    tags.extend(value.split_whitespace().map(|s| s.to_string()));
+                }
                 "batchmode" | "batch_mode" => batch_mode = Some(yes(value)),
                 "passwordauthentication" | "password_authentication" => password_authentication = Some(yes(value)),
                 "pubkeyauthentication" | "pubkey_authentication" => pubkey_authentication = Some(yes(value)),
@@ -1256,6 +1386,7 @@ impl SshConfig {
                 server_alive_count_max,
                 tcp_keep_alive,
                 ip_qos: ip_qos.clone(),
+                tags: tags.clone(),
                 batch_mode,
                 password_authentication,
                 pubkey_authentication,
@@ -1313,89 +1444,7 @@ impl SshConfig {
         }
 
         // Flush any remaining match block
-        if let Some(conditions) = current_match_conditions {
-            match_blocks.push(MatchConfig {
-                conditions,
-                config: HostConfig {
-                    host: String::new(),
-                    hostname: hostname.clone(),
-                    user: user.clone(),
-                    port,
-                    identity_file: identity_file.clone(),
-                certificate_file: certificate_file.clone(),
-                    identities_only,
-                    forward_agent,
-                    forward_x11,
-                    forward_x11_trusted,
-                    forward_x11_timeout,
-                    stream_local_bind_mask,
-                    stream_local_bind_unlink,
-                    compression,
-                    strict_host_key_checking: strict_host_key_checking.clone(),
-                    hash_known_hosts,
-                    user_known_hosts_file: user_known_hosts_file.clone(),
-                    global_known_hosts_file: global_known_hosts_file.clone(),
-                    connect_timeout,
-                    server_alive_interval,
-                    server_alive_count_max,
-                    tcp_keep_alive,
-                    ip_qos: ip_qos.clone(),
-                    batch_mode,
-                    password_authentication,
-                    pubkey_authentication,
-                    kbd_interactive_authentication,
-                    preferred_authentications: preferred_authentications.clone(),
-                    host_key_algorithms: host_key_algorithms.clone(),
-                    kex_algorithms: kex_algorithms.clone(),
-                    ciphers: ciphers.clone(),
-                    macs: macs.clone(),
-                    log_level: log_level.clone(),
-                    exit_on_forward_failure,
-                    send_env: send_env.clone(),
-                    set_env: set_env.clone(),
-                    proxy_jump: proxy_jump.clone(),
-                    proxy_command: proxy_command.clone(),
-                    bind_address: bind_address.clone(),
-                    local_forward: local_forward.clone(),
-                    remote_forward: remote_forward.clone(),
-                    dynamic_forward: dynamic_forward.clone(),
-                    request_tty: request_tty.clone(),
-                    remote_command: remote_command.clone(),
-                    add_keys_to_agent: add_keys_to_agent.clone(),
-                    no_host_authentication_for_localhost,
-                    verify_host_key_dns: verify_host_key_dns.clone(),
-                    address_family: address_family.clone(),
-                    escape_char: escape_char.clone(),
-                    subsystem: subsystem.clone(),
-                    local_command: local_command.clone(),
-                    permit_local_command: permit_local_command.clone(),
-                    host_key_alias: host_key_alias.clone(),
-                    fingerprint_hash: fingerprint_hash.clone(),
-                    visual_host_key: visual_host_key.clone(),
-                    check_host_ip: check_host_ip.clone(),
-                    number_of_password_prompts: number_of_password_prompts.clone(),
-                    connection_attempts: connection_attempts.clone(),
-                    rekey_limit: rekey_limit.clone(),
-                    identity_agent: identity_agent.clone(),
-                    pubkey_accepted_algorithms: pubkey_accepted_algorithms.clone(),
-                    control_master: control_master.clone(),
-                    control_path: control_path.clone(),
-                    control_persist: control_persist.clone(),
-                    gateway_ports,
-                    clear_all_forwardings,
-                    required_rsa_size,
-                    permit_remote_open: permit_remote_open.clone(),
-                    channel_timeouts: channel_timeouts.clone(),
-                    known_hosts_command: known_hosts_command.clone(),
-                    canonicalize_hostname: canonicalize_hostname.clone(),
-                    canonical_domains: canonical_domains.clone(),
-                    canonicalize_max_dots,
-                    canonicalize_fallback_local,
-                    canonicalize_permitted_cnames: canonicalize_permitted_cnames.clone(),
-                    update_host_keys: update_host_keys.clone(),
-                },
-            });
-        }
+        flush_match_block!();
 
         Ok(SshConfig { hosts, match_blocks })
     }
@@ -1953,6 +2002,39 @@ mod tests {
         assert_eq!(parse_forward_spec(""), None);
         assert_eq!(parse_forward_spec("8080"), None);
         assert_eq!(parse_forward_spec("a:b:c:d:e"), None);
+    }
+
+    #[test]
+    fn tag_directive_and_match_tagged() {
+        let cfg = SshConfig::parse(
+            "\
+Host bastion
+  Tag jump
+  Tag extra
+
+Match tagged jump
+  ForwardAgent yes
+
+Match tagged missing
+  ForwardX11 yes
+
+Match tagged !jump
+  Compression yes
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.hosts[0].tags, vec!["jump", "extra"]);
+
+        let tags = vec!["jump".to_string(), "extra".to_string()];
+        let no_tags: Vec<String> = Vec::new();
+        // `Match tagged jump` applies when the tag is active.
+        assert!(cfg.match_blocks[0].matches("bastion", "u", &tags));
+        assert!(!cfg.match_blocks[0].matches("bastion", "u", &no_tags));
+        // `Match tagged missing` does not apply.
+        assert!(!cfg.match_blocks[1].matches("bastion", "u", &tags));
+        // `Match tagged !jump` applies only when the tag is absent.
+        assert!(!cfg.match_blocks[2].matches("bastion", "u", &tags));
+        assert!(cfg.match_blocks[2].matches("bastion", "u", &no_tags));
     }
 
     #[test]
