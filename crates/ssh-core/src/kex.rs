@@ -98,7 +98,7 @@ impl KexExchange {
         // selected explicitly rather than inferred from the value.
         buf.clear();
         if public_keys_as_mpint {
-            SshMpInt(client_public_key.to_vec()).encode(&mut buf).unwrap();
+            SshMpInt::from_bytes_be(client_public_key).encode(&mut buf).unwrap();
         } else {
             SshString(client_public_key.to_vec()).encode(&mut buf).unwrap();
         }
@@ -106,14 +106,19 @@ impl KexExchange {
 
         buf.clear();
         if public_keys_as_mpint {
-            SshMpInt(server_public_key.to_vec()).encode(&mut buf).unwrap();
+            SshMpInt::from_bytes_be(server_public_key).encode(&mut buf).unwrap();
         } else {
             SshString(server_public_key.to_vec()).encode(&mut buf).unwrap();
         }
         hasher.update(&buf);
 
         buf.clear();
-        SshMpInt(shared_secret.to_vec()).encode(&mut buf).unwrap();
+        // `K` is an mpint (RFC 4253 §8). The raw ECDH secret for P-521 is 66
+        // bytes wide with a leading zero about half the time (the field is only
+        // 521 bits); mpint canonical form strips leading zero bytes, and
+        // OpenSSH does the same. Keeping them made the exchange hash differ on
+        // ~half of P-521 handshakes ("Host key verification failed").
+        SshMpInt::from_bytes_be(shared_secret).encode(&mut buf).unwrap();
         hasher.update(&buf);
 
         hasher.finalize()
@@ -288,7 +293,7 @@ pub fn select_gex_group(min: u32, nbits: u32, max: u32) -> Option<GexGroup> {
             // Prefer the size closest to `nbits`; on a tie keep the larger
             // (more conservative) group since iteration is ascending.
             Some((prev, _, _)) => {
-                (u64::from(bits).abs_diff(target) <= u64::from(prev).abs_diff(target))
+                u64::from(bits).abs_diff(target) <= u64::from(prev).abs_diff(target)
             }
         };
         if better {
@@ -344,7 +349,7 @@ pub fn compute_gex_exchange_hash(
     hasher.update(&buf); buf.clear();
     SshMpInt(server_public_key.to_vec()).encode(&mut buf).unwrap();
     hasher.update(&buf); buf.clear();
-    SshMpInt(shared_secret.to_vec()).encode(&mut buf).unwrap();
+    SshMpInt::from_bytes_be(shared_secret).encode(&mut buf).unwrap();
     hasher.update(&buf); buf.clear();
 
     hasher.finalize()
@@ -443,8 +448,12 @@ pub fn derive_key(
     let mut hasher = Khasher::new(hash_name);
 
     use crate::encoding::SshMpInt;
+    // RFC 4253 §7.2 feeds K into the key derivation function in the same
+    // canonical mpint form as the exchange hash. A raw P-521 x-coordinate can
+    // be 66 bytes with a leading zero; encoding it untrimmed produced keys
+    // that disagreed with OpenSSH whenever that byte was zero.
     let mut buf = Vec::new();
-    SshMpInt(shared_secret.to_vec()).encode(&mut buf).unwrap();
+    SshMpInt::from_bytes_be(shared_secret).encode(&mut buf).unwrap();
     hasher.update(&buf);
 
     hasher.update(exchange_hash);
@@ -463,7 +472,7 @@ pub fn derive_key(
     while out.len() < key_len {
         let mut h = Khasher::new(hash_name);
         let mut b = Vec::new();
-        SshMpInt(shared_secret.to_vec()).encode(&mut b).unwrap();
+        SshMpInt::from_bytes_be(shared_secret).encode(&mut b).unwrap();
         h.update(&b);
         h.update(exchange_hash);
         h.update(&out);
@@ -700,5 +709,35 @@ fn exchange_hash_encodes_ephemeral_keys_by_family() {
     assert_eq!(
         compute_exchange_hash("sha256", &exchange, b"k", &low_bit, &low_bit, &shared, true),
         compute_exchange_hash("sha256", &exchange, b"k", &low_bit, &low_bit, &shared, false),
+    );
+}
+
+#[test]
+fn exchange_hash_uses_canonical_mpints_for_shared_secret() {
+    // P-521 field elements are 521 bits, so their raw 66-byte encoding starts
+    // with 0x00 about half the time. mpint canonical form strips leading zero
+    // bytes and OpenSSH does the same, so the exchange hash must not depend on
+    // the untrimmed width.
+    let exchange = KexExchange {
+        client_version: b"SSH-2.0-test".to_vec(),
+        server_version: b"SSH-2.0-test".to_vec(),
+        client_kex_init: vec![crate::msg::SSH_MSG_KEXINIT],
+        server_kex_init: vec![crate::msg::SSH_MSG_KEXINIT],
+    };
+    let pub_key = vec![0x01u8, 0x02];
+    let trimmed = compute_exchange_hash(
+        "sha512", &exchange, b"hostkey", &pub_key, &pub_key, &[0x01], true,
+    );
+    let with_leading_zero = compute_exchange_hash(
+        "sha512", &exchange, b"hostkey", &pub_key, &pub_key, &[0x00, 0x01], true,
+    );
+    assert_eq!(trimmed, with_leading_zero);
+
+    // Key derivation also consumes K as a canonical mpint (RFC 4253 §7.2).
+    let hash = [0xabu8; 32];
+    let session = [0xcdu8; 20];
+    assert_eq!(
+        derive_encryption_key("sha512", &[0x01], &hash, &session, 32),
+        derive_encryption_key("sha512", &[0x00, 0x01], &hash, &session, 32),
     );
 }
