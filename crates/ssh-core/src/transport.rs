@@ -59,7 +59,6 @@ const DEFAULT_MACS: &[&str] = &[
     "hmac-sha2-512",
     "hmac-sha1",
     "hmac-sha1-96",
-    "none",
 ];
 
 /// Return the default supported algorithms for a `-Q` query (key/cipher/mac/kex).
@@ -1207,6 +1206,9 @@ mod tests {
         assert!(cipher.contains(&"chacha20-poly1305@openssh.com"));
         let mac = supported_algorithms("mac").unwrap();
         assert!(mac.contains(&"hmac-sha2-256-etm@openssh.com"));
+        // OpenSSH never advertises `none` as a MAC; doing so would let a peer
+        // negotiate an unauthenticated channel (Terrapin-class downgrade).
+        assert!(!mac.contains(&"none"));
         let kex = supported_algorithms("kex").unwrap();
         assert!(kex.contains(&"curve25519-sha256"));
         assert!(supported_algorithms("nonsense").is_none());
