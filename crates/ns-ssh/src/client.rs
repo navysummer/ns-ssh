@@ -1118,6 +1118,30 @@ impl SshClient {
         for key_path in &identity_files {
             match crate::agent::load_private_key(key_path) {
                 Ok(signer) => {
+                    // CertificateFile, or the implicit `<key>-cert.pub` OpenSSH
+                    // looks for next to the private key.
+                    let cert_path = self.config.certificate_file.clone().or_else(|| {
+                        Some(std::path::PathBuf::from(format!(
+                            "{}-cert.pub",
+                            key_path.display()
+                        )))
+                    });
+                    if let Some(path) = cert_path {
+                        if let Ok((cert_type, blob)) = ssh_core::cert::read_public_key_file(&path) {
+                            if ssh_core::cert::is_certificate_key_type(&cert_type) {
+                                if let Ok(cert) = ssh_core::cert::Certificate::parse(&blob) {
+                                    if cert.raw_key_blob == signer.public_key_bytes() {
+                                        self.loaded_signers.push(Box::new(
+                                            ssh_core::cert::CertificateSigner::new(
+                                                signer, cert_type, blob,
+                                            ),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.loaded_signers.push(signer);
                 }
                 Err(_) => continue,
@@ -1131,11 +1155,20 @@ impl SshClient {
                 "publickey" => {
                     for i in 0..self.loaded_signers.len() {
                         let alg = self.loaded_signers[i].algorithm_name().to_string();
-                        if has_sig_algs && !self.server_sig_algs.iter().any(|a| a == &alg) {
+                        // Certificate key types are gated by their underlying
+                        // plain key type in server-sig-algs / PubkeyAcceptedAlgorithms.
+                        let check_alg = if ssh_core::cert::is_certificate_key_type(&alg) {
+                            ssh_core::cert::base_key_type_for(&alg)
+                                .unwrap_or(&alg)
+                                .to_string()
+                        } else {
+                            alg.clone()
+                        };
+                        if has_sig_algs && !self.server_sig_algs.iter().any(|a| a == &check_alg) {
                             continue;
                         }
                         if let Some(ref accepted) = self.config.pubkey_accepted_algorithms {
-                            if !crate::config::pubkey_alg_accepted(&alg, accepted) {
+                            if !crate::config::pubkey_alg_accepted(&check_alg, accepted) {
                                 continue;
                             }
                         }

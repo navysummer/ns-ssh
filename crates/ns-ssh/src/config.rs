@@ -59,6 +59,8 @@ pub struct HostConfig {
     pub port: Option<u16>,
     #[serde(default)]
     pub identity_file: Option<String>,
+    /// CertificateFile: certificate presented alongside the identity key.
+    pub certificate_file: Option<String>,
     #[serde(default)]
     pub identities_only: Option<bool>,
     #[serde(default)]
@@ -230,6 +232,8 @@ pub struct ResolvedConfig {
     pub port: u16,
     pub user: String,
     pub identity_file: Option<PathBuf>,
+    /// CertificateFile: certificate presented alongside the identity key.
+    pub certificate_file: Option<PathBuf>,
     pub identities_only: bool,
     pub forward_agent: bool,
     pub forward_x11: bool,
@@ -344,6 +348,7 @@ impl ResolvedConfig {
             port: 22,
             user: user.to_string(),
             identity_file: None,
+            certificate_file: None,
             identities_only: false,
             forward_agent: false,
             forward_x11: false,
@@ -569,6 +574,7 @@ impl SshConfig {
         let mut user = None;
         let mut port = None;
         let mut identity_file = None;
+        let mut certificate_file = None;
         let mut identities_only = None;
         let mut forward_agent = None;
         let mut forward_x11 = None;
@@ -657,6 +663,7 @@ impl SshConfig {
                             user: user.take(),
                             port: port.take(),
                             identity_file: identity_file.take(),
+                            certificate_file: certificate_file.take(),
                             identities_only: identities_only.take(),
                             forward_agent: forward_agent.take(),
                             forward_x11: forward_x11.take(),
@@ -732,6 +739,7 @@ impl SshConfig {
                             user: user.take(),
                             port: port.take(),
                             identity_file: identity_file.take(),
+                            certificate_file: certificate_file.take(),
                             identities_only: identities_only.take(),
                             forward_agent: forward_agent.take(),
                             forward_x11: forward_x11.take(),
@@ -810,6 +818,9 @@ impl SshConfig {
                 "user" => user = Some(value.to_string()),
                 "port" => port = value.parse().ok(),
                 "identityfile" | "identity_file" => identity_file = Some(value.to_string()),
+                "certificatefile" | "certificate_file" => {
+                    certificate_file = Some(value.to_string())
+                }
                 "identitiesonly" | "identities_only" => identities_only = Some(yes(value)),
                 "forwardagent" | "forward_agent" => forward_agent = Some(yes(value)),
                 "forwardx11" | "forward_x11" => forward_x11 = Some(yes(value)),
@@ -909,7 +920,6 @@ impl SshConfig {
                 | "casignaturealgorithms" | "ca_signature_algorithms"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
-                | "certificatefile" | "certificate_file"
                 | "revokedhostkeys" | "revoked_host_keys"
                 | "securitykeyprovider" | "security_key_provider"
                 | "knownhostscommand" | "known_hosts_command"
@@ -977,6 +987,7 @@ impl SshConfig {
                 user: user.clone(),
                 port,
                 identity_file: identity_file.clone(),
+                certificate_file: certificate_file.clone(),
                 identities_only,
                 forward_agent,
                 forward_x11,
@@ -1052,6 +1063,7 @@ impl SshConfig {
                     user: user.clone(),
                     port,
                     identity_file: identity_file.clone(),
+                certificate_file: certificate_file.clone(),
                     identities_only,
                     forward_agent,
                     forward_x11,

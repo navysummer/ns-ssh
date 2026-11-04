@@ -2360,6 +2360,260 @@ fn server_per_source_max_startups_drops_excess() {
     );
 }
 
+/// Generate an unencrypted ed25519 key pair with the system OpenSSH keygen.
+/// Returns `(private_path, public_path)`; the public file is usable by
+/// `ssh-keygen -s` and the private file by the ns-ssh client.
+fn generate_ed25519_key(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let priv_path = dir.join(name);
+    let status = Command::new("ssh-keygen")
+        .arg("-q")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-C")
+        .arg(name)
+        .arg("-f")
+        .arg(&priv_path)
+        .status()
+        .expect("run ssh-keygen");
+    assert!(status.success(), "ssh-keygen -t ed25519 failed");
+    (priv_path, dir.join(format!("{name}.pub")))
+}
+
+/// Sign `user_pub` with the OpenSSH `ssh-keygen -s`, producing
+/// `<user_pub without .pub>-cert.pub` next to it.
+fn ssh_keygen_sign(ca: &Path, user_pub: &Path, principals: &str) -> bool {
+    Command::new("ssh-keygen")
+        .arg("-q")
+        .arg("-s")
+        .arg(ca)
+        .arg("-I")
+        .arg("ns-ssh-test")
+        .arg("-n")
+        .arg(principals)
+        .arg("-V")
+        .arg("+1h")
+        .arg(user_pub)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a remote command through the client and return (success, stdout, stderr).
+fn run_client_echo(
+    user: &str,
+    port: u16,
+    id_path: &Path,
+    kh: &Path,
+    extra: &[String],
+    command: &str,
+) -> (bool, String, String) {
+    let args = base_client_args(port, user, id_path, kh);
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..]);
+    for e in extra {
+        cmd.arg(e);
+    }
+    let out = cmd
+        .arg("127.0.0.1")
+        .arg(command)
+        .output()
+        .expect("run client");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A user certificate signed by a TrustedUserCAKeys CA must authenticate,
+/// both via the implicit `<key>-cert.pub` discovery and via `CertificateFile`.
+#[test]
+fn server_accepts_user_certificate_from_trusted_ca() {
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh-keygen not available");
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("cert-auth");
+    let port = free_port();
+
+    let (ca, ca_pub) = generate_ed25519_key(&dir, "ca");
+    let (user_key, user_pub) = generate_ed25519_key(&dir, "user_key");
+    assert!(
+        ssh_keygen_sign(&ca, &user_pub, &user),
+        "ssh-keygen failed to sign the user key"
+    );
+    let cert_path = dir.join("user_key-cert.pub");
+    assert!(cert_path.exists(), "ssh-keygen did not write the certificate");
+
+    let extra = vec![
+        "-o".to_string(),
+        format!("TrustedUserCAKeys={}", ca_pub.display()),
+    ];
+    let extra_ref: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    let (server, _unused_id, kh) = launch_test_server_extra(&dir, port, &extra_ref);
+
+    // Implicit discovery of `<private key>-cert.pub`.
+    let (ok, stdout, stderr) = run_client_echo(&user, port, &user_key, &kh, &[], "echo cert-ok");
+    // Explicit CertificateFile option.
+    let (ok_explicit, stdout_explicit, stderr_explicit) = run_client_echo(
+        &user,
+        port,
+        &user_key,
+        &kh,
+        &["-o".to_string(), format!("CertificateFile={}", cert_path.display())],
+        "echo cert-explicit-ok",
+    );
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        ok && stdout.contains("cert-ok"),
+        "implicit certificate auth failed: stderr={stderr} server_stdout={} server_stderr={}",
+        String::from_utf8_lossy(&server_out.stdout),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        ok_explicit && stdout_explicit.contains("cert-explicit-ok"),
+        "CertificateFile auth failed: stderr={stderr_explicit}"
+    );
+}
+
+/// A plain public key listed in RevokedKeys must no longer authenticate via
+/// a certificate signed by an otherwise trusted CA.
+#[test]
+fn server_revoked_keys_rejects_certificate() {
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh-keygen not available");
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("cert-revoked");
+    let keys_dir = dir.join("keys");
+    std::fs::create_dir_all(&keys_dir).unwrap();
+
+    let (ca, ca_pub) = generate_ed25519_key(&keys_dir, "ca");
+    let (user_key, user_pub) = generate_ed25519_key(&keys_dir, "user_key");
+    let (_, other_pub) = generate_ed25519_key(&keys_dir, "other_key");
+    assert!(
+        ssh_keygen_sign(&ca, &user_pub, &user),
+        "ssh-keygen failed to sign the user key"
+    );
+
+    // The user key is revoked: certificate authentication must fail.
+    let port_bad = free_port();
+    let extra_bad = vec![
+        "-o".to_string(),
+        format!("TrustedUserCAKeys={}", ca_pub.display()),
+        "-o".to_string(),
+        format!("RevokedKeys={}", user_pub.display()),
+    ];
+    let extra_bad_ref: Vec<&str> = extra_bad.iter().map(|s| s.as_str()).collect();
+    let (server_bad, _id_bad, kh_bad) = launch_test_server_extra(&dir, port_bad, &extra_bad_ref);
+    let (ok_bad, _, stderr_bad) =
+        run_client_echo(&user, port_bad, &user_key, &kh_bad, &[], "echo should-not-run");
+    let mut server_bad = server_bad;
+    let _ = server_bad.kill();
+    let _ = server_bad.wait();
+
+    // Only a different key is revoked: the same certificate must be accepted.
+    let port_good = free_port();
+    let extra_good = vec![
+        "-o".to_string(),
+        format!("TrustedUserCAKeys={}", ca_pub.display()),
+        "-o".to_string(),
+        format!("RevokedKeys={}", other_pub.display()),
+    ];
+    let extra_good_ref: Vec<&str> = extra_good.iter().map(|s| s.as_str()).collect();
+    let (server_good, _id_good, kh_good) =
+        launch_test_server_extra(&dir, port_good, &extra_good_ref);
+    let (ok_good, stdout_good, stderr_good) =
+        run_client_echo(&user, port_good, &user_key, &kh_good, &[], "echo not-revoked");
+    let mut server_good = server_good;
+    let _ = server_good.kill();
+    let _ = server_good.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !ok_bad,
+        "a revoked certificate must not authenticate; stderr={stderr_bad}"
+    );
+    assert!(
+        ok_good && stdout_good.contains("not-revoked"),
+        "a non-revoked certificate should authenticate: stderr={stderr_good}"
+    );
+}
+
+/// With AuthorizedPrincipalsFile, a certificate principal other than the
+/// login name is accepted, while without it the principal must match the user.
+#[test]
+fn server_authorized_principals_file_controls_certificate() {
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh-keygen not available");
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("cert-principals");
+    let keys_dir = dir.join("keys");
+    std::fs::create_dir_all(&keys_dir).unwrap();
+
+    let (ca, ca_pub) = generate_ed25519_key(&keys_dir, "ca");
+    let (user_key, user_pub) = generate_ed25519_key(&keys_dir, "user_key");
+    assert!(
+        ssh_keygen_sign(&ca, &user_pub, "team-alice"),
+        "ssh-keygen failed to sign the user key"
+    );
+    let principals_path = keys_dir.join("principals");
+    std::fs::write(&principals_path, "team-alice\n").unwrap();
+
+    // Without AuthorizedPrincipalsFile the principal `team-alice` is not
+    // the login name, so authentication must fail.
+    let port_bad = free_port();
+    let extra_bad = vec![
+        "-o".to_string(),
+        format!("TrustedUserCAKeys={}", ca_pub.display()),
+    ];
+    let extra_bad_ref: Vec<&str> = extra_bad.iter().map(|s| s.as_str()).collect();
+    let (server_bad, _id_bad, kh_bad) = launch_test_server_extra(&dir, port_bad, &extra_bad_ref);
+    let (ok_bad, _, stderr_bad) =
+        run_client_echo(&user, port_bad, &user_key, &kh_bad, &[], "echo should-not-run");
+    let mut server_bad = server_bad;
+    let _ = server_bad.kill();
+    let _ = server_bad.wait();
+
+    // With the file listing the certificate principal, authentication succeeds.
+    let port_good = free_port();
+    let extra_good = vec![
+        "-o".to_string(),
+        format!("TrustedUserCAKeys={}", ca_pub.display()),
+        "-o".to_string(),
+        format!("AuthorizedPrincipalsFile={}", principals_path.display()),
+    ];
+    let extra_good_ref: Vec<&str> = extra_good.iter().map(|s| s.as_str()).collect();
+    let (server_good, _id_good, kh_good) =
+        launch_test_server_extra(&dir, port_good, &extra_good_ref);
+    let (ok_good, stdout_good, stderr_good) =
+        run_client_echo(&user, port_good, &user_key, &kh_good, &[], "echo principal-ok");
+    let mut server_good = server_good;
+    let _ = server_good.kill();
+    let _ = server_good.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !ok_bad,
+        "certificate principal mismatch must fail without AuthorizedPrincipalsFile; stderr={stderr_bad}"
+    );
+    assert!(
+        ok_good && stdout_good.contains("principal-ok"),
+        "AuthorizedPrincipalsFile should accept the certificate principal: stderr={stderr_good}"
+    );
+}
+
 /// `ExposeAuthInfo` must put the accepted method and public key into the file
 /// named by `SSH_USER_AUTH`.
 #[test]

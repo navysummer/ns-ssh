@@ -1572,6 +1572,9 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(id) = &h.identity_file {
             resolved.identity_file = Some(std::path::PathBuf::from(id));
         }
+        if let Some(c) = &h.certificate_file {
+            resolved.certificate_file = Some(std::path::PathBuf::from(c));
+        }
         if let Some(v) = h.identities_only {
             resolved.identities_only = v;
         }
@@ -1629,6 +1632,9 @@ fn apply_scp_ssh_config(ssh_cfg: &config::SshConfig, config: &mut ResolvedConfig
         }
         if let Some(id) = &host_cfg.identity_file {
             config.identity_file = Some(std::path::PathBuf::from(id));
+        }
+        if let Some(c) = &host_cfg.certificate_file {
+            config.certificate_file = Some(std::path::PathBuf::from(c));
         }
     }
 }
@@ -1694,6 +1700,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(ref identity) = host_config.identity_file {
                 resolved.identity_file = Some(std::path::PathBuf::from(identity));
+            }
+            if let Some(ref cert) = host_config.certificate_file {
+                resolved.certificate_file = Some(std::path::PathBuf::from(cert));
             }
             if let Some(v) = host_config.identities_only {
                 resolved.identities_only = v;
@@ -1943,6 +1952,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(ref identity) = mc.identity_file {
                 resolved.identity_file = Some(std::path::PathBuf::from(identity));
             }
+            if let Some(ref cert) = mc.certificate_file {
+                resolved.certificate_file = Some(std::path::PathBuf::from(cert));
+            }
             if let Some(v) = mc.identities_only {
                 resolved.identities_only = v;
             }
@@ -2166,6 +2178,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "hostname" => resolved.hostname = value.to_string(),
         "identityfile" | "identity_file" => {
             resolved.identity_file = Some(std::path::PathBuf::from(value));
+        }
+        "certificatefile" | "certificate_file" => {
+            resolved.certificate_file = Some(std::path::PathBuf::from(value));
         }
         "identitiesonly" | "identities_only" => resolved.identities_only = value != "no",
         "stricthostkeychecking" | "strict_host_key_checking" => {

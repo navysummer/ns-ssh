@@ -230,6 +230,34 @@ fn main() {
                 "exposeauthinfo" | "expose_auth_info" => {
                     config.expose_auth_info = value == "yes";
                 }
+                "trustedusercakeys" | "trusted_user_ca_keys" => {
+                    config.trusted_user_ca_keys =
+                        value.split_whitespace().map(|s| s.to_string()).collect();
+                }
+                "revokedkeys" | "revoked_keys" => {
+                    config.revoked_keys = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalsfile" | "authorized_principals_file" => {
+                    config.authorized_principals_file = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalscommand" | "authorized_principals_command" => {
+                    config.authorized_principals_command = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalscommanduser" | "authorized_principals_command_user" => {
+                    config.authorized_principals_command_user = Some(value.to_string());
+                }
                 "persourcemaxstartups" | "per_source_max_startups" => {
                     config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
                         None

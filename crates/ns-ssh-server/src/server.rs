@@ -1,5 +1,6 @@
 use crate::config::{x11_display_name, x11_listen_addr, ServerConfig};
 use base64::Engine;
+use ssh_core::cert::{is_certificate_key_type, Certificate, CERT_TYPE_USER};
 use crate::hostkey::HostKeyManager;
 use crate::auth::ServerAuth;
 use crate::session::SessionManager;
@@ -54,6 +55,13 @@ impl SshServer {
         );
         self.auth.lock().await.set_strict_modes(self.config.strict_modes);
         self.auth.lock().await.set_required_rsa_size(self.config.required_rsa_size);
+        self.auth
+            .lock()
+            .await
+            .load_trusted_user_ca_keys(&self.config.trusted_user_ca_keys)?;
+        if let Some(ref path) = self.config.revoked_keys {
+            self.auth.lock().await.load_revoked_keys(path)?;
+        }
 
         Ok(())
     }
@@ -939,9 +947,17 @@ async fn handle_authenticated_session(
                         let public_key = SshBytes::decode(&mut r)?.0;
 
                         // PubkeyAcceptedAlgorithms: reject client algorithms
-                        // that are not in the server's allowed set.
+                        // that are not in the server's allowed set. Certificate
+                        // key types are judged by their underlying key type.
                         if let Some(ref accepted) = config.pubkey_accepted_algorithms {
-                            if !crate::config::pubkey_alg_accepted_server(&key_type, accepted) {
+                            let algorithm = if is_certificate_key_type(&key_type) {
+                                ssh_core::cert::base_key_type_for(&key_type)
+                                    .unwrap_or(&key_type)
+                                    .to_string()
+                            } else {
+                                key_type.clone()
+                            };
+                            if !crate::config::pubkey_alg_accepted_server(&algorithm, accepted) {
                                 let (methods, partial) = failure_methods(
                                     &config,
                                     &completed_methods,
@@ -957,32 +973,64 @@ async fn handle_authenticated_session(
 
                         if has_sig {
                             let signature_blob = SshBytes::decode(&mut r)?.0;
+                            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+                            let cert = if is_certificate_key_type(&key_type) {
+                                validate_user_certificate(
+                                    &auth, &config, &username, &public_key, peer_ip,
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            let sig_ok = if is_certificate_key_type(&key_type) {
+                                cert.is_some()
+                                    && auth.lock().await.verify_signature(
+                                        session_id, &username, &key_type, &public_key,
+                                        &signature_blob,
+                                    )
+                            } else {
+                                auth_verify_pubkey_signed(
+                                    &auth, session_id, &username, &key_type, &public_key,
+                                    &signature_blob,
+                                )
+                                .await
+                            };
 
-                            if config.pubkey_auth && auth_verify_pubkey_signed(&auth, session_id, &username, &key_type, &public_key, &signature_blob).await
+                            if config.pubkey_auth && sig_ok
                             {
                                 // Check authorized key options (command=, from=, no-pty)
                                 let mut g = auth.lock().await;
                                 g.load_user_authorized_keys(&username);
-                                if let Some(entry) = g.find_matching_key(&key_type, &public_key) {
-                                    // from= check against peer address
-                                    if let Ok(peer_addr) = stream.peer_addr() {
-                                        let peer_addr = peer_addr.to_string();
-                                        if !g.check_from_pattern(entry, &peer_addr) {
-                                            drop(g);
-                                            let (methods, partial) = failure_methods(
-                                                &config,
-                                                &completed_methods,
-                                                enabled_auth_methods(&config),
-                                            );
-                                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
-                                            if config.auth_failure_delay > 0 {
-                                                tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                                if cert.is_none() {
+                                    if let Some(entry) = g.find_matching_key(&key_type, &public_key) {
+                                        // from= check against peer address
+                                        if let Ok(peer_addr) = stream.peer_addr() {
+                                            let peer_addr = peer_addr.to_string();
+                                            if !g.check_from_pattern(entry, &peer_addr) {
+                                                drop(g);
+                                                let (methods, partial) = failure_methods(
+                                                    &config,
+                                                    &completed_methods,
+                                                    enabled_auth_methods(&config),
+                                                );
+                                                send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                                                if config.auth_failure_delay > 0 {
+                                                    tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                                                }
+                                                continue;
                                             }
-                                            continue;
                                         }
+                                        // Store the authorized key options for application to the session
+                                        auth_key_options = Some(entry.options.clone());
                                     }
-                                    // Store the authorized key options for application to the session
-                                    auth_key_options = Some(entry.options.clone());
+                                } else if let Some(ref c) = cert {
+                                    // force-command from the certificate critical options.
+                                    if let Some(cmd) = c.critical_option("force-command") {
+                                        let mut opts = crate::auth::AuthorizedKeyOptions::default();
+                                        opts.command =
+                                            Some(String::from_utf8_lossy(cmd).into_owned());
+                                        auth_key_options = Some(opts);
+                                    }
                                 }
                                 drop(g);
                                 auth_info.push(format!(
@@ -1013,7 +1061,20 @@ async fn handle_authenticated_session(
                                 }
                             }
                         } else {
-                            if config.pubkey_auth && auth_verify_public_key(&auth, &username, &key_type, &public_key).await {
+                            let key_ok = if is_certificate_key_type(&key_type) {
+                                validate_user_certificate(
+                                    &auth,
+                                    &config,
+                                    &username,
+                                    &public_key,
+                                    stream.peer_addr().ok().map(|a| a.ip()),
+                                )
+                                .await
+                                .is_some()
+                            } else {
+                                auth_verify_public_key(&auth, &username, &key_type, &public_key).await
+                            };
+                            if config.pubkey_auth && key_ok {
                                 let mut pk_ok = vec![msg::SSH_MSG_USERAUTH_PK_OK];
                                 SshString::new(&key_type).encode(&mut pk_ok)?;
                                 SshBytes(public_key).encode(&mut pk_ok)?;
@@ -1344,6 +1405,90 @@ async fn auth_verify_pubkey_signed(
         return false;
     }
     g.verify_signature(session_id, username, key_type, public_key, signature_blob)
+}
+
+/// Validate a user certificate: user type, validity window, trusted CA,
+/// revocation, principals and `source-address` critical option.
+async fn validate_user_certificate(
+    auth: &Arc<Mutex<ServerAuth>>,
+    config: &ServerConfig,
+    username: &str,
+    cert_blob: &[u8],
+    peer_ip: Option<std::net::IpAddr>,
+) -> Option<Certificate> {
+    let cert = Certificate::parse(cert_blob).ok()?;
+    if cert.cert_type != CERT_TYPE_USER {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if !cert.is_valid_at(now) {
+        return None;
+    }
+    let principals;
+    {
+        let g = auth.lock().await;
+        if !g.is_trusted_ca(&cert.signature_key) {
+            return None;
+        }
+        if g.is_revoked_cert(&cert) {
+            return None;
+        }
+        if !cert.verify_ca_signature(None) {
+            return None;
+        }
+        principals = g.authorized_principals(
+            username,
+            config.authorized_principals_file.as_deref(),
+            config.authorized_principals_command.as_deref(),
+            config.authorized_principals_command_user.as_deref(),
+        );
+    }
+    // With no AuthorizedPrincipals* source the certificate principal must be
+    // the login name; otherwise any listed principal is accepted.
+    if principals.is_empty() {
+        if !cert.principal_matches(username) {
+            return None;
+        }
+    } else if !cert.any_principal_in(&principals) {
+        return None;
+    }
+    if let Some(patterns) = cert.critical_option("source-address") {
+        let ip = peer_ip?;
+        if !source_address_allowed(&String::from_utf8_lossy(patterns), ip) {
+            return None;
+        }
+    }
+    Some(cert)
+}
+
+fn source_address_allowed(patterns: &str, ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    patterns.split(',').any(|p| {
+        let p = p.trim();
+        if let Some((addr, bits)) = p.split_once('/') {
+            let (Ok(base), Ok(bits)) = (addr.parse::<IpAddr>(), bits.parse::<u8>()) else {
+                return false;
+            };
+            match (base, ip) {
+                (IpAddr::V4(b), IpAddr::V4(i)) if bits <= 32 => {
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits as u32) };
+                    (u32::from(b) & mask) == (u32::from(i) & mask)
+                }
+                (IpAddr::V6(b), IpAddr::V6(i)) if bits <= 128 => {
+                    let b = u128::from(b);
+                    let i = u128::from(i);
+                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits as u32) };
+                    (b & mask) == (i & mask)
+                }
+                _ => false,
+            }
+        } else {
+            p.parse::<IpAddr>().map(|a| a == ip).unwrap_or(false)
+        }
+    })
 }
 
 fn start_session_and_readers(

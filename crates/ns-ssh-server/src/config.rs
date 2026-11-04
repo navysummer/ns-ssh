@@ -226,6 +226,27 @@ pub struct ServerConfig {
     #[serde(default)]
     pub expose_auth_info: bool,
 
+    /// TrustedUserCAKeys: files with CA public keys trusted to sign user
+    /// certificates.
+    #[serde(default)]
+    pub trusted_user_ca_keys: Vec<String>,
+
+    /// RevokedKeys: file with public keys that must never authenticate.
+    #[serde(default)]
+    pub revoked_keys: Option<String>,
+
+    /// AuthorizedPrincipalsFile: principals accepted from user certificates.
+    #[serde(default)]
+    pub authorized_principals_file: Option<String>,
+
+    /// AuthorizedPrincipalsCommand: command whose output lists accepted principals.
+    #[serde(default)]
+    pub authorized_principals_command: Option<String>,
+
+    /// AuthorizedPrincipalsCommandUser: user to run the command as.
+    #[serde(default)]
+    pub authorized_principals_command_user: Option<String>,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -323,6 +344,11 @@ pub struct MatchOverrides {
     pub refuse_connection: Option<String>,
     pub permit_user_rc: Option<bool>,
     pub expose_auth_info: Option<bool>,
+    pub trusted_user_ca_keys: Option<Vec<String>>,
+    pub revoked_keys: Option<String>,
+    pub authorized_principals_file: Option<String>,
+    pub authorized_principals_command: Option<String>,
+    pub authorized_principals_command_user: Option<String>,
     pub allow_agent_forwarding: Option<bool>,
     pub allow_streamlocal_forwarding: Option<bool>,
     pub allow_users: Option<Vec<String>>,
@@ -413,6 +439,17 @@ impl ServerMatch {
         }
         if let Some(v) = o.permit_user_rc { cfg.permit_user_rc = v; }
         if let Some(v) = o.expose_auth_info { cfg.expose_auth_info = v; }
+        if let Some(v) = &o.trusted_user_ca_keys { cfg.trusted_user_ca_keys = v.clone(); }
+        if let Some(v) = &o.revoked_keys { cfg.revoked_keys = Some(v.clone()); }
+        if let Some(v) = &o.authorized_principals_file {
+            cfg.authorized_principals_file = Some(v.clone());
+        }
+        if let Some(v) = &o.authorized_principals_command {
+            cfg.authorized_principals_command = Some(v.clone());
+        }
+        if let Some(v) = &o.authorized_principals_command_user {
+            cfg.authorized_principals_command_user = Some(v.clone());
+        }
         if let Some(v) = o.allow_agent_forwarding { cfg.allow_agent_forwarding = v; }
         if let Some(v) = o.allow_streamlocal_forwarding { cfg.allow_streamlocal_forwarding = v; }
         if let Some(v) = &o.allow_users { cfg.allow_users = v.clone(); }
@@ -539,14 +576,40 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         }
         "permituserrc" | "permit_user_rc" => o.permit_user_rc = Some(value == "yes"),
         "exposeauthinfo" | "expose_auth_info" => o.expose_auth_info = Some(value == "yes"),
+        "trustedusercakeys" | "trusted_user_ca_keys" => {
+            o.trusted_user_ca_keys =
+                Some(value.split_whitespace().map(|s| s.to_string()).collect());
+        }
+        "revokedkeys" | "revoked_keys" => {
+            o.revoked_keys = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "authorizedprincipalsfile" | "authorized_principals_file" => {
+            o.authorized_principals_file = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "authorizedprincipalscommand" | "authorized_principals_command" => {
+            o.authorized_principals_command = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "authorizedprincipalscommanduser" | "authorized_principals_command_user" => {
+            o.authorized_principals_command_user = Some(value.to_string());
+        }
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
-        "authorizedprincipalsfile" | "authorized_principals_file"
-        | "casignaturealgorithms" | "ca_signature_algorithms"
+        "casignaturealgorithms" | "ca_signature_algorithms"
         | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
         | "hostcertificate" | "host_certificate"
         | "pubkeyauthoptions" | "pubkey_auth_options"
         | "requiredrsasize" | "required_rsa_size"
-        | "revokedkeys" | "revoked_keys"
         | "disableforwarding" | "disable_forwarding"
         | "permittunnel" | "permit_tunnel" => {
             // Accepted; not enforced.
@@ -1004,6 +1067,11 @@ impl Default for ServerConfig {
             refuse_connection: None,
             permit_user_rc: true,
             expose_auth_info: false,
+            trusted_user_ca_keys: Vec::new(),
+            revoked_keys: None,
+            authorized_principals_file: None,
+            authorized_principals_command: None,
+            authorized_principals_command_user: None,
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1355,6 +1423,34 @@ impl ServerConfig {
                 "exposeauthinfo" | "expose_auth_info" => {
                     config.expose_auth_info = value == "yes";
                 }
+                "trustedusercakeys" | "trusted_user_ca_keys" => {
+                    config.trusted_user_ca_keys =
+                        value.split_whitespace().map(|s| s.to_string()).collect();
+                }
+                "revokedkeys" | "revoked_keys" => {
+                    config.revoked_keys = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalsfile" | "authorized_principals_file" => {
+                    config.authorized_principals_file = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalscommand" | "authorized_principals_command" => {
+                    config.authorized_principals_command = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "authorizedprincipalscommanduser" | "authorized_principals_command_user" => {
+                    config.authorized_principals_command_user = Some(value.to_string());
+                }
                 "persourcemaxstartups" | "per_source_max_startups" => {
                     config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
                         None
@@ -1466,10 +1562,7 @@ impl ServerConfig {
                 // Known OpenSSH directives accepted but not enforced. Accepting
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
-                "authorizedprincipalsfile" | "authorized_principals_file"
-                | "authorizedprincipalscommand" | "authorized_principals_command"
-                | "authorizedprincipalscommanduser" | "authorized_principals_command_user"
-                | "casignaturealgorithms" | "ca_signature_algorithms"
+                "casignaturealgorithms" | "ca_signature_algorithms"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
                 | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
@@ -1487,10 +1580,8 @@ impl ServerConfig {
                 | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
                 | "rdomain"
-                | "revokedkeys" | "revoked_keys"
                 | "securitykeyprovider" | "security_key_provider"
                 | "sshdsessionpath" | "sshd_session_path"
-                | "trustedusercakeys" | "trusted_user_ca_keys"
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location"
                 // Deprecated OpenSSH aliases: accepted and ignored.
@@ -1864,6 +1955,69 @@ Match All
             per_source_key("127.0.0.5".parse().unwrap(), (24, 128)),
             "127.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn certificate_authentication_options_are_parsed() {
+        let c = ServerConfig::parse("").unwrap();
+        assert!(c.trusted_user_ca_keys.is_empty());
+        assert!(c.revoked_keys.is_none());
+        assert!(c.authorized_principals_file.is_none());
+        assert!(c.authorized_principals_command.is_none());
+        assert!(c.authorized_principals_command_user.is_none());
+
+        let c = ServerConfig::parse(
+            "TrustedUserCAKeys /etc/ssh/ca1.pub /etc/ssh/ca2.pub\n\
+             RevokedKeys /etc/ssh/revoked_keys\n\
+             AuthorizedPrincipalsFile /etc/ssh/principals/%u\n\
+             AuthorizedPrincipalsCommand /usr/local/bin/principals %u\n\
+             AuthorizedPrincipalsCommandUser nobody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.trusted_user_ca_keys,
+            vec!["/etc/ssh/ca1.pub", "/etc/ssh/ca2.pub"]
+        );
+        assert_eq!(c.revoked_keys.as_deref(), Some("/etc/ssh/revoked_keys"));
+        assert_eq!(
+            c.authorized_principals_file.as_deref(),
+            Some("/etc/ssh/principals/%u")
+        );
+        assert_eq!(
+            c.authorized_principals_command.as_deref(),
+            Some("/usr/local/bin/principals %u")
+        );
+        assert_eq!(
+            c.authorized_principals_command_user.as_deref(),
+            Some("nobody")
+        );
+
+        // `none` disables the corresponding option.
+        let c = ServerConfig::parse(
+            "RevokedKeys none\nAuthorizedPrincipalsFile none\nAuthorizedPrincipalsCommand none\n",
+        )
+        .unwrap();
+        assert!(c.revoked_keys.is_none());
+        assert!(c.authorized_principals_file.is_none());
+        assert!(c.authorized_principals_command.is_none());
+
+        // Match blocks carry their own overrides.
+        let c = ServerConfig::parse(
+            "Match User alice\n\
+                 TrustedUserCAKeys /etc/ssh/ca3.pub\n\
+                 AuthorizedPrincipalsFile /etc/ssh/principals/alice\n\
+                 AuthorizedPrincipalsCommand /bin/echo alice\n\
+                 AuthorizedPrincipalsCommandUser alice\n",
+        )
+        .unwrap();
+        let o = &c.match_blocks[0].overrides;
+        assert_eq!(o.trusted_user_ca_keys.as_deref(), Some(&["/etc/ssh/ca3.pub".to_string()][..]));
+        assert_eq!(
+            o.authorized_principals_file.as_deref(),
+            Some("/etc/ssh/principals/alice")
+        );
+        assert_eq!(o.authorized_principals_command.as_deref(), Some("/bin/echo alice"));
+        assert_eq!(o.authorized_principals_command_user.as_deref(), Some("alice"));
     }
 
     #[test]

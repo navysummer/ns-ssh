@@ -237,6 +237,10 @@ pub struct ServerAuth {
     authorized_keys_command_user: Option<String>,
     strict_modes: bool,
     required_rsa_size: usize,
+    /// TrustedUserCAKeys: CA public key blobs allowed to sign user certificates.
+    trusted_ca_keys: Vec<Vec<u8>>,
+    /// RevokedKeys: public key blobs that must never authenticate.
+    revoked_keys: Vec<Vec<u8>>,
 }
 
 impl ServerAuth {
@@ -249,6 +253,8 @@ impl ServerAuth {
             authorized_keys_command_user: None,
             strict_modes: true,
             required_rsa_size: 1024,
+            trusted_ca_keys: Vec::new(),
+            revoked_keys: Vec::new(),
         }
     }
 
@@ -271,6 +277,91 @@ impl ServerAuth {
     pub fn set_authorized_keys_command(&mut self, command: Option<String>, user: Option<String>) {
         self.authorized_keys_command = command;
         self.authorized_keys_command_user = user;
+    }
+
+    /// Load TrustedUserCAKeys files (one public key per line).
+    pub fn load_trusted_user_ca_keys(&mut self, paths: &[String]) -> Result<()> {
+        for path in paths {
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("warning: cannot read TrustedUserCAKeys {}: {}", path, e);
+                    continue;
+                }
+            };
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((_, blob)) = ssh_core::cert::parse_public_key_line(line) {
+                    self.trusted_ca_keys.push(blob);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a RevokedKeys file listing plain public keys.
+    pub fn load_revoked_keys(&mut self, path: &str) -> Result<()> {
+        let content = fs::read_to_string(path).map_err(SshError::Io)?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((_, blob)) = ssh_core::cert::parse_public_key_line(line) {
+                self.revoked_keys.push(blob);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_trusted_ca(&self, ca_blob: &[u8]) -> bool {
+        self.trusted_ca_keys.iter().any(|k| k == ca_blob)
+    }
+
+    /// Whether the certificate's key or its CA is revoked.
+    pub fn is_revoked_cert(&self, cert: &ssh_core::cert::Certificate) -> bool {
+        cert.is_revoked_by(&self.revoked_keys)
+            || self.revoked_keys.iter().any(|k| k == &cert.signature_key)
+    }
+
+    /// Principals accepted for `username`, from AuthorizedPrincipalsCommand or
+    /// AuthorizedPrincipalsFile. An empty result means "use the username".
+    pub fn authorized_principals(
+        &self,
+        username: &str,
+        file: Option<&str>,
+        command: Option<&str>,
+        command_user: Option<&str>,
+    ) -> Vec<String> {
+        if let Some(command) = command {
+            if let Some(output) =
+                Self::run_authorized_keys_command(command, username, command_user)
+            {
+                return output
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect();
+            }
+        }
+        if let Some(file) = file {
+            let mut path = file.to_string();
+            if let Some(home) = Self::home_dir_for_user(username) {
+                path = path.replace("%h", &home);
+            }
+            path = path.replace("%u", username);
+            if let Ok(content) = fs::read_to_string(&path) {
+                return content
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .collect();
+            }
+        }
+        Vec::new()
     }
 
     /// Resolve a user's home directory from /etc/passwd.
@@ -636,7 +727,17 @@ impl ServerAuth {
         public_key: &[u8],
         signature_blob: &[u8],
     ) -> bool {
-        let signer = match self.create_signer_for_key(key_type, public_key) {
+        // Certificates advertise a *-cert-v01 type while signatures are made by
+        // the wrapped plain key, so verify with the reconstructed key blob.
+        let (verify_type, verify_blob) = if ssh_core::cert::is_certificate_key_type(key_type) {
+            match ssh_core::cert::Certificate::parse(public_key) {
+                Ok(cert) => (cert.base_key_type.clone(), cert.raw_key_blob.clone()),
+                Err(_) => return false,
+            }
+        } else {
+            (key_type.to_string(), public_key.to_vec())
+        };
+        let signer = match self.create_signer_for_key(&verify_type, &verify_blob) {
             Some(s) => s,
             None => return false,
         };
@@ -829,6 +930,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssh_core::HostKeySigner;
 
     #[test]
     fn authorized_key_options_parse_command_with_spaces() {
@@ -949,6 +1051,111 @@ mod tests {
         // World-writable: rejected.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(!ServerAuth::check_authorized_keys_permissions(&path, &me));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn pub_key_line(key: &ssh_core::hostkey::Ed25519HostKey) -> String {
+        let blob = key.public_key_bytes();
+        format!(
+            "ssh-ed25519 {}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        )
+    }
+
+    fn user_cert_blob(
+        user: &ssh_core::hostkey::Ed25519HostKey,
+        ca: &ssh_core::hostkey::Ed25519HostKey,
+        principal: &str,
+    ) -> Vec<u8> {
+        let mut cert = Vec::new();
+        SshString::new("ssh-ed25519-cert-v01@openssh.com")
+            .encode(&mut cert)
+            .unwrap();
+        SshBytes(vec![1, 2, 3, 4]).encode(&mut cert).unwrap();
+        let mut r = &user.public_key_bytes()[..];
+        let _ = SshString::decode(&mut r).unwrap();
+        SshBytes::decode(&mut r).unwrap().encode(&mut cert).unwrap();
+        cert.extend_from_slice(&42u64.to_be_bytes());
+        cert.extend_from_slice(&ssh_core::cert::CERT_TYPE_USER.to_be_bytes());
+        SshString::new("test-id").encode(&mut cert).unwrap();
+        let mut pbuf = Vec::new();
+        SshString::new(principal).encode(&mut pbuf).unwrap();
+        SshBytes(pbuf).encode(&mut cert).unwrap();
+        cert.extend_from_slice(&0u64.to_be_bytes());
+        cert.extend_from_slice(&0u64.to_be_bytes());
+        SshBytes(Vec::new()).encode(&mut cert).unwrap(); // critical options
+        SshBytes(Vec::new()).encode(&mut cert).unwrap(); // extensions
+        SshBytes(Vec::new()).encode(&mut cert).unwrap(); // reserved
+        SshBytes(ca.public_key_bytes()).encode(&mut cert).unwrap();
+        let sig = ca.sign(&cert).unwrap();
+        SshBytes(sig).encode(&mut cert).unwrap();
+        cert
+    }
+
+    #[test]
+    fn trusted_user_ca_keys_are_loaded() {
+        let ca = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("ns-ssh-auth-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trusted_ca.pub");
+        std::fs::write(&path, format!("# comment\n{}\n\n", pub_key_line(&ca))).unwrap();
+
+        let mut auth = ServerAuth::new();
+        auth.load_trusted_user_ca_keys(&[path.to_string_lossy().to_string()])
+            .unwrap();
+        assert!(auth.is_trusted_ca(&ca.public_key_bytes()));
+
+        let other = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        assert!(!auth.is_trusted_ca(&other.public_key_bytes()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoked_keys_reject_certificate() {
+        let user = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        let ca = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        let dir = std::env::temp_dir().join(format!("ns-ssh-auth-revoked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked_keys");
+        std::fs::write(&path, pub_key_line(&user)).unwrap();
+
+        let mut auth = ServerAuth::new();
+        auth.load_revoked_keys(path.to_str().unwrap()).unwrap();
+        let cert = ssh_core::cert::Certificate::parse(&user_cert_blob(&user, &ca, "alice")).unwrap();
+        assert!(auth.is_revoked_cert(&cert));
+
+        let other = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        let other_cert =
+            ssh_core::cert::Certificate::parse(&user_cert_blob(&other, &ca, "alice")).unwrap();
+        assert!(!auth.is_revoked_cert(&other_cert));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authorized_principals_reads_file_and_command() {
+        let dir = std::env::temp_dir().join(format!("ns-ssh-auth-principals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("principals")).unwrap();
+        let file = dir.join("principals").join("alice");
+        std::fs::write(&file, "# comment\nalice-team\nops\n").unwrap();
+
+        let auth = ServerAuth::new();
+        // `%u` is expanded against the username.
+        let pattern = dir.join("principals").join("%u");
+        let principals =
+            auth.authorized_principals("alice", Some(pattern.to_str().unwrap()), None, None);
+        assert_eq!(principals, vec!["alice-team".to_string(), "ops".to_string()]);
+
+        // AuthorizedPrincipalsCommand takes precedence over the file.
+        let principals = auth.authorized_principals("alice", Some("/nonexistent"), Some("echo cmd-team"), None);
+        assert_eq!(principals, vec!["cmd-team".to_string()]);
+
+        // Missing file and no command yields an empty list.
+        assert!(auth
+            .authorized_principals("bob", Some("/nonexistent"), None, None)
+            .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
