@@ -852,7 +852,16 @@ impl SshConfig {
                 | "proxyusefdpass" | "proxy_use_fdpass"
                 | "tunneldevice" | "tunnel_device"
                 | "updatehostkeys" | "update_host_keys"
-                | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command" => {
+                | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
+                | "canonicaldomains" | "canonical_domains"
+                | "canonicalizehostname" | "canonicalize_hostname"
+                | "canonicalizemaxdots" | "canonicalize_max_dots"
+                | "canonicalizefallbacklocal" | "canonicalize_fallback_local"
+                | "canonicalizepermittedcnames" | "canonicalize_permitted_cnames"
+                | "forwardx11trusted" | "forward_x11_trusted"
+                | "gssapiauthentication" | "gssapi_authentication"
+                | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
+                | "usekeychain" | "use_keychain" => {
                     // Accepted; not enforced.
                 }
                 "ignoreunknown" | "ignore_unknown" => {
