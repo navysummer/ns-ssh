@@ -258,6 +258,10 @@ fn main() {
                 "authorizedprincipalscommanduser" | "authorized_principals_command_user" => {
                     config.authorized_principals_command_user = Some(value.to_string());
                 }
+                "hostcertificate" | "host_certificate" => {
+                    config.host_certificates =
+                        value.split_whitespace().map(|s| s.to_string()).collect();
+                }
                 "persourcemaxstartups" | "per_source_max_startups" => {
                     config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
                         None

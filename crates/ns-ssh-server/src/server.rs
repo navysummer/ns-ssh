@@ -45,6 +45,10 @@ impl SshServer {
     pub async fn init(&mut self) -> Result<()> {
         let key_files = self.config.get_host_key_files();
         self.host_keys.lock().await.load_or_generate(&key_files)?;
+        self.host_keys
+            .lock()
+            .await
+            .load_certificates(&self.config.host_certificates)?;
 
         let auth_files = self.config.get_authorized_keys_files();
         self.auth.lock().await.load_authorized_keys(&auth_files)?;

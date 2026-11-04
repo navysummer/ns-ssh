@@ -65,7 +65,13 @@ impl HostKeyManager {
         let key: Box<dyn HostKeySigner> = if key_name.contains("ed25519") {
             Box::new(Ed25519HostKey::generate()?)
         } else if key_name.contains("ecdsa") {
-            Box::new(EcdsaP256HostKey::generate()?)
+            if key_name.contains("384") {
+                Box::new(EcdsaP384HostKey::generate()?)
+            } else if key_name.contains("521") {
+                Box::new(EcdsaP521HostKey::generate()?)
+            } else {
+                Box::new(EcdsaP256HostKey::generate()?)
+            }
         } else if key_name.contains("rsa") {
             Box::new(RsaHostKey::generate(2048)?)
         } else {
@@ -82,13 +88,20 @@ impl HostKeyManager {
             .unwrap_or("");
 
         let content = if key_name.contains("ed25519") {
-            let signer = key as *const dyn HostKeySigner as *const Ed25519HostKey;
-            let ed_key = unsafe { &*signer };
+            let ed_key = key.as_any().downcast_ref::<Ed25519HostKey>()
+                .ok_or_else(|| SshError::Protocol("ed25519 key type mismatch".into()))?;
             ssh_core::keygen::format_openssh_ed25519(&ed_key.secret_bytes())
         } else if key_name.contains("ecdsa") {
-            let signer = key as *const dyn HostKeySigner as *const EcdsaP256HostKey;
-            let ecdsa_key = unsafe { &*signer };
-            ssh_core::keygen::format_openssh_ecdsa(&ecdsa_key.secret_bytes())
+            let secret = if let Some(k) = key.as_any().downcast_ref::<EcdsaP256HostKey>() {
+                k.secret_bytes()
+            } else if let Some(k) = key.as_any().downcast_ref::<EcdsaP384HostKey>() {
+                k.secret_bytes()
+            } else if let Some(k) = key.as_any().downcast_ref::<EcdsaP521HostKey>() {
+                k.secret_bytes()
+            } else {
+                return Err(SshError::Protocol("ecdsa key type mismatch".into()));
+            };
+            ssh_core::keygen::format_openssh_ecdsa(&secret)?
         } else {
             return Err(SshError::Protocol("unsupported key type for generation".into()));
         };
@@ -106,19 +119,103 @@ impl HostKeyManager {
         Ok(())
     }
 
+    /// Load `HostCertificate` files and additionally present the certified
+    /// variants of the matching host keys (as OpenSSH does).
+    pub fn load_certificates(&mut self, cert_files: &[String]) -> Result<()> {
+        use ssh_core::cert::{
+            is_certificate_key_type, parse_public_key_line, Certificate, CertificateSigner,
+            CERT_TYPE_HOST,
+        };
+
+        for path in cert_files {
+            let content = match fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Warning: cannot read host certificate {}: {}", path, e);
+                    continue;
+                }
+            };
+            let line = match content
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                Some(l) => l,
+                None => {
+                    eprintln!("Warning: host certificate {} is empty", path);
+                    continue;
+                }
+            };
+            let Some((key_type, blob)) = parse_public_key_line(line) else {
+                eprintln!("Warning: malformed host certificate {}", path);
+                continue;
+            };
+            if !is_certificate_key_type(&key_type) {
+                eprintln!("Warning: {} is not a certificate", path);
+                continue;
+            }
+            let cert = match Certificate::parse(&blob) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Warning: cannot parse host certificate {}: {}", path, e);
+                    continue;
+                }
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if cert.cert_type != CERT_TYPE_HOST || !cert.is_valid_at(now) {
+                eprintln!("Warning: host certificate {} is not a valid host certificate", path);
+                continue;
+            }
+            let Some(inner) = self
+                .keys
+                .iter()
+                .find(|k| k.public_key_bytes() == cert.raw_key_blob)
+            else {
+                eprintln!(
+                    "Warning: no host key matches certificate {}",
+                    path
+                );
+                continue;
+            };
+            let inner = inner.clone_box();
+
+            // Certificate key types follow the plain key type, except for RSA
+            // which advertises one variant per signature algorithm.
+            let algorithms: Vec<String> = match cert.base_key_type.as_str() {
+                "ssh-rsa" => vec![
+                    "rsa-sha2-512-cert-v01@openssh.com".to_string(),
+                    "rsa-sha2-256-cert-v01@openssh.com".to_string(),
+                ],
+                base => vec![format!("{}-cert-v01@openssh.com", base)],
+            };
+            for algorithm in algorithms {
+                if self.keys.iter().any(|k| k.algorithm_name() == algorithm) {
+                    continue;
+                }
+                self.keys.push(Box::new(CertificateSigner::new(
+                    inner.clone_box(),
+                    algorithm,
+                    blob.clone(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_key_for_algorithm(&self, algorithm: &str) -> Option<&dyn HostKeySigner> {
-        self.keys.iter().find(|k| k.algorithm_name() == algorithm).map(|k| k.as_ref())
+        self.keys
+            .iter()
+            .find(|k| k.algorithm_name() == algorithm || k.supports(algorithm))
+            .map(|k| k.as_ref())
     }
 
     pub fn get_all_keys(&self) -> &[Box<dyn HostKeySigner>] {
         &self.keys
     }
 
-    pub fn get_key_blobs(&self) -> Vec<(String, Vec<u8>)> {
-        self.keys.iter().map(|k| {
-            (k.algorithm_name().to_string(), k.public_key_bytes())
-        }).collect()
-    }
 }
 
 fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {
@@ -172,13 +269,22 @@ fn load_openssh_key(content: &str) -> Result<Box<dyn HostKeySigner>> {
                 &secret_bytes.try_into().map_err(|_| SshError::InvalidKey("wrong ed25519 key size".into()))?
             )?))
         }
-        "ecdsa-sha2-nistp256" => {
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
             let _pub_curve = read_simplified_string(&mut pr)?;
             let _pub_len = read_simplified_uint32(&mut pr)? as usize;
             pr = &pr[_pub_len..];
             let secret_bytes = read_simplified_string_bytes(&mut pr)?;
-
-            Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&secret_bytes)?))
+            let (field_len, name) = match key_type.as_str() {
+                "ecdsa-sha2-nistp256" => (32, "nistp256"),
+                "ecdsa-sha2-nistp384" => (48, "nistp384"),
+                _ => (66, "nistp521"),
+            };
+            let secret = normalize_scalar(&secret_bytes, field_len)?;
+            match name {
+                "nistp256" => Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&secret)?)),
+                "nistp384" => Ok(Box::new(EcdsaP384HostKey::from_secret_bytes(&secret)?)),
+                _ => Ok(Box::new(EcdsaP521HostKey::from_secret_bytes(&secret)?)),
+            }
         }
         "ssh-rsa" => {
             let n_bytes = read_simplified_string_bytes(&mut pr)?;
@@ -229,6 +335,23 @@ fn read_simplified_uint32(r: &mut &[u8]) -> Result<u32> {
     let val = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
     *r = &r[4..];
     Ok(val)
+}
+
+/// OpenSSH stores the ECDSA private scalar as an mpint, which may carry a
+/// leading 0x00 sign byte and may omit leading zeros. Normalise it to the
+/// curve's field width before handing it to the crypto crate.
+fn normalize_scalar(bytes: &[u8], field_len: usize) -> Result<Vec<u8>> {
+    if bytes.len() > field_len + 1 {
+        return Err(SshError::InvalidKey("ECDSA secret longer than field".into()));
+    }
+    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let scalar = &bytes[first..];
+    if scalar.len() > field_len {
+        return Err(SshError::InvalidKey("ECDSA secret longer than field".into()));
+    }
+    let mut out = vec![0u8; field_len];
+    out[field_len - scalar.len()..].copy_from_slice(scalar);
+    Ok(out)
 }
 
 fn read_simplified_raw(r: &mut &[u8], len: usize) -> Result<Vec<u8>> {

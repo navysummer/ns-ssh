@@ -55,6 +55,51 @@ pub fn base_key_type_for(key_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Map a certificate signature algorithm name to the plain algorithm the
+/// underlying key signs with (e.g. `rsa-sha2-512-cert-v01@openssh.com` ->
+/// `rsa-sha2-512`). Non-certificate names are returned unchanged.
+pub fn base_signature_algorithm(algorithm: &str) -> &str {
+    match algorithm {
+        "ssh-ed25519-cert-v01@openssh.com" => "ssh-ed25519",
+        "ssh-rsa-cert-v01@openssh.com" => "ssh-rsa",
+        "rsa-sha2-256-cert-v01@openssh.com" => "rsa-sha2-256",
+        "rsa-sha2-512-cert-v01@openssh.com" => "rsa-sha2-512",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com" => "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com" => "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com" => "ecdsa-sha2-nistp521",
+        other => other,
+    }
+}
+
+/// Match a principal pattern (`*` and `?` wildcards, as OpenSSH allows in
+/// certificate principals) against a concrete name.
+fn principal_pattern_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut star_ni) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 fn parse_options(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     let mut r = bytes;
     let mut out = Vec::new();
@@ -148,7 +193,9 @@ impl Certificate {
     }
 
     pub fn principal_matches(&self, name: &str) -> bool {
-        self.principals.iter().any(|p| p == name)
+        self.principals
+            .iter()
+            .any(|p| principal_pattern_matches(p, name))
     }
 
     /// Whether any of `allowed` appears in the certificate principals.
@@ -296,7 +343,8 @@ impl HostKeySigner for CertificateSigner {
         self.inner.sign(data)
     }
     fn sign_with(&self, algorithm: &str, data: &[u8]) -> Result<Vec<u8>> {
-        self.inner.sign_with(algorithm, data)
+        self.inner
+            .sign_with(base_signature_algorithm(algorithm), data)
     }
     fn supports(&self, algorithm: &str) -> bool {
         algorithm == self.cert_type || self.inner.supports(algorithm)
@@ -381,6 +429,33 @@ mod tests {
         assert!(cert.is_valid_at(100));
         assert!(cert.is_valid_at(199));
         assert!(!cert.is_valid_at(200));
+    }
+
+    #[test]
+    fn certificate_algorithms_map_to_plain_algorithms() {
+        assert_eq!(
+            base_signature_algorithm("ssh-ed25519-cert-v01@openssh.com"),
+            "ssh-ed25519"
+        );
+        assert_eq!(
+            base_signature_algorithm("rsa-sha2-512-cert-v01@openssh.com"),
+            "rsa-sha2-512"
+        );
+        assert_eq!(
+            base_signature_algorithm("ecdsa-sha2-nistp256-cert-v01@openssh.com"),
+            "ecdsa-sha2-nistp256"
+        );
+        assert_eq!(base_signature_algorithm("ssh-ed25519"), "ssh-ed25519");
+    }
+
+    #[test]
+    fn principals_support_wildcards() {
+        let ca = Ed25519HostKey::generate().unwrap();
+        let blob = build_user_cert(&["*.example.com"], 0, 0, &ca);
+        let cert = Certificate::parse(&blob).unwrap();
+        assert!(cert.principal_matches("a.example.com"));
+        assert!(cert.principal_matches("a.b.example.com"));
+        assert!(!cert.principal_matches("example.org"));
     }
 
     #[test]

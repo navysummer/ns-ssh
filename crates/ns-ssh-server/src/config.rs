@@ -247,6 +247,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub authorized_principals_command_user: Option<String>,
 
+    /// HostCertificate: host certificates to present alongside host keys.
+    #[serde(default)]
+    pub host_certificates: Vec<String>,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -1072,6 +1076,7 @@ impl Default for ServerConfig {
             authorized_principals_file: None,
             authorized_principals_command: None,
             authorized_principals_command_user: None,
+            host_certificates: Vec::new(),
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1559,6 +1564,11 @@ impl ServerConfig {
                     // OpenSSH: LogVerbose = LogLevel VERBOSE
                     config.log_level = Some("VERBOSE".to_string());
                 }
+                "hostcertificate" | "host_certificate" => {
+                    config
+                        .host_certificates
+                        .extend(value.split_whitespace().map(|s| s.to_string()));
+                }
                 // Known OpenSSH directives accepted but not enforced. Accepting
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
@@ -1568,7 +1578,6 @@ impl ServerConfig {
                 | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
                 | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
-                | "hostcertificate" | "host_certificate"
                 | "hostkeyagent" | "host_key_agent"
                 | "kerberosauthentication" | "kerberos_authentication"
                 | "kerberosgetafstoken" | "kerberos_get_afs_token"
@@ -1965,6 +1974,20 @@ Match All
         assert!(c.authorized_principals_file.is_none());
         assert!(c.authorized_principals_command.is_none());
         assert!(c.authorized_principals_command_user.is_none());
+        assert!(c.host_certificates.is_empty());
+
+        let c = ServerConfig::parse(
+            "HostCertificate /etc/ssh/ssh_host_ed25519_key-cert.pub\n\
+             HostCertificate /etc/ssh/ssh_host_ecdsa_key-cert.pub\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.host_certificates,
+            vec![
+                "/etc/ssh/ssh_host_ed25519_key-cert.pub",
+                "/etc/ssh/ssh_host_ecdsa_key-cert.pub"
+            ]
+        );
 
         let c = ServerConfig::parse(
             "TrustedUserCAKeys /etc/ssh/ca1.pub /etc/ssh/ca2.pub\n\

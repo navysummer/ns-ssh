@@ -2,7 +2,6 @@ use crate::error::{Result, SshError};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::{Write, BufRead, BufReader};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct KnownHostEntry {
@@ -10,6 +9,9 @@ pub struct KnownHostEntry {
     pub key_type: String,
     pub public_key: Vec<u8>,
     pub comment: Option<String>,
+    /// `@cert-authority`: this key is a CA trusted to sign host certificates
+    /// for the listed hosts, not a host key itself.
+    pub cert_authority: bool,
     /// OpenSSH hashed-host fields: `|1|base64(salt)|base64(HMAC-SHA1)`.
     pub host_salt: Option<Vec<u8>>,
     pub host_hash: Option<Vec<u8>>,
@@ -64,7 +66,20 @@ impl KnownHosts {
 
     fn parse_line(line: &str) -> Option<KnownHostEntry> {
         let mut parts = line.split_whitespace();
-        let hosts_str = parts.next()?;
+        let first = parts.next()?;
+        // A leading marker (e.g. `@cert-authority`) precedes the host list.
+        let (marker, hosts_str) = if first.starts_with('@') {
+            (Some(first), parts.next()?)
+        } else {
+            (None, first)
+        };
+        let cert_authority = match marker {
+            Some("@cert-authority") => true,
+            // `@revoked` and other markers are not supported; ignore the line
+            // rather than misreading it as a regular host key entry.
+            Some(_) => return None,
+            None => false,
+        };
         let key_type = parts.next()?;
         let key_b64 = parts.next()?;
         let comment = parts.next().map(|s| s.to_string());
@@ -100,33 +115,63 @@ impl KnownHosts {
             key_type: key_type.to_string(),
             public_key: key_bytes,
             comment,
+            cert_authority,
             host_salt,
             host_hash,
         })
     }
 
-    pub fn check(&self, hostname: &str, port: u16, key_type: &str, public_key: &[u8]) -> HostKeyStatus {
+    fn entry_matches(&self, entry: &KnownHostEntry, hostname: &str, port: u16) -> bool {
         let host_port = format!("[{}]:{}", hostname, port);
-        let hostname_only = hostname.to_string();
-
-        for entry in &self.entries {
-            let host_matches = entry.hosts.iter().any(|h| {
-                h == &host_port || h == &hostname_only || h == "*"
-            }) || match (&entry.host_salt, &entry.host_hash) {
-                (Some(salt), Some(hash)) => {
-                    let candidate = format!("[{}]:{}", hostname, port);
-                    let computed = hash_hostname(salt, &candidate);
-                    constant_time_eq(computed.as_slice(), hash)
-                        || {
-                            let candidate2 = hostname.to_string();
-                            let computed2 = hash_hostname(salt, &candidate2);
-                            constant_time_eq(computed2.as_slice(), hash)
-                        }
-                }
-                _ => false,
+        let mut matched = false;
+        for pattern in &entry.hosts {
+            let (negated, pattern) = match pattern.strip_prefix('!') {
+                Some(p) => (true, p),
+                None => (false, pattern.as_str()),
             };
+            if pattern == "*"
+                || host_pattern_matches(pattern, &host_port)
+                || host_pattern_matches(pattern, hostname)
+            {
+                if negated {
+                    return false;
+                }
+                matched = true;
+            }
+        }
+        if matched {
+            return true;
+        }
+        match (&entry.host_salt, &entry.host_hash) {
+            (Some(salt), Some(hash)) => {
+                let computed = hash_hostname(salt, &host_port);
+                constant_time_eq(computed.as_slice(), hash)
+                    || {
+                        let computed = hash_hostname(salt, hostname);
+                        constant_time_eq(computed.as_slice(), hash)
+                    }
+            }
+            _ => false,
+        }
+    }
 
-            if host_matches {
+    /// CA keys from `@cert-authority` lines that apply to `hostname:port`.
+    /// (See `host_pattern_matches` for wildcard semantics.)
+    pub fn cert_authorities_for(&self, hostname: &str, port: u16) -> Vec<Vec<u8>> {
+        self.entries
+            .iter()
+            .filter(|e| e.cert_authority && self.entry_matches(e, hostname, port))
+            .map(|e| e.public_key.clone())
+            .collect()
+    }
+
+    pub fn check(&self, hostname: &str, port: u16, key_type: &str, public_key: &[u8]) -> HostKeyStatus {
+        for entry in &self.entries {
+            // `@cert-authority` entries hold CA keys, not host keys.
+            if entry.cert_authority {
+                continue;
+            }
+            if self.entry_matches(entry, hostname, port) {
                 if entry.key_type == key_type && entry.public_key == public_key {
                     return HostKeyStatus::Known;
                 } else if entry.key_type == key_type {
@@ -192,6 +237,7 @@ impl KnownHosts {
                 key_type: key_type.to_string(),
                 public_key: public_key.to_vec(),
                 comment: None,
+                cert_authority: false,
                 host_salt: salt_out,
                 host_hash: hash_out,
             });
@@ -201,6 +247,7 @@ impl KnownHosts {
                 key_type: key_type.to_string(),
                 public_key: public_key.to_vec(),
                 comment: None,
+                cert_authority: false,
                 host_salt: None,
                 host_hash: None,
             });
@@ -243,7 +290,12 @@ impl KnownHosts {
             } else {
                 entry.hosts.join(",")
             };
-            writeln!(file, "{} {} {}", hosts_field, entry.key_type, key_b64)
+            let marker = if entry.cert_authority {
+                "@cert-authority "
+            } else {
+                ""
+            };
+            writeln!(file, "{}{} {} {}", marker, hosts_field, entry.key_type, key_b64)
                 .map_err(|e| SshError::KnownHosts(format!("write error: {}", e)))?;
         }
 
@@ -283,6 +335,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_patterns_support_wildcards() {
+        assert!(host_pattern_matches("*.example.com", "a.example.com"));
+        assert!(host_pattern_matches("a?.example.com", "ab.example.com"));
+        assert!(!host_pattern_matches("*.example.com", "example.org"));
+        assert!(host_pattern_matches("*", "[localhost]:2222"));
+    }
 
     #[test]
     fn hash_hostname_matches_openssh_format() {
@@ -334,6 +394,36 @@ mod tests {
     }
 
     #[test]
+    fn cert_authority_markers_are_parsed() {
+        let dir = std::env::temp_dir().join(format!("ns_kh_ca_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+
+        let ca = vec![0xAAu8, 0xBB, 0xCC];
+        std::fs::write(
+            &path,
+            "@cert-authority *.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5\n\
+             @revoked bad.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5\n\
+             plain.other.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5\n",
+        )
+        .unwrap();
+
+        let kh = KnownHosts::new(path);
+        // The wildcard @cert-authority line applies to subdomains only.
+        assert_eq!(kh.cert_authorities_for("a.example.com", 22).len(), 1);
+        assert!(kh.cert_authorities_for("plain.other.org", 22).is_empty());
+        // @revoked entries are ignored rather than parsed as host keys.
+        assert!(!kh.entries.iter().any(|e| e.hosts.iter().any(|h| h == "bad.example.com")));
+        // A CA entry must not be treated as a host key by `check`.
+        assert_eq!(
+            kh.check("a.example.com", 22, "ssh-ed25519", &ca),
+            HostKeyStatus::Unknown
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn check_plain_entries_still_work() {
         let dir = std::env::temp_dir().join(format!("ns_kh_plain_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -352,6 +442,34 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Match a known_hosts host pattern (`*` and `?` wildcards) against text.
+fn host_pattern_matches(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut star_ti) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

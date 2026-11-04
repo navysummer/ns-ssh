@@ -970,6 +970,17 @@ async fn scan_one_host(host: &str, port: u16, key_types: &[String]) -> Option<(S
     cfg.connect_timeout = Some(10);
     if !key_types.is_empty() {
         cfg.host_key_algorithms = Some(key_types.to_vec());
+    } else {
+        // ssh-keyscan reports plain host keys; certificate variants are
+        // deliberately not requested here.
+        cfg.host_key_algorithms = Some(vec![
+            "ssh-ed25519".to_string(),
+            "ecdsa-sha2-nistp256".to_string(),
+            "ecdsa-sha2-nistp384".to_string(),
+            "ecdsa-sha2-nistp521".to_string(),
+            "rsa-sha2-512".to_string(),
+            "rsa-sha2-256".to_string(),
+        ]);
     }
     let mut client = client::SshClient::new(cfg);
     client.connect().await.ok()?;

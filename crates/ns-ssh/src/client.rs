@@ -8,6 +8,7 @@ use ssh_core::auth::*;
 use ssh_core::channel::*;
 use ssh_core::known_hosts::*;
 use ssh_core::hostkey::*;
+use ssh_core::cert::{is_certificate_key_type, Certificate, CERT_TYPE_HOST};
 use ssh_core::kex::{KexExchange, KexAlgorithm};
 use std::collections::{VecDeque, HashMap};
 use std::pin::Pin;
@@ -237,6 +238,56 @@ fn check_host_status(
             }
         }
     }
+}
+
+/// Decide whether a presented host certificate is trusted for `host:port`
+/// through `@cert-authority` entries in the user and global known_hosts files.
+fn host_cert_status(
+    user_kh: &KnownHosts,
+    global_kh: &KnownHosts,
+    host: &str,
+    port: u16,
+    cert: &Certificate,
+) -> HostKeyStatus {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if cert.cert_type != CERT_TYPE_HOST
+        || !cert.is_valid_at(now)
+        || !cert.principal_matches(host)
+    {
+        return HostKeyStatus::Changed;
+    }
+
+    let mut trusted_cas = user_kh.cert_authorities_for(host, port);
+    trusted_cas.extend(global_kh.cert_authorities_for(host, port));
+    if trusted_cas.is_empty() {
+        return HostKeyStatus::Unknown;
+    }
+    if !cert.verify_ca_signature(None) {
+        return HostKeyStatus::Changed;
+    }
+    if !trusted_cas.iter().any(|ca| ca == &cert.signature_key) {
+        return HostKeyStatus::Unknown;
+    }
+    HostKeyStatus::Known
+}
+
+/// Decode a plain public key blob (starting with its key type) into the
+/// `(key type, key material)` pair the host key verifiers expect.
+fn plain_key_material(blob: &[u8]) -> Result<(String, Vec<u8>)> {
+    let mut r = blob;
+    let key_type = SshString::decode(&mut r)?.as_str()?.to_string();
+    let bytes = if key_type.starts_with("ecdsa-") {
+        let _curve = SshString::decode(&mut r)?;
+        SshBytes::decode(&mut r)?.0
+    } else if key_type == "ssh-rsa" || key_type.starts_with("rsa-sha2-") {
+        r.to_vec()
+    } else {
+        SshBytes::decode(&mut r)?.0
+    };
+    Ok((key_type, bytes))
 }
 
 /// Format an OpenSSH-style host key fingerprint: `SHA256:...` (default) or
@@ -842,6 +893,14 @@ impl SshClient {
             SshBytes::decode(&mut r2)?.0
         };
 
+        // A certified host key carries a CA-signed certificate instead of a
+        // plain key; verification and signature checking use its inner key.
+        let host_cert = if is_certificate_key_type(&host_key_type) {
+            Some(Certificate::parse(&server_host_key_blob)?)
+        } else {
+            None
+        };
+
         // ssh-keyscan: capture the host key without verifying known_hosts.
         if self.config.ssh_keyscan {
             self.captured_host_key = Some((host_key_type.clone(), server_host_key_blob.clone()));
@@ -868,6 +927,20 @@ impl SshClient {
                 &lookup_host, self.config.port,
                 &host_key_type, &server_host_key_blob,
             );
+
+            // A certified host key is trusted through a `@cert-authority`
+            // known_hosts marker instead of a plain host key entry.
+            if status != HostKeyStatus::Known {
+                if let Some(cert) = &host_cert {
+                    status = host_cert_status(
+                        &user_kh,
+                        &global_kh,
+                        &lookup_host,
+                        self.config.port,
+                        cert,
+                    );
+                }
+            }
 
             // VerifyHostKeyDNS: verify the host key against SSHFP records.
             // OpenSSH semantics: a match accepts the key; a mismatch is fatal
@@ -959,27 +1032,34 @@ impl SshClient {
             }
         }
 
-        let sig_ok = match host_key_type.as_str() {
+        // The exchange-hash signature is made by the host's private key, so a
+        // certificate must be verified with its inner (base) key.
+        let (verify_type, verify_bytes) = match &host_cert {
+            Some(cert) => plain_key_material(&cert.raw_key_blob)?,
+            None => (host_key_type.clone(), host_key_bytes.clone()),
+        };
+
+        let sig_ok = match verify_type.as_str() {
             "ssh-ed25519" => {
-                let pk_bytes: [u8; 32] = host_key_bytes.as_slice().try_into()
+                let pk_bytes: [u8; 32] = verify_bytes.as_slice().try_into()
                     .map_err(|_| SshError::InvalidKey("ed25519 pubkey length".into()))?;
                 let verifier = Ed25519HostKey::from_public_bytes(&pk_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             "ecdsa-sha2-nistp256" => {
-                let verifier = EcdsaP256HostKey::from_public_bytes(&host_key_bytes)?;
+                let verifier = EcdsaP256HostKey::from_public_bytes(&verify_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             "ecdsa-sha2-nistp384" => {
-                let verifier = EcdsaP384HostKey::from_public_bytes(&host_key_bytes)?;
+                let verifier = EcdsaP384HostKey::from_public_bytes(&verify_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             "ecdsa-sha2-nistp521" => {
-                let verifier = EcdsaP521HostKey::from_public_bytes(&host_key_bytes)?;
+                let verifier = EcdsaP521HostKey::from_public_bytes(&verify_bytes)?;
                 HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
-                let verifier = RsaHostKey::from_public_bytes(&host_key_bytes)?;
+                let verifier = RsaHostKey::from_public_bytes(&verify_bytes)?;
                 if verifier.bits() < self.config.required_rsa_size as usize {
                     return Err(SshError::HostKeyVerificationFailed);
                 }

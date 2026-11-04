@@ -2400,6 +2400,25 @@ fn ssh_keygen_sign(ca: &Path, user_pub: &Path, principals: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Sign a host public key (`-h`) with the OpenSSH `ssh-keygen -s`.
+fn ssh_keygen_sign_host(ca: &Path, host_pub: &Path, principals: &str) -> bool {
+    Command::new("ssh-keygen")
+        .arg("-q")
+        .arg("-s")
+        .arg(ca)
+        .arg("-I")
+        .arg("ns-ssh-host-test")
+        .arg("-h")
+        .arg("-n")
+        .arg(principals)
+        .arg("-V")
+        .arg("+1h")
+        .arg(host_pub)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Run a remote command through the client and return (success, stdout, stderr).
 fn run_client_echo(
     user: &str,
@@ -2611,6 +2630,72 @@ fn server_authorized_principals_file_controls_certificate() {
     assert!(
         ok_good && stdout_good.contains("principal-ok"),
         "AuthorizedPrincipalsFile should accept the certificate principal: stderr={stderr_good}"
+    );
+}
+
+/// A host certificate signed by a CA listed as `@cert-authority` in known_hosts
+/// must be accepted; the same host is rejected once the marker is removed.
+#[test]
+fn client_accepts_host_certificate_via_cert_authority() {
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        eprintln!("SKIP: ssh-keygen not available");
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("host-cert");
+    let port = free_port();
+
+    // Pre-create the host key so `HostCertificate` has something to match.
+    let (_host_key, host_pub) = generate_ed25519_key(&dir, "host_key_ed25519");
+    let (ca, ca_pub) = generate_ed25519_key(&dir, "ca");
+    assert!(
+        ssh_keygen_sign_host(&ca, &host_pub, "127.0.0.1"),
+        "ssh-keygen failed to sign the host key"
+    );
+    let cert_path = dir.join("host_key_ed25519-cert.pub");
+    assert!(cert_path.exists(), "ssh-keygen did not write the host certificate");
+
+    let extra = vec![
+        "-o".to_string(),
+        format!("HostCertificate={}", cert_path.display()),
+    ];
+    let extra_ref: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    let (server, id_path, kh) = launch_test_server_extra(&dir, port, &extra_ref);
+
+    // Force certificate negotiation, exactly like an OpenSSH client would
+    // try the certified variant first.
+    let opts = vec![
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "HostKeyAlgorithms=ssh-ed25519-cert-v01@openssh.com".to_string(),
+    ];
+
+    // With the CA marker, the certified host key is trusted.
+    let ca_line = std::fs::read_to_string(&ca_pub).unwrap();
+    std::fs::write(&kh, format!("@cert-authority 127.0.0.1 {}\n", ca_line.trim())).unwrap();
+    let (ok, stdout, stderr) =
+        run_client_echo(&user, port, &id_path, &kh, &opts, "echo host-cert-ok");
+
+    // Without the marker the certificate is unknown and strict mode rejects it.
+    std::fs::write(&kh, "").unwrap();
+    let (ok_without, _, stderr_without) =
+        run_client_echo(&user, port, &id_path, &kh, &opts, "echo should-not-run");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        ok && stdout.contains("host-cert-ok"),
+        "host certificate should be accepted via @cert-authority: stderr={stderr} server_stdout={} server_stderr={}",
+        String::from_utf8_lossy(&server_out.stdout),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        !ok_without,
+        "host certificate must be rejected without a @cert-authority marker: stderr={stderr_without}"
     );
 }
 
