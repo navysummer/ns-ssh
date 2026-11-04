@@ -797,6 +797,18 @@ impl SshClient {
             }
         }
 
+        // IPQoS: interactive sessions (with a tty) use the interactive class,
+        // bulk sessions (exec/sftp/forwarding) use the bulk class.
+        #[cfg(unix)]
+        {
+            let tos = if self.config.request_tty {
+                self.config.ip_qos_interactive
+            } else {
+                self.config.ip_qos_bulk
+            };
+            ssh_core::transport::set_ip_qos(&stream, tos);
+        }
+
         self.peer_ip = stream.peer_addr().ok().map(|a| a.ip().to_string());
         self.stream = Some(Box::pin(stream));
         Ok(())

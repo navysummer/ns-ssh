@@ -1784,6 +1784,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = host_config.tcp_keep_alive {
                 resolved.tcp_keep_alive = v;
             }
+            if let Some(v) = &host_config.ip_qos {
+                if let Some((i, b)) = config::parse_ipqos(v) {
+                    resolved.ip_qos_interactive = i;
+                    resolved.ip_qos_bulk = b;
+                }
+            }
             if let Some(v) = host_config.batch_mode {
                 resolved.batch_mode = v;
             }
@@ -2055,6 +2061,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = mc.tcp_keep_alive {
                 resolved.tcp_keep_alive = v;
+            }
+            if let Some(v) = &mc.ip_qos {
+                if let Some((i, b)) = config::parse_ipqos(v) {
+                    resolved.ip_qos_interactive = i;
+                    resolved.ip_qos_bulk = b;
+                }
             }
             if let Some(v) = mc.batch_mode {
                 resolved.batch_mode = v;
@@ -2407,6 +2419,12 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "permitlocalcommand" | "permit_local_command" => resolved.permit_local_command = value != "no",
         "gatewayports" | "gateway_ports" => resolved.gateway_ports = value != "no",
         "tcpkeepalive" | "tcp_keep_alive" => resolved.tcp_keep_alive = value != "no",
+        "ipqos" | "ip_qos" => {
+            if let Some((i, b)) = config::parse_ipqos(value) {
+                resolved.ip_qos_interactive = i;
+                resolved.ip_qos_bulk = b;
+            }
+        }
         "logfile" | "log_file" => resolved.log_file = Some(std::path::PathBuf::from(value)),
         "rekeylimit" | "rekey_limit" => {
             if let Some((bytes, secs)) = config::parse_rekey_limit(value) {

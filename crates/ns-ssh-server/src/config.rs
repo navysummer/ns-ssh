@@ -157,6 +157,15 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub tcp_keep_alive: bool,
 
+    /// IPQoS: ToS applied to interactive (pty) sessions (default AF21 0x48;
+    /// -1 = do not set).
+    #[serde(default = "default_ip_qos_interactive")]
+    pub ip_qos_interactive: i32,
+
+    /// IPQoS: ToS applied to bulk transfers (default CS1 0x20).
+    #[serde(default = "default_ip_qos_bulk")]
+    pub ip_qos_bulk: i32,
+
     #[serde(default)]
     pub force_command: Option<String>,
 
@@ -378,6 +387,7 @@ pub struct MatchOverrides {
     pub client_alive_interval: Option<u32>,
     pub client_alive_count_max: Option<u32>,
     pub tcp_keep_alive: Option<bool>,
+    pub ip_qos: Option<(i32, i32)>,
     pub permit_user_environment: Option<bool>,
     pub accept_env: Option<Vec<String>>,
     pub set_env: Option<Vec<(String, String)>>,
@@ -480,6 +490,10 @@ impl ServerMatch {
         if let Some(v) = o.client_alive_interval { cfg.client_alive_interval = v; }
         if let Some(v) = o.client_alive_count_max { cfg.client_alive_count_max = v; }
         if let Some(v) = o.tcp_keep_alive { cfg.tcp_keep_alive = v; }
+        if let Some(v) = o.ip_qos {
+            cfg.ip_qos_interactive = v.0;
+            cfg.ip_qos_bulk = v.1;
+        }
         if let Some(v) = o.permit_user_environment { cfg.permit_user_environment = v; }
         if let Some(v) = &o.accept_env { cfg.accept_env = v.clone(); }
         if let Some(v) = &o.set_env { cfg.set_env.extend(v.iter().cloned()); }
@@ -568,6 +582,11 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
             if let Ok(v) = value.parse() { o.client_alive_count_max = Some(v); }
         }
         "tcpkeepalive" | "tcp_keep_alive" => o.tcp_keep_alive = Some(value == "yes"),
+        "ipqos" | "ip_qos" => {
+            o.ip_qos = Some(parse_ipqos(value).ok_or_else(|| {
+                SshError::Config(format!("bad IPQoS value: {}", value))
+            })?);
+        }
         "permituserenvironment" | "permit_user_environment" => o.permit_user_environment = Some(value == "yes"),
         "acceptenv" | "accept_env" => {
             let mut list = o.accept_env.take().unwrap_or_default();
@@ -935,6 +954,61 @@ pub fn parse_set_env(value: &str) -> Result<(String, String)> {
     Ok((name.to_string(), val.to_string()))
 }
 
+fn default_ip_qos_interactive() -> i32 { 0x48 }
+fn default_ip_qos_bulk() -> i32 { 0x20 }
+
+/// Parse one `IPQoS` token: a DSCP class name (cs*, af*, ef), a legacy ToS
+/// keyword (lowdelay/throughput/reliability), or an integer 0-255. Returns
+/// -1 for `none` (leave the socket untouched) and `None` for invalid input.
+pub fn parse_ipqos_token(tok: &str) -> Option<i32> {
+    let v = match tok.to_ascii_lowercase().as_str() {
+        "none" => return Some(-1),
+        "cs0" => 0x00,
+        "cs1" => 0x20,
+        "cs2" => 0x40,
+        "cs3" => 0x60,
+        "cs4" => 0x80,
+        "cs5" => 0xa0,
+        "cs6" => 0xc0,
+        "cs7" => 0xe0,
+        "af11" => 0x28,
+        "af12" => 0x30,
+        "af13" => 0x38,
+        "af21" => 0x48,
+        "af22" => 0x50,
+        "af23" => 0x58,
+        "af31" => 0x68,
+        "af32" => 0x70,
+        "af33" => 0x78,
+        "af41" => 0x88,
+        "af42" => 0x90,
+        "af43" => 0x98,
+        "ef" => 0xb8,
+        "lowdelay" => 0x10,
+        "throughput" => 0x08,
+        "reliability" => 0x04,
+        _ => {
+            let n: u32 = tok.parse().ok()?;
+            if n > 255 {
+                return None;
+            }
+            n as i32
+        }
+    };
+    Some(v)
+}
+
+/// Parse `IPQoS [interactive [bulk]]`. A single value applies to both classes.
+pub fn parse_ipqos(value: &str) -> Option<(i32, i32)> {
+    let mut toks = value.split_whitespace();
+    let interactive = parse_ipqos_token(toks.next()?)?;
+    let bulk = match toks.next() {
+        Some(t) => parse_ipqos_token(t)?,
+        None => interactive,
+    };
+    Some((interactive, bulk))
+}
+
 fn default_x11_display_offset() -> u32 { 10 }
 
 fn default_streamlocal_mask() -> u32 { 0o177 }
@@ -1080,6 +1154,8 @@ impl Default for ServerConfig {
             hostbased_auth: false,
             print_last_log: default_true(),
             tcp_keep_alive: default_true(),
+            ip_qos_interactive: default_ip_qos_interactive(),
+            ip_qos_bulk: default_ip_qos_bulk(),
             banner: default_banner(),
             max_startups: default_max_startups(),
             login_grace_time: default_login_grace_time(),
@@ -1571,6 +1647,13 @@ impl ServerConfig {
                 "tcpkeepalive" | "tcp_keep_alive" => {
                     config.tcp_keep_alive = value == "yes";
                 }
+                "ipqos" | "ip_qos" => {
+                    let (interactive, bulk) = parse_ipqos(value).ok_or_else(|| {
+                        SshError::Config(format!("bad IPQoS value: {}", value))
+                    })?;
+                    config.ip_qos_interactive = interactive;
+                    config.ip_qos_bulk = bulk;
+                }
                 "include" => {
                     // Handled during load (collect_config). Ignore here for raw parse().
                 }
@@ -1760,6 +1843,30 @@ Match User alice
                 ("PERUSER".to_string(), "2".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn ipqos_parsing() {
+        // Defaults match OpenSSH (AF21 interactive / CS1 bulk).
+        let cfg = ServerConfig::parse("").unwrap();
+        assert_eq!((cfg.ip_qos_interactive, cfg.ip_qos_bulk), (0x48, 0x20));
+
+        let cfg = ServerConfig::parse("IPQoS ef cs0\n").unwrap();
+        assert_eq!((cfg.ip_qos_interactive, cfg.ip_qos_bulk), (0xb8, 0x00));
+        // Single value applies to both; `none` means do not set (-1).
+        let cfg = ServerConfig::parse("IPQoS lowdelay\n").unwrap();
+        assert_eq!((cfg.ip_qos_interactive, cfg.ip_qos_bulk), (0x10, 0x10));
+        let cfg = ServerConfig::parse("IPQoS af21 none\n").unwrap();
+        assert_eq!((cfg.ip_qos_interactive, cfg.ip_qos_bulk), (0x48, -1));
+        // Invalid values are rejected like OpenSSH.
+        assert!(ServerConfig::parse("IPQoS bogus\n").is_err());
+
+        // Match blocks may override IPQoS.
+        let cfg = ServerConfig::parse("IPQoS cs0\nMatch User alice\n    IPQoS ef\n").unwrap();
+        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0xb8, 0xb8));
+        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0x00, 0x00));
     }
 
     #[test]

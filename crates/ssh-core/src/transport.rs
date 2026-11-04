@@ -642,6 +642,38 @@ pub fn unpack_packet_body(body: &[u8]) -> Result<Vec<u8>> {
     Ok(body[1..body.len() - padding_len].to_vec())
 }
 
+/// Set the IP type-of-service (IPv4 `IP_TOS`) or traffic class (IPv6
+/// `IPV6_TCLASS`) on a connected socket, implementing OpenSSH's `IPQoS`.
+/// A negative `tos` (OpenSSH `none`) leaves the socket untouched.
+/// Failures are intentionally silent: QoS is best-effort.
+#[cfg(unix)]
+pub fn set_ip_qos<S: std::os::unix::io::AsRawFd>(stream: &S, tos: i32) {
+    if tos < 0 {
+        return;
+    }
+    let fd = stream.as_raw_fd();
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+            return;
+        }
+        let val: libc::c_int = tos;
+        let (level, opt) = match addr.ss_family as libc::c_int {
+            libc::AF_INET => (libc::IPPROTO_IP, libc::IP_TOS),
+            libc::AF_INET6 => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+            _ => return,
+        };
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
 pub async fn send_raw_packet(stream: &mut (impl AsyncWrite + Unpin), payload: &[u8]) -> Result<()> {
     let base = 1 + payload.len();
     let padding_len = compute_packet_padding(base, 8, true);

@@ -193,6 +193,12 @@ fn main() {
                 "tcpkeepalive" | "tcp_keep_alive" => {
                     config.tcp_keep_alive = value == "yes";
                 }
+                "ipqos" | "ip_qos" => {
+                    if let Some((i, b)) = config::parse_ipqos(value) {
+                        config.ip_qos_interactive = i;
+                        config.ip_qos_bulk = b;
+                    }
+                }
                 "allowagentforwarding" | "allow_agent_forwarding" => {
                     config.allow_agent_forwarding = value == "yes";
                 }

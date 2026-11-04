@@ -95,6 +95,8 @@ pub struct HostConfig {
     pub server_alive_count_max: Option<u32>,
     #[serde(default)]
     pub tcp_keep_alive: Option<bool>,
+    /// IPQoS: raw value (`[interactive [bulk]]`, class names or integers).
+    pub ip_qos: Option<String>,
     #[serde(default)]
     pub batch_mode: Option<bool>,
     #[serde(default)]
@@ -277,6 +279,11 @@ pub struct ResolvedConfig {
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
     pub tcp_keep_alive: bool,
+    /// IPQoS ToS/TrafficClass for interactive sessions (default AF21 0x48;
+    /// -1 = do not set).
+    pub ip_qos_interactive: i32,
+    /// IPQoS ToS/TrafficClass for bulk transfers (default CS1 0x20).
+    pub ip_qos_bulk: i32,
     pub batch_mode: bool,
     pub password_authentication: bool,
     pub pubkey_authentication: bool,
@@ -398,6 +405,8 @@ impl ResolvedConfig {
             server_alive_interval: None,
             server_alive_count_max: None,
             tcp_keep_alive: true,
+            ip_qos_interactive: 0x48,
+            ip_qos_bulk: 0x20,
             batch_mode: false,
             password_authentication: true,
             pubkey_authentication: true,
@@ -779,6 +788,7 @@ impl SshConfig {
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
         let mut tcp_keep_alive = None;
+        let mut ip_qos = None;
         let mut batch_mode = None;
         let mut password_authentication = None;
         let mut pubkey_authentication = None;
@@ -875,6 +885,7 @@ impl SshConfig {
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
                             tcp_keep_alive: tcp_keep_alive.take(),
+                            ip_qos: ip_qos.take(),
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
@@ -958,6 +969,7 @@ impl SshConfig {
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
                             tcp_keep_alive: tcp_keep_alive.take(),
+                            ip_qos: ip_qos.take(),
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
@@ -1058,6 +1070,7 @@ impl SshConfig {
                 "serveraliveinterval" | "server_alive_interval" => server_alive_interval = parse_u32(value),
                 "serveralivecountmax" | "server_alive_count_max" => server_alive_count_max = parse_u32(value),
                 "tcpkeepalive" | "tcp_keep_alive" => tcp_keep_alive = Some(yes(value)),
+                "ipqos" | "ip_qos" => ip_qos = Some(value.to_string()),
                 "batchmode" | "batch_mode" => batch_mode = Some(yes(value)),
                 "passwordauthentication" | "password_authentication" => password_authentication = Some(yes(value)),
                 "pubkeyauthentication" | "pubkey_authentication" => pubkey_authentication = Some(yes(value)),
@@ -1242,6 +1255,7 @@ impl SshConfig {
                 server_alive_interval,
                 server_alive_count_max,
                 tcp_keep_alive,
+                ip_qos: ip_qos.clone(),
                 batch_mode,
                 password_authentication,
                 pubkey_authentication,
@@ -1325,6 +1339,7 @@ impl SshConfig {
                     server_alive_interval,
                     server_alive_count_max,
                     tcp_keep_alive,
+                    ip_qos: ip_qos.clone(),
                     batch_mode,
                     password_authentication,
                     pubkey_authentication,
@@ -1627,6 +1642,58 @@ pub fn parse_stdio_forward(spec: &str) -> std::result::Result<(String, u16), Str
     Ok((host.to_string(), port))
 }
 
+/// Parse one `IPQoS` token: a DSCP class name (cs*, af*, ef), a legacy ToS
+/// keyword (lowdelay/throughput/reliability), or an integer 0-255. Returns
+/// -1 for `none` (leave the socket untouched) and `None` for invalid input.
+pub fn parse_ipqos_token(tok: &str) -> Option<i32> {
+    let v = match tok.to_ascii_lowercase().as_str() {
+        "none" => return Some(-1),
+        "cs0" => 0x00,
+        "cs1" => 0x20,
+        "cs2" => 0x40,
+        "cs3" => 0x60,
+        "cs4" => 0x80,
+        "cs5" => 0xa0,
+        "cs6" => 0xc0,
+        "cs7" => 0xe0,
+        "af11" => 0x28,
+        "af12" => 0x30,
+        "af13" => 0x38,
+        "af21" => 0x48,
+        "af22" => 0x50,
+        "af23" => 0x58,
+        "af31" => 0x68,
+        "af32" => 0x70,
+        "af33" => 0x78,
+        "af41" => 0x88,
+        "af42" => 0x90,
+        "af43" => 0x98,
+        "ef" => 0xb8,
+        "lowdelay" => 0x10,
+        "throughput" => 0x08,
+        "reliability" => 0x04,
+        _ => {
+            let n: u32 = tok.parse().ok()?;
+            if n > 255 {
+                return None;
+            }
+            n as i32
+        }
+    };
+    Some(v)
+}
+
+/// Parse `IPQoS [interactive [bulk]]`. A single value applies to both classes.
+pub fn parse_ipqos(value: &str) -> Option<(i32, i32)> {
+    let mut toks = value.split_whitespace();
+    let interactive = parse_ipqos_token(toks.next()?)?;
+    let bulk = match toks.next() {
+        Some(t) => parse_ipqos_token(t)?,
+        None => interactive,
+    };
+    Some((interactive, bulk))
+}
+
 /// Parse an OpenSSH `RekeyLimit` value.
 ///
 /// Syntax: `RekeyLimit [time] [size]` (either order), where `size` may carry a
@@ -1886,6 +1953,30 @@ mod tests {
         assert_eq!(parse_forward_spec(""), None);
         assert_eq!(parse_forward_spec("8080"), None);
         assert_eq!(parse_forward_spec("a:b:c:d:e"), None);
+    }
+
+    #[test]
+    fn ipqos_parsing() {
+        // Class names (case-insensitive) and a single value applying to both.
+        assert_eq!(parse_ipqos("af21 cs1"), Some((0x48, 0x20)));
+        assert_eq!(parse_ipqos("AF21 cs1"), Some((0x48, 0x20)));
+        assert_eq!(parse_ipqos("ef"), Some((0xb8, 0xb8)));
+        // Legacy ToS keywords and numeric values.
+        assert_eq!(parse_ipqos("lowdelay throughput"), Some((0x10, 0x08)));
+        assert_eq!(parse_ipqos("16 32"), Some((16, 32)));
+        // `none` disables setting the socket option (-1).
+        assert_eq!(parse_ipqos("none"), Some((-1, -1)));
+        assert_eq!(parse_ipqos("af21 none"), Some((0x48, -1)));
+        // Invalid input.
+        assert_eq!(parse_ipqos(""), None);
+        assert_eq!(parse_ipqos("bogus"), None);
+        assert_eq!(parse_ipqos("256"), None);
+    }
+
+    #[test]
+    fn ipqos_directive_in_config() {
+        let cfg = SshConfig::parse("Host example\n  IPQoS lowdelay cs1\n").unwrap();
+        assert_eq!(cfg.hosts[0].ip_qos.as_deref(), Some("lowdelay cs1"));
     }
 
     #[test]

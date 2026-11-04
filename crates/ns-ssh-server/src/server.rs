@@ -136,6 +136,11 @@ impl SshServer {
                 }
             }
 
+            // IPQoS: connections start in the bulk class; a successful pty-req
+            // later switches the socket to the interactive class.
+            #[cfg(unix)]
+            ssh_core::transport::set_ip_qos(&stream, self.config.ip_qos_bulk);
+
             let config = self.config.clone();
             let host_keys = self.host_keys.clone();
             let auth = self.auth.clone();
@@ -2264,6 +2269,10 @@ async fn handle_connection_service(
                                             session_manager.set_pty(sid, term, width, height);
                                         }
                                     }
+
+                                    // IPQoS: a pty session is interactive.
+                                    #[cfg(unix)]
+                                    ssh_core::transport::set_ip_qos(stream, config.ip_qos_interactive);
 
                                     if want_reply {
                                         let reply = build_channel_success(channel_id);
