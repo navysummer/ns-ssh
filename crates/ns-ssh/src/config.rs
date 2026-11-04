@@ -66,6 +66,10 @@ pub struct HostConfig {
     #[serde(default)]
     pub forward_x11: Option<bool>,
     #[serde(default)]
+    pub forward_x11_trusted: Option<bool>,
+    #[serde(default)]
+    pub forward_x11_timeout: Option<u32>,
+    #[serde(default)]
     pub compression: Option<bool>,
     #[serde(default)]
     pub strict_host_key_checking: Option<String>,
@@ -223,6 +227,11 @@ pub struct ResolvedConfig {
     pub identities_only: bool,
     pub forward_agent: bool,
     pub forward_x11: bool,
+    /// ForwardX11Trusted: remote X11 clients get full display access.
+    pub forward_x11_trusted: bool,
+    /// ForwardX11Timeout: seconds an untrusted X11 session may stay idle
+    /// before the channel is closed (default 1200; 0 disables).
+    pub forward_x11_timeout: u32,
     pub compression: bool,
     pub strict_host_key_checking: HostKeyChecking,
     pub hash_known_hosts: bool,
@@ -328,6 +337,8 @@ impl ResolvedConfig {
             identities_only: false,
             forward_agent: false,
             forward_x11: false,
+            forward_x11_trusted: false,
+            forward_x11_timeout: 1200,
             compression: false,
             strict_host_key_checking: HostKeyChecking::Yes,
             hash_known_hosts: false,
@@ -549,6 +560,8 @@ impl SshConfig {
         let mut identities_only = None;
         let mut forward_agent = None;
         let mut forward_x11 = None;
+        let mut forward_x11_trusted = None;
+        let mut forward_x11_timeout: Option<u32> = None;
         let mut compression = None;
         let mut strict_host_key_checking = None;
         let mut hash_known_hosts = None;
@@ -633,6 +646,8 @@ impl SshConfig {
                             identities_only: identities_only.take(),
                             forward_agent: forward_agent.take(),
                             forward_x11: forward_x11.take(),
+                            forward_x11_trusted: forward_x11_trusted.take(),
+                            forward_x11_timeout: forward_x11_timeout.take(),
                             compression: compression.take(),
                             strict_host_key_checking: strict_host_key_checking.take(),
                             hash_known_hosts: hash_known_hosts.take(),
@@ -704,6 +719,8 @@ impl SshConfig {
                             identities_only: identities_only.take(),
                             forward_agent: forward_agent.take(),
                             forward_x11: forward_x11.take(),
+                            forward_x11_trusted: forward_x11_trusted.take(),
+                            forward_x11_timeout: forward_x11_timeout.take(),
                             compression: compression.take(),
                             strict_host_key_checking: strict_host_key_checking.take(),
                             hash_known_hosts: hash_known_hosts.take(),
@@ -778,6 +795,10 @@ impl SshConfig {
                 "identitiesonly" | "identities_only" => identities_only = Some(yes(value)),
                 "forwardagent" | "forward_agent" => forward_agent = Some(yes(value)),
                 "forwardx11" | "forward_x11" => forward_x11 = Some(yes(value)),
+                "forwardx11trusted" | "forward_x11_trusted" => forward_x11_trusted = Some(yes(value)),
+                "forwardx11timeout" | "forward_x11_timeout" => {
+                    forward_x11_timeout = parse_time_suffix(value).map(|v| v as u32);
+                }
                 "compression" => compression = Some(yes(value)),
                 "stricthostkeychecking" | "strict_host_key_checking" => {
                     strict_host_key_checking = Some(value.to_string())
@@ -883,7 +904,6 @@ impl SshConfig {
                 | "canonicalizemaxdots" | "canonicalize_max_dots"
                 | "canonicalizefallbacklocal" | "canonicalize_fallback_local"
                 | "canonicalizepermittedcnames" | "canonicalize_permitted_cnames"
-                | "forwardx11trusted" | "forward_x11_trusted"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
                 | "usekeychain" | "use_keychain"
@@ -938,6 +958,8 @@ impl SshConfig {
                 identities_only,
                 forward_agent,
                 forward_x11,
+                forward_x11_trusted,
+                forward_x11_timeout,
                 compression,
                 strict_host_key_checking: strict_host_key_checking.clone(),
                 hash_known_hosts,
@@ -1009,6 +1031,8 @@ impl SshConfig {
                     identities_only,
                     forward_agent,
                     forward_x11,
+                    forward_x11_trusted,
+                    forward_x11_timeout,
                     compression,
                     strict_host_key_checking: strict_host_key_checking.clone(),
                     hash_known_hosts,
@@ -1690,5 +1714,21 @@ mod tests {
         // `none` disables the timeout for that type.
         let entries = parse_channel_timeout("session=none");
         assert_eq!(channel_timeout_secs(&entries, "session"), 0);
+    }
+
+    #[test]
+    fn forward_x11_options_are_parsed() {
+        let cfg = SshConfig::parse(
+            "Host foo\n  ForwardX11Trusted yes\n  ForwardX11Timeout 20m\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.forward_x11_trusted, Some(true));
+        assert_eq!(host.forward_x11_timeout, Some(1200));
+
+        // Defaults: untrusted, 20 minutes.
+        let r = ResolvedConfig::default_for_user("nobody");
+        assert!(!r.forward_x11_trusted);
+        assert_eq!(r.forward_x11_timeout, 1200);
     }
 

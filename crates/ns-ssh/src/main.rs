@@ -288,8 +288,9 @@ fn main() {
         config.forward_x11 = false;
     }
 
-    if !args.forward_x11_trusted {
-        // -Y sets trusted; -X sets untrusted; for simplicity both enable forwarding
+    if args.forward_x11_trusted {
+        // -Y: remote X11 clients are trusted with full display access.
+        config.forward_x11_trusted = true;
     }
 
     if let Some(bind) = args.bind_address.clone() {
@@ -484,6 +485,8 @@ fn print_effective_config(cfg: &ResolvedConfig) {
     println!("identitiesonly {}", yesno(cfg.identities_only));
     println!("forwardagent {}", yesno(cfg.forward_agent));
     println!("forwardx11 {}", yesno(cfg.forward_x11));
+    println!("forwardx11trusted {}", yesno(cfg.forward_x11_trusted));
+    println!("forwardx11timeout {}", cfg.forward_x11_timeout);
     println!("compression {}", yesno(cfg.compression));
     println!("stricthostkeychecking {}", cfg.strict_host_key_checking.as_str());
     println!("hashknownhosts {}", yesno(cfg.hash_known_hosts));
@@ -1701,6 +1704,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(x) = host_config.forward_x11 {
                 resolved.forward_x11 = x;
             }
+            if let Some(x) = host_config.forward_x11_trusted {
+                resolved.forward_x11_trusted = x;
+            }
+            if let Some(x) = host_config.forward_x11_timeout {
+                resolved.forward_x11_timeout = x;
+            }
             if let Some(c) = host_config.compression {
                 resolved.compression = c;
             }
@@ -1936,6 +1945,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(x) = mc.forward_x11 {
                 resolved.forward_x11 = x;
+            }
+            if let Some(x) = mc.forward_x11_trusted {
+                resolved.forward_x11_trusted = x;
+            }
+            if let Some(x) = mc.forward_x11_timeout {
+                resolved.forward_x11_timeout = x;
             }
             if let Some(c) = mc.compression {
                 resolved.compression = c;
@@ -2183,6 +2198,12 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "forwardagent" | "forward_agent" => resolved.forward_agent = value != "no",
         "forwardx11" | "forward_x11" => resolved.forward_x11 = value != "no",
+        "forwardx11trusted" | "forward_x11_trusted" => resolved.forward_x11_trusted = value != "no",
+        "forwardx11timeout" | "forward_x11_timeout" => {
+            if let Some(v) = config::parse_time_suffix(value) {
+                resolved.forward_x11_timeout = v as u32;
+            }
+        }
         "compression" => resolved.compression = value != "no",
         "proxyjump" | "proxy_jump" => resolved.proxy_jump = Some(value.to_string()),
         "proxycommand" | "proxy_command" => resolved.proxy_command = Some(value.to_string()),

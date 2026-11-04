@@ -1813,6 +1813,16 @@ impl SshClient {
                     for (id, last) in channel_last_activity.iter() {
                         let Some(ch) = self.channel_manager.get_channel(*id) else { continue };
                         let secs = crate::config::channel_timeout_secs(&self.config.channel_timeouts, &ch.channel_type);
+                        // ForwardX11Timeout limits untrusted X11 sessions when
+                        // no explicit ChannelTimeout entry covers x11.
+                        let secs = if secs == 0
+                            && ch.channel_type == "x11"
+                            && !self.config.forward_x11_trusted
+                        {
+                            self.config.forward_x11_timeout as u64
+                        } else {
+                            secs
+                        };
                         if secs > 0 && last.elapsed().as_secs() >= secs {
                             expired.push((*id, secs));
                         }
