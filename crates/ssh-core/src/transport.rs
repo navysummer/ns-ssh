@@ -395,8 +395,18 @@ impl SshTransport {
     /// Reject a non-KEX packet received while strict KEX is active. Called from
     /// every packet reader so the rule applies uniformly to core, client-local
     /// and server-local transport implementations.
+    ///
+    /// Like OpenSSH (`kex_protocol_error`), the ordering rule only applies to
+    /// the initial key exchange: Terrapin targets the first KEX, and rekeys
+    /// routinely deliver data packets that were already in flight when the
+    /// peer's KEXINIT was sent. The session id is recorded only after the
+    /// initial NEWKEYS, so its presence marks a rekey.
     pub fn check_strict_kex_packet(&self, payload: &[u8]) -> Result<()> {
-        if !self.strict_kex || !self.strict_kex_peer_kexinit || self.state == KexState::Established {
+        if !self.strict_kex
+            || !self.strict_kex_peer_kexinit
+            || self.session_id.is_some()
+            || self.state == KexState::Established
+        {
             return Ok(());
         }
         match payload.first() {
@@ -412,8 +422,13 @@ impl SshTransport {
     /// After both NEWKEYS have crossed under strict KEX, both sequence
     /// numbers restart at zero. In non-strict mode they keep counting (as
     /// OpenSSH did before strict KEX existed).
+    ///
+    /// The reset is part of the initial exchange only: OpenSSH resets the
+    /// counters when `SSH2_MSG_NEWKEYS` is seen while `kex_strict` is set, and
+    /// `kex_strict` is only ever set for the initial KEX. Resetting on rekey
+    /// would desynchronise the MAC sequence numbers with OpenSSH.
     pub fn reset_sequences_after_newkeys(&mut self) {
-        if self.strict_kex {
+        if self.strict_kex && self.session_id.is_none() {
             self.outgoing_seq = 0;
             self.incoming_seq = 0;
         }
@@ -774,10 +789,12 @@ pub async fn send_encrypted_packet(
         stream.write_all(&packet).await?;
     }
 
-    if !is_newkeys {
-        transport.bytes_out += wire_len as u64;
-        transport.outgoing_seq += 1;
-    }
+    // RFC 4253 §6.4: every packet, including NEWKEYS, consumes a sequence
+    // number. `is_newkeys` only suppresses compression for the NEWKEYS packet
+    // itself; the counters must keep advancing so both peers stay in sync
+    // across rekeys (strict KEX resets them afterwards for the initial KEX).
+    transport.bytes_out += wire_len as u64;
+    transport.outgoing_seq += 1;
     stream.flush().await?;
     Ok(())
 }
@@ -829,10 +846,8 @@ pub async fn receive_encrypted_packet(
                 return Err(SshError::Protocol("chacha packet too short".into()));
             }
             let payload = unpack_packet_body(&plaintext[4..])?;
-            if !is_newkeys {
-                transport.bytes_in += (4 + plen + tag_len) as u64;
-                transport.incoming_seq += 1;
-            }
+            transport.bytes_in += (4 + plen + tag_len) as u64;
+            transport.incoming_seq += 1;
             payload
         } else {
             // GCM and other AEAD ciphers: packet_length is cleartext and
@@ -850,10 +865,8 @@ pub async fn receive_encrypted_packet(
             let plaintext = cipher.decrypt_with_aad(seq, &len_buf, &ciphertext)
                 .map_err(|_| SshError::DecryptionFailed)?;
             let payload = unpack_packet_body(&plaintext)?;
-            if !is_newkeys {
-                transport.bytes_in += (4 + total_len + tag_len) as u64;
-                transport.incoming_seq += 1;
-            }
+            transport.bytes_in += (4 + total_len + tag_len) as u64;
+            transport.incoming_seq += 1;
             payload
         }
     } else {
@@ -863,10 +876,8 @@ pub async fn receive_encrypted_packet(
         } else {
             receive_non_etm_packet(stream, cipher, mac, seq).await?
         };
-        if !is_newkeys {
-            transport.bytes_in += wire_len as u64;
-            transport.incoming_seq += 1;
-        }
+        transport.bytes_in += wire_len as u64;
+        transport.incoming_seq += 1;
         payload
     };
 
@@ -988,10 +999,10 @@ pub async fn send_encrypted_packet_server(
         stream.write_all(&packet).await?;
     }
 
-    if !is_newkeys {
-        transport.bytes_out += wire_len as u64;
-        transport.outgoing_seq += 1;
-    }
+    // Every packet consumes a sequence number; `is_newkeys` only suppresses
+    // compression for the NEWKEYS packet itself.
+    transport.bytes_out += wire_len as u64;
+    transport.outgoing_seq += 1;
     stream.flush().await?;
     Ok(())
 }
@@ -1042,10 +1053,8 @@ pub async fn receive_encrypted_packet_server(
                 return Err(SshError::Protocol("chacha packet too short".into()));
             }
             let payload = unpack_packet_body(&plaintext[4..])?;
-            if !is_newkeys {
-                transport.bytes_in += (4 + plen + tag_len) as u64;
-                transport.incoming_seq += 1;
-            }
+            transport.bytes_in += (4 + plen + tag_len) as u64;
+            transport.incoming_seq += 1;
             payload
         } else {
             // GCM and other AEAD ciphers: packet_length is cleartext.
@@ -1062,10 +1071,8 @@ pub async fn receive_encrypted_packet_server(
             let plaintext = cipher.decrypt_with_aad(seq, &len_buf, &ciphertext)
                 .map_err(|_| SshError::DecryptionFailed)?;
             let payload = unpack_packet_body(&plaintext)?;
-            if !is_newkeys {
-                transport.bytes_in += (4 + total_len + tag_len) as u64;
-                transport.incoming_seq += 1;
-            }
+            transport.bytes_in += (4 + total_len + tag_len) as u64;
+            transport.incoming_seq += 1;
             payload
         }
     } else {
@@ -1074,10 +1081,8 @@ pub async fn receive_encrypted_packet_server(
         } else {
             receive_non_etm_packet(stream, cipher, mac, seq).await?
         };
-        if !is_newkeys {
-            transport.bytes_in += wire_len as u64;
-            transport.incoming_seq += 1;
-        }
+        transport.bytes_in += wire_len as u64;
+        transport.incoming_seq += 1;
         payload
     };
 
@@ -1323,6 +1328,14 @@ mod tests {
         // After NEWKEYS generic messages are legal again.
         t.state = KexState::Established;
         assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_IGNORE]).is_ok());
+
+        // A rekey (session id already recorded) is not subject to the
+        // ordering rule: data packets in flight when the peer sent its
+        // KEXINIT are legal, matching OpenSSH's KEX_INITIAL-only check.
+        t.session_id = Some(vec![1, 2, 3]);
+        t.state = KexState::NewKeysSent;
+        t.strict_kex_peer_kexinit = true;
+        assert!(t.check_strict_kex_packet(&[msg::SSH_MSG_CHANNEL_REQUEST]).is_ok());
     }
 
     #[test]
@@ -1342,6 +1355,17 @@ mod tests {
         plain.reset_sequences_after_newkeys();
         assert_eq!(plain.outgoing_seq, 3);
         assert_eq!(plain.incoming_seq, 2);
+
+        // Strict KEX only resets after the *initial* NEWKEYS; a rekey (session
+        // id present) keeps counting so the MAC sequence stays in sync.
+        let mut rekey = SshTransport::new();
+        rekey.strict_kex = true;
+        rekey.session_id = Some(vec![1, 2, 3]);
+        rekey.outgoing_seq = 3;
+        rekey.incoming_seq = 2;
+        rekey.reset_sequences_after_newkeys();
+        assert_eq!(rekey.outgoing_seq, 3);
+        assert_eq!(rekey.incoming_seq, 2);
     }
 
     /// Build a raw packet body: padding_length, payload, padding.

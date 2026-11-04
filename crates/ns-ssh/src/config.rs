@@ -1157,7 +1157,6 @@ impl SshConfig {
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
                 | "revokedhostkeys" | "revoked_host_keys"
-                | "securitykeyprovider" | "security_key_provider"
                 | "enableescapecommandline" | "enable_escape_commandline"
                 | "enablesshkeysign" | "enable_ssh_keysign"
                 | "forkafterauthentication" | "fork_after_authentication"
@@ -1165,13 +1164,23 @@ impl SshConfig {
                 | "proxyusefdpass" | "proxy_use_fdpass"
                 | "tunneldevice" | "tunnel_device"
                 | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
-                | "gssapiauthentication" | "gssapi_authentication"
-                | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
-                | "usekeychain" | "use_keychain"
                 // Deprecated OpenSSH aliases: accepted and ignored, matching
                 // OpenSSH's "Deprecated option" behaviour.
                 | "rsaauthentication" | "rhostsrsaauthentication" => {
                     // Accepted; not enforced.
+                }
+                // Explicitly unsupported (environment-dependent) features:
+                // GSSAPI/Kerberos needs a GSSAPI library, `SecurityKeyProvider`
+                // selects a PKCS#11/FIDO2 provider, and `UseKeychain` is macOS
+                // keychain integration. The directives are accepted so that
+                // real ssh_config files remain loadable, but they have no
+                // effect: the client never attempts GSSAPI or security-key
+                // authentication and never loads a PKCS#11 provider.
+                "gssapiauthentication" | "gssapi_authentication"
+                | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
+                | "securitykeyprovider" | "security_key_provider"
+                | "usekeychain" | "use_keychain" => {
+                    // Accepted; explicitly not implemented.
                 }
                 "requiredrsasize" | "required_rsa_size" => {
                     if let Ok(v) = value.parse() {
@@ -1818,6 +1827,22 @@ mod tests {
         assert!(is_ip_literal("127.0.0.1"));
         assert!(is_ip_literal("[::1]"));
         assert!(!is_ip_literal("example.com"));
+    }
+
+    #[test]
+    fn unsupported_environment_auth_directives_are_accepted() {
+        // These need a GSSAPI library, a PKCS#11/FIDO2 provider or macOS
+        // keychain access. They must not make a real ssh_config unloadable.
+        let cfg = SshConfig::parse(
+            "Host env\n\
+             \x20 GSSAPIAuthentication yes\n\
+             \x20 GSSAPIDelegateCredentials yes\n\
+             \x20 SecurityKeyProvider internal\n\
+             \x20 UseKeychain yes\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hosts.len(), 1);
+        assert_eq!(cfg.hosts[0].host, "env");
     }
 
     #[test]

@@ -1542,8 +1542,27 @@ impl ServerConfig {
                 "include" => {
                     // Handled during load (collect_config). Ignore here for raw parse().
                 }
-                "usepam" | "use_pam" => {
-                    // PAM authentication is not implemented; accept the directive silently.
+                // Explicitly unsupported (environment-dependent) features:
+                // PAM (UsePAM/PAMServiceName), GSSAPI/Kerberos, PKCS#11/FIDO2
+                // security-key providers, the host key agent, and
+                // PerSourcePenalties-based throttling all require external
+                // libraries or platform facilities. The directives are accepted
+                // so that real sshd_config files remain loadable, but no such
+                // authentication, credential delegation or penalty logic runs.
+                "usepam" | "use_pam"
+                | "pamservicename" | "pam_service_name"
+                | "gssapiauthentication" | "gssapi_authentication"
+                | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
+                | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
+                | "kerberosauthentication" | "kerberos_authentication"
+                | "kerberosgetafstoken" | "kerberos_get_afs_token"
+                | "kerberosorlocalpasswd" | "kerberos_or_local_passwd"
+                | "kerberosticketcleanup" | "kerberos_ticket_cleanup"
+                | "persourcepenalties" | "per_source_penalties"
+                | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
+                | "securitykeyprovider" | "security_key_provider"
+                | "hostkeyagent" | "host_key_agent" => {
+                    // Accepted; explicitly not implemented.
                 }
                 "addressfamily" | "address_family" => {
                     config.address_family = Some(value.to_string());
@@ -1573,23 +1592,11 @@ impl ServerConfig {
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
                 "casignaturealgorithms" | "ca_signature_algorithms"
-                | "gssapiauthentication" | "gssapi_authentication"
-                | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
-                | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
                 | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
-                | "hostkeyagent" | "host_key_agent"
-                | "kerberosauthentication" | "kerberos_authentication"
-                | "kerberosgetafstoken" | "kerberos_get_afs_token"
-                | "kerberosorlocalpasswd" | "kerberos_or_local_passwd"
-                | "kerberosticketcleanup" | "kerberos_ticket_cleanup"
                 | "modulifile" | "moduli_file"
-                | "pamservicename" | "pam_service_name"
-                | "persourcepenalties" | "per_source_penalties"
-                | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
                 | "rdomain"
-                | "securitykeyprovider" | "security_key_provider"
                 | "sshdsessionpath" | "sshd_session_path"
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location"
@@ -1673,6 +1680,30 @@ mod tests {
         let l = resolve_pubkey_algorithms_server("default");
         assert!(!pubkey_alg_accepted_server("ssh-rsa", &l));
         assert!(pubkey_alg_accepted_server("ssh-ed25519", &l));
+    }
+
+    #[test]
+    fn unsupported_environment_directives_are_accepted() {
+        // PAM, GSSAPI/Kerberos, PKCS#11/FIDO2 providers, the host key agent and
+        // PerSourcePenalties throttling are explicitly not implemented. They
+        // must still leave a real sshd_config loadable.
+        let cfg = ServerConfig::parse(
+            "\
+UsePAM yes
+PAMServiceName sshd
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials yes
+KerberosAuthentication yes
+KerberosTicketCleanup yes
+PerSourcePenalties yes
+PerSourcePenaltyExemptList 127.0.0.1/32
+SecurityKeyProvider internal
+HostKeyAgent /run/hostkeyd.sock
+",
+        )
+        .unwrap();
+        // No enforcement: defaults are unchanged.
+        assert_eq!(cfg.port, 22);
     }
 
     #[test]

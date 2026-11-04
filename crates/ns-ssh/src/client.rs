@@ -1240,7 +1240,11 @@ impl SshClient {
             &exchange_hash,
         )?;
 
-        self.session_id = Some(exchange_hash);
+        self.session_id = Some(exchange_hash.clone());
+        // The transport mirrors the session id so strict KEX ordering and the
+        // sequence-number reset apply to the initial exchange only (see
+        // SshTransport::reset_sequences_after_newkeys).
+        self.transport.session_id = Some(exchange_hash);
         self.transport.kex_algorithm = Some(kex);
         self.transport.state = KexState::Established;
         // The RekeyLimit byte counter starts after the initial key exchange.
@@ -2280,7 +2284,7 @@ impl SshClient {
                     }
                 }
 
-                packet = self.recv_packet_impl(false) => {
+                packet = self.recv_packet_impl(false, false) => {
                     last_any_packet = std::time::Instant::now();
                     match packet {
                         Ok(payload) if !payload.is_empty() => {
@@ -3381,10 +3385,14 @@ impl SshClient {
         // returned so it can also flush data deferred on an exhausted window;
         // consuming them here would deadlock a window-gated upload when the
         // peer sends no further data packets.
-        self.recv_packet_impl(true).await
+        self.recv_packet_impl(true, true).await
     }
 
-    async fn recv_packet_impl(&mut self, skip_window_adjust: bool) -> Result<Vec<u8>> {
+    async fn recv_packet_impl(
+        &mut self,
+        skip_window_adjust: bool,
+        handle_kexinit: bool,
+    ) -> Result<Vec<u8>> {
         loop {
             if let Some(p) = self.deferred_packets.pop_front() {
                 return Ok(p);
@@ -3392,7 +3400,12 @@ impl SshClient {
             let aead = self.is_aead();
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-            if p.first() == Some(&msg::SSH_MSG_KEXINIT) {
+            // The event loop polled this future inside `select!`; completing a
+            // rekey there would let an unrelated branch (e.g. stdout data) drop
+            // the half-finished exchange, leaving the peer waiting for NEWKEYS.
+            // It therefore returns KEXINIT to the caller, which runs the rekey
+            // in the select branch body where it cannot be cancelled.
+            if handle_kexinit && p.first() == Some(&msg::SSH_MSG_KEXINIT) {
                 let deferred = self.perform_rekey_with_kex(p).await?;
                 for d in deferred {
                     self.deferred_packets.push_back(d);
