@@ -2359,3 +2359,41 @@ fn server_per_source_max_startups_drops_excess() {
         elapsed
     );
 }
+
+/// `ExposeAuthInfo` must put the accepted method and public key into the file
+/// named by `SSH_USER_AUTH`.
+#[test]
+fn server_expose_auth_info_sets_ssh_user_auth() {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("server-expose-auth");
+    let port = free_port();
+    let (server, id_path, kh) =
+        launch_test_server_extra(&dir, port, &["-o", "ExposeAuthInfo=yes"]);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("cat \"$SSH_USER_AUTH\"")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "remote command failed: stderr={:?} server_stdout={} server_stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stdout),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        stdout.starts_with("publickey ssh-ed25519 "),
+        "SSH_USER_AUTH should list the accepted public key method, got: {:?}",
+        stdout
+    );
+}

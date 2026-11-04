@@ -224,6 +224,12 @@ fn main() {
                 "refuseconnection" | "refuse_connection" => {
                     config.refuse_connection = crate::config::parse_refuse_connection(value);
                 }
+                "permituserrc" | "permit_user_rc" => {
+                    config.permit_user_rc = value == "yes";
+                }
+                "exposeauthinfo" | "expose_auth_info" => {
+                    config.expose_auth_info = value == "yes";
+                }
                 "persourcemaxstartups" | "per_source_max_startups" => {
                     config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
                         None

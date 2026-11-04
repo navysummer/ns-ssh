@@ -217,6 +217,15 @@ pub struct ServerConfig {
     #[serde(default)]
     pub refuse_connection: Option<String>,
 
+    /// PermitUserRC: run `~/.ssh/rc` before the session command (default yes).
+    #[serde(default = "default_true")]
+    pub permit_user_rc: bool,
+
+    /// ExposeAuthInfo: pass the successful auth method(s) to the session via
+    /// the `SSH_USER_AUTH` environment variable (default no).
+    #[serde(default)]
+    pub expose_auth_info: bool,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -312,6 +321,8 @@ pub struct MatchOverrides {
     pub stream_local_bind_unlink: Option<bool>,
     pub unused_connection_timeout: Option<u64>,
     pub refuse_connection: Option<String>,
+    pub permit_user_rc: Option<bool>,
+    pub expose_auth_info: Option<bool>,
     pub allow_agent_forwarding: Option<bool>,
     pub allow_streamlocal_forwarding: Option<bool>,
     pub allow_users: Option<Vec<String>>,
@@ -400,6 +411,8 @@ impl ServerMatch {
         if let Some(v) = &o.refuse_connection {
             cfg.refuse_connection = parse_refuse_connection(v);
         }
+        if let Some(v) = o.permit_user_rc { cfg.permit_user_rc = v; }
+        if let Some(v) = o.expose_auth_info { cfg.expose_auth_info = v; }
         if let Some(v) = o.allow_agent_forwarding { cfg.allow_agent_forwarding = v; }
         if let Some(v) = o.allow_streamlocal_forwarding { cfg.allow_streamlocal_forwarding = v; }
         if let Some(v) = &o.allow_users { cfg.allow_users = v.clone(); }
@@ -524,10 +537,11 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "channeltimeout" | "channel_timeout" => {
             o.channel_timeouts = Some(parse_channel_timeout(value));
         }
+        "permituserrc" | "permit_user_rc" => o.permit_user_rc = Some(value == "yes"),
+        "exposeauthinfo" | "expose_auth_info" => o.expose_auth_info = Some(value == "yes"),
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
         "authorizedprincipalsfile" | "authorized_principals_file"
         | "casignaturealgorithms" | "ca_signature_algorithms"
-        | "exposeauthinfo" | "expose_auth_info"
         | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
         | "hostcertificate" | "host_certificate"
         | "pubkeyauthoptions" | "pubkey_auth_options"
@@ -988,6 +1002,8 @@ impl Default for ServerConfig {
             per_source_max_startups: None,
             per_source_net_block_size: default_per_source_net_block_size(),
             refuse_connection: None,
+            permit_user_rc: true,
+            expose_auth_info: false,
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1333,6 +1349,12 @@ impl ServerConfig {
                 "refuseconnection" | "refuse_connection" => {
                     config.refuse_connection = parse_refuse_connection(value);
                 }
+                "permituserrc" | "permit_user_rc" => {
+                    config.permit_user_rc = value == "yes";
+                }
+                "exposeauthinfo" | "expose_auth_info" => {
+                    config.expose_auth_info = value == "yes";
+                }
                 "persourcemaxstartups" | "per_source_max_startups" => {
                     config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
                         None
@@ -1448,7 +1470,6 @@ impl ServerConfig {
                 | "authorizedprincipalscommand" | "authorized_principals_command"
                 | "authorizedprincipalscommanduser" | "authorized_principals_command_user"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
-                | "exposeauthinfo" | "expose_auth_info"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
                 | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
@@ -1462,7 +1483,6 @@ impl ServerConfig {
                 | "kerberosticketcleanup" | "kerberos_ticket_cleanup"
                 | "modulifile" | "moduli_file"
                 | "pamservicename" | "pam_service_name"
-                | "permituserrc" | "permit_user_rc"
                 | "persourcepenalties" | "per_source_penalties"
                 | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
@@ -1844,5 +1864,25 @@ Match All
             per_source_key("127.0.0.5".parse().unwrap(), (24, 128)),
             "127.0.0.0".parse::<std::net::IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn permit_user_rc_and_expose_auth_info_are_parsed() {
+        // OpenSSH defaults: PermitUserRC yes, ExposeAuthInfo no.
+        let c = ServerConfig::parse("").unwrap();
+        assert!(c.permit_user_rc);
+        assert!(!c.expose_auth_info);
+
+        let c = ServerConfig::parse("PermitUserRC no\nExposeAuthInfo yes\n").unwrap();
+        assert!(!c.permit_user_rc);
+        assert!(c.expose_auth_info);
+
+        // Both are valid inside Match blocks.
+        let c = ServerConfig::parse(
+            "Match User alice\n    PermitUserRC no\n    ExposeAuthInfo yes\n",
+        )
+        .unwrap();
+        assert_eq!(c.match_blocks[0].overrides.permit_user_rc, Some(false));
+        assert_eq!(c.match_blocks[0].overrides.expose_auth_info, Some(true));
     }
 }

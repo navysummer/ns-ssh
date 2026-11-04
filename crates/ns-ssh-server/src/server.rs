@@ -1,4 +1,5 @@
 use crate::config::{x11_display_name, x11_listen_addr, ServerConfig};
+use base64::Engine;
 use crate::hostkey::HostKeyManager;
 use crate::auth::ServerAuth;
 use crate::session::SessionManager;
@@ -739,6 +740,8 @@ async fn handle_authenticated_session(
     let mut auth_key_options: Option<crate::auth::AuthorizedKeyOptions> = None;
     // Methods successfully completed so far, in order, for AuthenticationMethods.
     let mut completed_methods: Vec<String> = Vec::new();
+    // ExposeAuthInfo: one line per accepted method (in order).
+    let mut auth_info: Vec<String> = Vec::new();
     // UnusedConnectionTimeout: closes a connection that never attempts auth.
     let mut saw_auth_attempt = false;
     let unused_deadline: Option<tokio::time::Instant> = if config.unused_connection_timeout > 0 {
@@ -809,6 +812,7 @@ async fn handle_authenticated_session(
                     && config.password_auth
                     && auth.lock().await.verify_password(&current_user, &answer)
                 {
+                    auth_info.push("keyboard-interactive".to_string());
                     if complete_auth_step(
                         &mut stream,
                         &mut transport,
@@ -981,6 +985,11 @@ async fn handle_authenticated_session(
                                     auth_key_options = Some(entry.options.clone());
                                 }
                                 drop(g);
+                                auth_info.push(format!(
+                                    "publickey {} {}",
+                                    key_type,
+                                    base64::engine::general_purpose::STANDARD.encode(&public_key)
+                                ));
                                 if complete_auth_step(
                                     &mut stream,
                                     &mut transport,
@@ -1033,6 +1042,7 @@ async fn handle_authenticated_session(
                             if config.print_last_log {
                                 tracing::info!("Accepted password for {} from {}", username, match_addr);
                             }
+                            auth_info.push("password".to_string());
                             if complete_auth_step(
                                 &mut stream,
                                 &mut transport,
@@ -1130,7 +1140,7 @@ async fn handle_authenticated_session(
         transport.compression_active_s2c = true;
     }
 
-    handle_connection_service(&mut stream, &mut transport, &config, &host_keys, &username, &mut session_manager, &auth_key_options).await?;
+    handle_connection_service(&mut stream, &mut transport, &config, &host_keys, &username, &mut session_manager, &auth_key_options, &auth_info).await?;
     Ok(())
 }
 
@@ -1344,11 +1354,18 @@ fn start_session_and_readers(
     auth_key_options: &Option<crate::auth::AuthorizedKeyOptions>,
     permit_user_environment: bool,
     print_motd: bool,
+    permit_user_rc: bool,
+    expose_auth_info: bool,
+    auth_info: &[String],
     child_tx: tokio::sync::mpsc::UnboundedSender<ChildOutputMsg>,
     readers_done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<()> {
     if let Some(ch) = chroot {
         session_manager.set_chroot_dir(sid, ch.to_string());
+    }
+    session_manager.set_permit_user_rc(sid, permit_user_rc);
+    if expose_auth_info {
+        session_manager.set_auth_info(sid, auth_info.to_vec(), true);
     }
     // Apply authorized_keys restrictions: command=, no-pty, environment= (if permitted)
     if let Some(opts) = auth_key_options {
@@ -1457,6 +1474,7 @@ async fn handle_connection_service(
     username: &str,
     session_manager: &mut SessionManager,
     auth_key_options: &Option<crate::auth::AuthorizedKeyOptions>,
+    auth_info: &[String],
 ) -> Result<()> {
     use std::collections::HashMap;
     use tokio::sync::{mpsc, oneshot};
@@ -2109,7 +2127,7 @@ async fn handle_connection_service(
                                     session_manager.set_command(sid, command.clone());
                                     let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     session_readers_done.insert(sid, readers_done.clone());
-                                    if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, child_tx.clone(), readers_done) {
+                                    if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
                                         tracing::error!("Failed to start session: {}", e);
                                     }
                                     session_started = true;
@@ -2128,7 +2146,7 @@ async fn handle_connection_service(
                                         {
                                             let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                             session_readers_done.insert(sid, readers_done.clone());
-                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, child_tx.clone(), readers_done) {
+                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
                                                 tracing::error!("Failed to start shell: {}", e);
                                             }
                                             session_started = true;
@@ -2314,7 +2332,7 @@ async fn handle_connection_service(
                                             session_manager.set_command(sid, subsystem_path.clone());
                                             let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                             session_readers_done.insert(sid, readers_done.clone());
-                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, child_tx.clone(), readers_done) {
+                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
                                                 tracing::error!("Failed to start subsystem {}: {}", subsystem_name, e);
                                             }
                                             session_started = true;

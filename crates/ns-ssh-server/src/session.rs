@@ -28,6 +28,14 @@ pub struct Session {
     pub chroot_dir: Option<String>,
     /// Forced command from authorized_keys command= option.
     pub auth_key_command: Option<String>,
+    /// PermitUserRC: run `~/.ssh/rc` before the session command.
+    pub permit_user_rc: bool,
+    /// Lines describing the successful authentication methods (ExposeAuthInfo).
+    pub auth_info: Vec<String>,
+    /// ExposeAuthInfo: write `auth_info` to a file and set `SSH_USER_AUTH`.
+    pub expose_auth_info: bool,
+    /// Temp file holding `auth_info`; removed when the child exits.
+    pub auth_info_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +98,10 @@ impl SessionManager {
             status: SessionStatus::Pending,
             chroot_dir: None,
             auth_key_command: None,
+            permit_user_rc: false,
+            auth_info: Vec::new(),
+            expose_auth_info: false,
+            auth_info_file: None,
         };
 
         self.sessions.insert(id, session);
@@ -147,6 +159,20 @@ impl SessionManager {
         }
     }
 
+    pub fn set_permit_user_rc(&mut self, id: u32, permit: bool) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.permit_user_rc = permit;
+        }
+    }
+
+    /// Record the successful auth methods, and enable ExposeAuthInfo when `expose` is set.
+    pub fn set_auth_info(&mut self, id: u32, lines: Vec<String>, expose: bool) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.auth_info = lines;
+            session.expose_auth_info = expose;
+        }
+    }
+
     pub fn set_pty_disabled(&mut self, id: u32) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.pty = false;
@@ -173,6 +199,9 @@ impl SessionManager {
         let username = session.username.clone();
         let env_vars = session.env_vars.clone();
         let pty = session.pty;
+        let permit_user_rc = session.permit_user_rc;
+        let auth_info = session.auth_info.clone();
+        let expose_auth_info = session.expose_auth_info;
         let user_info = get_user_info(&username)?;
         let uid = user_info.uid;
         let gid = user_info.gid;
@@ -226,15 +255,72 @@ impl SessionManager {
             .clone()
             .or_else(|| session.command.clone());
 
-        let mut cmd = if let Some(ref cmd_str) = effective_cmd {
+        // ExposeAuthInfo: write the accepted methods to a private-ish temp file
+        // and hand its path to the session through SSH_USER_AUTH.
+        let auth_info_file = if expose_auth_info && !auth_info.is_empty() {
+            let path = std::env::temp_dir()
+                .join(format!("ns-ssh-authinfo-{}-{}", std::process::id(), id));
+            let mut content = auth_info.join("\n");
+            content.push('\n');
+            let _ = std::fs::remove_file(&path);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o644);
+            }
+            match opts.open(&path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    let _ = f.write_all(content.as_bytes());
+                    Some(path.to_string_lossy().into_owned())
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // PermitUserRC: run ~/.ssh/rc before the user's command/shell.
+        let rc_path = format!("{}/.ssh/rc", user_info.home_dir);
+        let run_rc = should_run_user_rc(permit_user_rc, &rc_path);
+
+        let mut cmd = if run_rc {
+            let script = if effective_cmd.is_some() {
+                "if [ -f \"$NS_SSH_RC\" ]; then /bin/sh \"$NS_SSH_RC\"; fi\nexec /bin/sh -c \"$NS_SSH_CMD\""
+            } else {
+                "if [ -f \"$NS_SSH_RC\" ]; then /bin/sh \"$NS_SSH_RC\"; fi\nexec \"$NS_SSH_SHELL\""
+            };
+            let mut c = TokioCommand::new("/bin/sh");
+            c.arg("-c").arg(script);
+            build_base(&mut c);
+            c.env("NS_SSH_RC", &rc_path);
+            if let Some(ref cmd_str) = effective_cmd {
+                c.env("NS_SSH_CMD", cmd_str);
+            } else {
+                c.env("NS_SSH_SHELL", &user_info.shell);
+            }
+            if let Some(ref path) = auth_info_file {
+                c.env("SSH_USER_AUTH", path);
+            }
+            c.spawn()
+                .map_err(|e| SshError::Subprocess(format!("failed to exec: {}", e)))?
+        } else if let Some(ref cmd_str) = effective_cmd {
             let mut c = TokioCommand::new("/bin/sh");
             c.arg("-c").arg(cmd_str);
             build_base(&mut c);
+            if let Some(ref path) = auth_info_file {
+                c.env("SSH_USER_AUTH", path);
+            }
             c.spawn()
                 .map_err(|e| SshError::Subprocess(format!("failed to exec: {}", e)))?
         } else {
             let mut c = TokioCommand::new(&user_info.shell);
             build_base(&mut c);
+            if let Some(ref path) = auth_info_file {
+                c.env("SSH_USER_AUTH", path);
+            }
             c.spawn()
                 .map_err(|e| SshError::Subprocess(format!("failed to exec: {}", e)))?
         };
@@ -250,6 +336,7 @@ impl SessionManager {
         session.pty_write = pty_write;
         session.pty_resize_fd = pty_resize_fd;
         session.child = Some(cmd);
+        session.auth_info_file = auth_info_file;
         session.status = SessionStatus::Running;
 
         Ok(())
@@ -289,6 +376,9 @@ impl SessionManager {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         session.status = SessionStatus::Completed;
+                        if let Some(path) = session.auth_info_file.take() {
+                            let _ = std::fs::remove_file(path);
+                        }
                         if let Some(code) = status.code() {
                             Some(ChildExit::Status(code))
                         } else {
@@ -308,6 +398,9 @@ impl SessionManager {
                     Ok(None) => None,
                     Err(_) => {
                         session.status = SessionStatus::Failed;
+                        if let Some(path) = session.auth_info_file.take() {
+                            let _ = std::fs::remove_file(path);
+                        }
                         Some(ChildExit::Status(1))
                     }
                 }
@@ -324,6 +417,11 @@ impl SessionManager {
             .map(|s| s.status == SessionStatus::Running)
             .unwrap_or(false)
     }
+}
+
+/// PermitUserRC: run the user's `~/.ssh/rc` only when permitted and present.
+fn should_run_user_rc(permit: bool, rc_path: &str) -> bool {
+    permit && std::path::Path::new(rc_path).is_file()
 }
 
 fn configure_pre_exec(cmd: &mut TokioCommand, uid: u32, gid: u32, pty: bool, chroot: Option<&str>, chroot_cwd: Option<&str>) {
@@ -622,5 +720,21 @@ mod tests {
         assert_eq!(signal_name(15), "TERM");
         assert_eq!(signal_name(9), "KILL");
         assert_eq!(signal_name(99), "UNKNOWN");
+    }
+
+    #[test]
+    fn user_rc_runs_only_when_permitted_and_present() {
+        let dir = std::env::temp_dir().join(format!("ns-ssh-rc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = dir.join("rc");
+        std::fs::write(&rc, "true\n").unwrap();
+        let rc = rc.to_string_lossy().into_owned();
+
+        assert!(should_run_user_rc(true, &rc));
+        assert!(!should_run_user_rc(false, &rc));
+        assert!(!should_run_user_rc(true, "/nonexistent/rc"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
