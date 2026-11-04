@@ -176,6 +176,10 @@ pub struct HostConfig {
     /// PermitRemoteOpen: whitelist of remote forwarding targets.
     #[serde(default)]
     pub permit_remote_open: Option<Vec<String>>,
+
+    /// ChannelTimeout: per-channel-type idle timeouts (e.g. `session=5m`).
+    #[serde(default)]
+    pub channel_timeouts: Option<Vec<(String, u64)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +314,8 @@ pub struct ResolvedConfig {
     pub required_rsa_size: u32,
     /// PermitRemoteOpen entries; empty means unrestricted.
     pub permit_remote_open: Vec<String>,
+    /// ChannelTimeout entries: `(channel type, idle seconds)`.
+    pub channel_timeouts: Vec<(String, u64)>,
 }
 
 impl ResolvedConfig {
@@ -391,6 +397,7 @@ impl ResolvedConfig {
             pubkey_accepted_algorithms: None,
             required_rsa_size: 1024,
             permit_remote_open: Vec::new(),
+            channel_timeouts: Vec::new(),
         }
     }
 }
@@ -596,6 +603,7 @@ impl SshConfig {
         let mut clear_all_forwardings = None;
         let mut required_rsa_size = None;
         let mut permit_remote_open: Option<Vec<String>> = None;
+        let mut channel_timeouts: Option<Vec<(String, u64)>> = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -679,6 +687,7 @@ impl SshConfig {
                              clear_all_forwardings: clear_all_forwardings.take(),
                              required_rsa_size: required_rsa_size.take(),
                              permit_remote_open: permit_remote_open.take(),
+                             channel_timeouts: channel_timeouts.take(),
                          });
                     }
                     current_host = Some(value.to_string());
@@ -749,6 +758,7 @@ impl SshConfig {
                              clear_all_forwardings: clear_all_forwardings.take(),
                              required_rsa_size: required_rsa_size.take(),
                              permit_remote_open: permit_remote_open.take(),
+                             channel_timeouts: channel_timeouts.take(),
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
@@ -852,7 +862,6 @@ impl SshConfig {
                 | "hostbasedauthentication" | "hostbased_authentication"
                 | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
-                | "channeltimeout" | "channel_timeout"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
                 | "streamlocalbindmask" | "stream_local_bind_mask"
@@ -890,6 +899,9 @@ impl SshConfig {
                 }
                 "permitremoteopen" | "permit_remote_open" => {
                     permit_remote_open = Some(parse_permit_remote_open(value));
+                }
+                "channeltimeout" | "channel_timeout" => {
+                    channel_timeouts = Some(parse_channel_timeout(value));
                 }
                 "ignoreunknown" | "ignore_unknown" => {
                     for tok in value.split(',') {
@@ -980,6 +992,7 @@ impl SshConfig {
                 clear_all_forwardings,
                 required_rsa_size,
                 permit_remote_open: permit_remote_open.clone(),
+                channel_timeouts: channel_timeouts.clone(),
             });
         }
 
@@ -1050,6 +1063,7 @@ impl SshConfig {
                     clear_all_forwardings,
                     required_rsa_size,
                     permit_remote_open: permit_remote_open.clone(),
+                    channel_timeouts: channel_timeouts.clone(),
                 },
             });
         }
@@ -1067,6 +1081,47 @@ pub fn parse_permit_remote_open(value: &str) -> Vec<String> {
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Parse an OpenSSH `ChannelTimeout` value: comma-separated `type=time`
+/// pairs, where time accepts s/m/h/d suffixes and `none`/`0` disables it.
+pub fn parse_channel_timeout(value: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for item in value.split(',') {
+        let Some((kind, time)) = item.split_once('=') else { continue };
+        let kind = kind.trim().to_ascii_lowercase();
+        if kind.is_empty() {
+            continue;
+        }
+        let time = time.trim();
+        let secs = if time.eq_ignore_ascii_case("none") {
+            0
+        } else {
+            parse_time_suffix(time).unwrap_or(0)
+        };
+        out.push((kind, secs));
+    }
+    out
+}
+
+/// Resolve the idle timeout in seconds for a channel type. A per-type entry
+/// wins over `global`; no entry (or 0) means the timeout is disabled.
+pub fn channel_timeout_secs(entries: &[(String, u64)], channel_type: &str) -> u64 {
+    let kind = match channel_type {
+        "x11" => "x11-connection",
+        "auth-agent@openssh.com" => "agent-connection",
+        other => other,
+    };
+    let mut specific: Option<u64> = None;
+    let mut global: Option<u64> = None;
+    for (name, secs) in entries {
+        if name == kind {
+            specific = Some(*secs);
+        } else if name == "global" {
+            global = Some(*secs);
+        }
+    }
+    specific.or(global).unwrap_or(0)
 }
 
 /// Check a remote forwarding target against `PermitRemoteOpen`.
@@ -1615,5 +1670,25 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.hosts.iter().any(|h| h.host == "foo"));
+    }
+
+    #[test]
+    fn channel_timeout_is_parsed_and_resolved() {
+        let cfg = SshConfig::parse(
+            "Host foo\n  ChannelTimeout session=2m,global=1h\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        let entries = host.channel_timeouts.as_ref().unwrap();
+        assert_eq!(entries[0], ("session".to_string(), 120));
+        assert_eq!(entries[1], ("global".to_string(), 3600));
+
+        assert_eq!(channel_timeout_secs(entries, "session"), 120);
+        // Specific entry wins over global.
+        assert_eq!(channel_timeout_secs(entries, "direct-tcpip"), 3600);
+
+        // `none` disables the timeout for that type.
+        let entries = parse_channel_timeout("session=none");
+        assert_eq!(channel_timeout_secs(&entries, "session"), 0);
     }
 

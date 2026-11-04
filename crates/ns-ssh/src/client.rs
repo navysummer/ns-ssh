@@ -1711,6 +1711,11 @@ impl SshClient {
         // this, a large upload whose tail is window-gated would send SSH_MSG_
         // CHANNEL_EOF before the deferred bytes, truncating the transfer.
         let mut session_eof_pending = false;
+        // ChannelTimeout: last data activity per local channel. Channels with
+        // no recorded activity are inserted on the first poll tick.
+        let mut channel_last_activity: HashMap<ChannelId, std::time::Instant> = HashMap::new();
+        let mut channel_timeout_poll: std::pin::Pin<Box<tokio::time::Sleep>> =
+            Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
 
         #[cfg(unix)]
         let mut winch_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -1760,6 +1765,9 @@ impl SshClient {
 
                 to_ssh = to_ssh_rx.recv() => {
                     if let Some((remote_id, data)) = to_ssh {
+                        if let Some(local_id) = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
+                            channel_last_activity.insert(local_id, std::time::Instant::now());
+                        }
                         // Respect the peer's advertised receive window; defer
                         // when it is exhausted (flushed on WINDOW_ADJUST).
                         self.send_channel_data_gated(remote_id, data, &mut pending_window_data, &mut pending_write, aead).await;
@@ -1789,6 +1797,40 @@ impl SshClient {
                         keepalive_outstanding = Some(std::time::Instant::now());
                     }
                     alive_sleep = Some(Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(alive_interval_ms))));
+                }
+
+                _ = &mut channel_timeout_poll => {
+                    channel_timeout_poll.as_mut().reset(
+                        tokio::time::Instant::now() + tokio::time::Duration::from_secs(1)
+                    );
+                    let now = std::time::Instant::now();
+                    // Pick up channels allocated since the last tick.
+                    let ids: Vec<ChannelId> = self.channel_manager.channels().keys().copied().collect();
+                    for id in ids {
+                        channel_last_activity.entry(id).or_insert(now);
+                    }
+                    let mut expired: Vec<(ChannelId, u64)> = Vec::new();
+                    for (id, last) in channel_last_activity.iter() {
+                        let Some(ch) = self.channel_manager.get_channel(*id) else { continue };
+                        let secs = crate::config::channel_timeout_secs(&self.config.channel_timeouts, &ch.channel_type);
+                        if secs > 0 && last.elapsed().as_secs() >= secs {
+                            expired.push((*id, secs));
+                        }
+                    }
+                    for (id, secs) in expired {
+                        tracing::info!("channel {} idle for {}s, closing (ChannelTimeout)", id, secs);
+                        let _ = self.send_channel_close(id).await;
+                        self.channel_manager.close_channel(id);
+                        channel_last_activity.remove(&id);
+                        pending_forward_sockets.remove(&id);
+                        pending_streamlocal_sockets.remove(&id);
+                        pending_window_data.retain(|(rid, _)| {
+                            self.channel_manager.find_by_remote_id(*rid).is_some()
+                        });
+                        if Some(id) == session_id || Some(id) == stdio_forward_channel_id {
+                            should_exit = true;
+                        }
+                    }
                 }
 
                 _ = async {
@@ -1894,6 +1936,12 @@ impl SshClient {
                 stdin_data = stdin_rx.recv(), if stdin_active => {
                     match stdin_data {
                         Some(data) => {
+                            if let Some(sid) = session_id {
+                                channel_last_activity.insert(sid, std::time::Instant::now());
+                            }
+                            if let Some(cid) = stdio_forward_channel_id {
+                                channel_last_activity.insert(cid, std::time::Instant::now());
+                            }
                             let (forward_data, exit_now) = if escape_enabled {
                                 escape_state.process(&data, escape_char)
                             } else {
@@ -1981,6 +2029,7 @@ impl SshClient {
                                 msg::SSH_MSG_CHANNEL_DATA => {
                                     if let Ok((recipient, data)) = parse_channel_data(&payload) {
                                         let data_len = data.len() as u32;
+                                        channel_last_activity.insert(recipient, std::time::Instant::now());
                                         // Inbound recipient is our local id; the
                                         // window-adjust reply must use the peer's
                                         // id for that channel (RFC 4254 §5.2).
@@ -2013,6 +2062,7 @@ impl SshClient {
                                     let dt = u32::decode(&mut r)?;
                                     let data = SshBytes::decode(&mut r)?.0;
                                     let data_len = data.len() as u32;
+                                    channel_last_activity.insert(recipient, std::time::Instant::now());
                                     let reply_id = self.channel_manager.reply_recipient(recipient)
                                         .unwrap_or(recipient);
                                     if let Some(local_id) = self.channel_manager.get_channel(recipient).map(|c| c.local_id) {

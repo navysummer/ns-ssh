@@ -2118,3 +2118,44 @@ fn channel_timeout_closes_idle_channels() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn client_channel_timeout_closes_idle_session() {
+    // The client-side ChannelTimeout must close an idle session channel even
+    // when the server has no timeout configured.
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("client-channeltimeout");
+    let port = free_port();
+    let (server, id_path, kh) = launch_test_server_extra(&dir, port, &[]);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let start = std::time::Instant::now();
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("ChannelTimeout=session=1")
+        .arg("127.0.0.1")
+        .arg("sleep 10; echo late")
+        .output()
+        .expect("run client");
+    let elapsed = start.elapsed();
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "client should close the idle session channel long before the 10s \
+         command finishes, but it ran for {:?}; stderr={:?} server_stderr={}",
+        elapsed,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("late"),
+        "the idle session must be closed before 'late' is printed, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

@@ -1893,6 +1893,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = host_config.required_rsa_size {
                 resolved.required_rsa_size = v;
             }
+            if let Some(v) = &host_config.channel_timeouts {
+                resolved.channel_timeouts = v.clone();
+            }
             if let Some(v) = host_config.clear_all_forwardings {
                 if v {
                     resolved.local_forwards.clear();
@@ -2104,6 +2107,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = mc.required_rsa_size {
                 resolved.required_rsa_size = v;
             }
+            if let Some(v) = &mc.channel_timeouts {
+                resolved.channel_timeouts = v.clone();
+            }
         }
     }
 
@@ -2225,6 +2231,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "permitremoteopen" | "permit_remote_open" => {
             resolved.permit_remote_open = config::parse_permit_remote_open(value);
+        }
+        "channeltimeout" | "channel_timeout" => {
+            resolved.channel_timeouts = config::parse_channel_timeout(value);
         }
         "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
             resolved.no_host_authentication_for_localhost = value != "no";
