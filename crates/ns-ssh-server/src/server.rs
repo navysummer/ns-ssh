@@ -9,6 +9,7 @@ use ssh_core::transport::*;
 use ssh_core::channel::*;
 use ssh_core::kex::{KexExchange, KexAlgorithm};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -65,6 +66,10 @@ impl SshServer {
 
         let pending_auth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_startups = MaxStartups::parse(&self.config.max_startups);
+        // PerSourceMaxStartups: concurrent unauthenticated connections per
+        // masked source address.
+        let per_source: Arc<std::sync::Mutex<HashMap<String, usize>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         loop {
             let (stream, peer_addr) = listener.accept().await
@@ -80,6 +85,25 @@ impl SshServer {
                     );
                     continue;
                 }
+            }
+
+            let per_source_key = self.config.per_source_max_startups.map(|_| {
+                crate::config::per_source_key(peer_addr.ip(), self.config.per_source_net_block_size)
+                    .to_string()
+            });
+            if let (Some(limit), Some(key)) = (self.config.per_source_max_startups, per_source_key.as_ref()) {
+                let mut map = per_source.lock().unwrap();
+                let count = map.get(key).copied().unwrap_or(0) as u64;
+                if count >= limit {
+                    drop(map);
+                    drop(stream);
+                    tracing::debug!(
+                        "dropping connection from {}: PerSourceMaxStartups ({} open)",
+                        peer_addr, count,
+                    );
+                    continue;
+                }
+                *map.entry(key.clone()).or_insert(0) += 1;
             }
 
             // Enable TCP keepalive on accepted connections so dead peers are detected.
@@ -104,6 +128,8 @@ impl SshServer {
             let auth = self.auth.clone();
             let pending_guard = pending_auth.clone();
             pending_guard.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let per_source_guard = per_source_key
+                .map(|key| Arc::new(PerSourceGuard::new(per_source.clone(), key)));
 
             tokio::spawn(async move {
                 struct Guard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
@@ -118,6 +144,7 @@ impl SshServer {
                     config,
                     host_keys,
                     auth,
+                    per_source_guard,
                 ).await {
                     Ok(()) => {}
                     // A peer that disconnects (RFC 4253 §11.1) is a normal end
@@ -134,11 +161,65 @@ impl SshServer {
     }
 }
 
+/// Counts one unauthenticated connection from a masked source address and
+/// releases the slot when authentication completes (or the task ends).
+struct PerSourceGuard {
+    map: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    key: String,
+    released: std::sync::atomic::AtomicBool,
+}
+
+impl PerSourceGuard {
+    fn new(map: Arc<std::sync::Mutex<HashMap<String, usize>>>, key: String) -> Self {
+        PerSourceGuard {
+            map,
+            key,
+            released: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        if !self.released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(mut map) = self.map.lock() {
+                if let Some(count) = map.get_mut(&self.key) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&self.key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PerSourceGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Send a disconnect and stop the connection when `RefuseConnection` is set.
+async fn refuse_connection_if_configured(
+    stream: &mut TcpStream,
+    transport: &mut SshTransport,
+    aead: bool,
+    config: &ServerConfig,
+) -> Result<bool> {
+    let Some(text) = config.refuse_connection.clone() else {
+        return Ok(false);
+    };
+    tracing::info!("refusing connection: {}", text);
+    let packet = build_disconnect(2, &text, "");
+    send_encrypted_packet_server(stream, &packet, transport, false, aead).await?;
+    Ok(true)
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     config: ServerConfig,
     host_keys: Arc<Mutex<HostKeyManager>>,
     auth: Arc<Mutex<ServerAuth>>,
+    per_source: Option<Arc<PerSourceGuard>>,
 ) -> Result<()> {
     let base_config = config;
 
@@ -164,7 +245,20 @@ async fn handle_connection(
     transport.rekey_seconds = config.rekey_limit_time;
     // Compression yes/no: controls whether zlib is advertised and preferred.
     transport.compression_enabled = config.compression;
-    let client_version = read_version_string(&mut stream).await?;
+    let client_version = if config.unused_connection_timeout > 0 {
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(config.unused_connection_timeout),
+            read_version_string(&mut stream),
+        ).await {
+            Ok(v) => v?,
+            Err(_) => {
+                tracing::info!("UnusedConnectionTimeout exceeded before version exchange");
+                return Err(SshError::AuthFailed("unused connection timeout exceeded".into()));
+            }
+        }
+    } else {
+        read_version_string(&mut stream).await?
+    };
     transport.client_version = client_version;
 
     if config.use_dns {
@@ -459,6 +553,12 @@ async fn handle_connection(
         let _ = send_encrypted_packet_server(&mut stream, &ext_info, &mut transport, false, aead).await;
     }
 
+    // Authentication is complete: this connection no longer counts against
+    // PerSourceMaxStartups.
+    if let Some(guard) = &per_source {
+        guard.release();
+    }
+
     handle_authenticated_session(
         stream,
         transport,
@@ -639,24 +739,60 @@ async fn handle_authenticated_session(
     let mut auth_key_options: Option<crate::auth::AuthorizedKeyOptions> = None;
     // Methods successfully completed so far, in order, for AuthenticationMethods.
     let mut completed_methods: Vec<String> = Vec::new();
+    // UnusedConnectionTimeout: closes a connection that never attempts auth.
+    let mut saw_auth_attempt = false;
+    let unused_deadline: Option<tokio::time::Instant> = if config.unused_connection_timeout > 0 {
+        Some(tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(config.unused_connection_timeout))
+    } else {
+        None
+    };
+
+    if refuse_connection_if_configured(&mut stream, &mut transport, aead, &config).await? {
+        return Ok(());
+    }
 
     while auth_tries < config.max_auth_tries {
-        let auth_request = if config.login_grace_time > 0 {
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(config.login_grace_time as u64),
-                receive_encrypted_packet_server(&mut stream, &mut transport, false, aead),
-            ).await {
-                Ok(res) => res?,
-                Err(_) => {
-                    tracing::info!("LoginGraceTime exceeded for {}, disconnecting", username);
-                    return Err(SshError::AuthFailed("login grace time exceeded".into()));
+        let auth_request = {
+            let mut wait_secs = config.login_grace_time as u64;
+            if !saw_auth_attempt {
+                if let Some(deadline) = unused_deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        tracing::info!("UnusedConnectionTimeout exceeded, disconnecting");
+                        return Err(SshError::AuthFailed(
+                            "unused connection timeout exceeded".into(),
+                        ));
+                    }
+                    let remaining_secs = (remaining.as_millis() as u64).div_ceil(1000);
+                    if wait_secs == 0 || remaining_secs < wait_secs {
+                        wait_secs = remaining_secs;
+                    }
                 }
             }
-        } else {
-            receive_encrypted_packet_server(&mut stream, &mut transport, false, aead).await?
+            if wait_secs > 0 {
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(wait_secs),
+                    receive_encrypted_packet_server(&mut stream, &mut transport, false, aead),
+                ).await {
+                    Ok(res) => res?,
+                    Err(_) => {
+                        tracing::info!("LoginGraceTime/UnusedConnectionTimeout exceeded for {}, disconnecting", username);
+                        return Err(SshError::AuthFailed("login grace time exceeded".into()));
+                    }
+                }
+            } else {
+                receive_encrypted_packet_server(&mut stream, &mut transport, false, aead).await?
+            }
         };
         if auth_request.is_empty() {
             break;
+        }
+        if matches!(
+            auth_request[0],
+            msg::SSH_MSG_USERAUTH_REQUEST | msg::SSH_MSG_USERAUTH_INFO_RESPONSE
+        ) {
+            saw_auth_attempt = true;
         }
 
         match auth_request[0] {
@@ -706,6 +842,10 @@ async fn handle_authenticated_session(
                 // Re-evaluate `Match` blocks now that the username is known.
                 let groups = crate::auth::get_user_groups(&username).unwrap_or_default();
                 config = base_config.resolve_for_match(&username, &groups, &match_host, &match_addr);
+
+                if refuse_connection_if_configured(&mut stream, &mut transport, aead, &config).await? {
+                    return Ok(());
+                }
 
                 if !crate::auth::check_user_authorized(&username, &match_host, &config.allow_users, &config.deny_users) {
                     let (methods, partial) = failure_methods(

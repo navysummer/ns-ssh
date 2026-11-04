@@ -218,6 +218,24 @@ fn main() {
                 "streamlocalbindunlink" | "stream_local_bind_unlink" => {
                     config.stream_local_bind_unlink = value == "yes";
                 }
+                "unusedconnectiontimeout" | "unused_connection_timeout" => {
+                    config.unused_connection_timeout = crate::config::parse_time_suffix(value).unwrap_or(0);
+                }
+                "refuseconnection" | "refuse_connection" => {
+                    config.refuse_connection = crate::config::parse_refuse_connection(value);
+                }
+                "persourcemaxstartups" | "per_source_max_startups" => {
+                    config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        value.parse().ok()
+                    };
+                }
+                "persourcenetblocksize" | "per_source_net_block_size" => {
+                    if let Some(b) = crate::config::parse_net_block_size(value) {
+                        config.per_source_net_block_size = b;
+                    }
+                }
                 "forcecommand" | "force_command" => {
                     config.force_command = Some(value.to_string());
                 }

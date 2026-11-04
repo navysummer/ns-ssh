@@ -199,6 +199,24 @@ pub struct ServerConfig {
     #[serde(default)]
     pub stream_local_bind_unlink: bool,
 
+    /// UnusedConnectionTimeout: seconds to wait for the first authentication
+    /// attempt before closing the connection (0 disables).
+    #[serde(default)]
+    pub unused_connection_timeout: u64,
+
+    /// PerSourceMaxStartups: max concurrent unauthenticated connections from
+    /// one masked source address; None means unlimited.
+    #[serde(default)]
+    pub per_source_max_startups: Option<u64>,
+
+    /// PerSourceNetBlockSize: `ipv4_bits:ipv6_bits` used to group sources.
+    #[serde(default = "default_per_source_net_block_size")]
+    pub per_source_net_block_size: (u32, u32),
+
+    /// RefuseConnection: when set, the connection is refused with this text.
+    #[serde(default)]
+    pub refuse_connection: Option<String>,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -292,6 +310,8 @@ pub struct MatchOverrides {
     pub x11_use_localhost: Option<bool>,
     pub stream_local_bind_mask: Option<u32>,
     pub stream_local_bind_unlink: Option<bool>,
+    pub unused_connection_timeout: Option<u64>,
+    pub refuse_connection: Option<String>,
     pub allow_agent_forwarding: Option<bool>,
     pub allow_streamlocal_forwarding: Option<bool>,
     pub allow_users: Option<Vec<String>>,
@@ -376,6 +396,10 @@ impl ServerMatch {
         if let Some(v) = o.x11_use_localhost { cfg.x11_use_localhost = v; }
         if let Some(v) = o.stream_local_bind_mask { cfg.stream_local_bind_mask = v; }
         if let Some(v) = o.stream_local_bind_unlink { cfg.stream_local_bind_unlink = v; }
+        if let Some(v) = o.unused_connection_timeout { cfg.unused_connection_timeout = v; }
+        if let Some(v) = &o.refuse_connection {
+            cfg.refuse_connection = parse_refuse_connection(v);
+        }
         if let Some(v) = o.allow_agent_forwarding { cfg.allow_agent_forwarding = v; }
         if let Some(v) = o.allow_streamlocal_forwarding { cfg.allow_streamlocal_forwarding = v; }
         if let Some(v) = &o.allow_users { cfg.allow_users = v.clone(); }
@@ -519,6 +543,12 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "streamlocalbindunlink" | "stream_local_bind_unlink" => {
             o.stream_local_bind_unlink = Some(value == "yes");
         }
+        "unusedconnectiontimeout" | "unused_connection_timeout" => {
+            o.unused_connection_timeout = parse_time_suffix(value);
+        }
+        "refuseconnection" | "refuse_connection" => {
+            o.refuse_connection = Some(value.to_string());
+        }
         _ => return Err(SshError::Config(format!(
             "unknown directive '{}' in Match block",
             key
@@ -618,7 +648,7 @@ fn parse_size_suffix(tok: &str) -> Option<u64> {
     digits.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
 }
 
-fn parse_time_suffix(tok: &str) -> Option<u64> {
+pub fn parse_time_suffix(tok: &str) -> Option<u64> {
     let (digits, mult) = match tok.chars().last()? {
         // OpenSSH time suffixes are lowercase; 'M' is size/Mega, not minutes.
         's' => (&tok[..tok.len() - 1], 1u64),
@@ -802,6 +832,56 @@ fn default_x11_display_offset() -> u32 { 10 }
 
 fn default_streamlocal_mask() -> u32 { 0o177 }
 
+fn default_per_source_net_block_size() -> (u32, u32) { (32, 128) }
+
+/// Parse `PerSourceNetBlockSize` (`ipv4:ipv6`, e.g. `32:128`).
+pub fn parse_net_block_size(value: &str) -> Option<(u32, u32)> {
+    let (v4, v6) = value.split_once(':')?;
+    let v4: u32 = v4.trim().parse().ok()?;
+    let v6: u32 = v6.trim().parse().ok()?;
+    if v4 > 32 || v6 > 128 {
+        return None;
+    }
+    Some((v4, v6))
+}
+
+/// Parse `RefuseConnection`: `no`/`false` disables it; any other value is the
+/// message shown to the client (empty means the default text).
+pub fn parse_refuse_connection(value: &str) -> Option<String> {
+    let v = value.trim();
+    // sshd_config accepts double-quoted values; strip the surrounding quotes.
+    let v = if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    };
+    if v.is_empty() || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no") {
+        return None;
+    }
+    if v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true") {
+        return Some("Connection refused.".to_string());
+    }
+    Some(v.to_string())
+}
+
+/// Mask an IP address to the configured per-source network block.
+pub fn per_source_key(ip: std::net::IpAddr, block: (u32, u32)) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            let bits = block.0.min(32);
+            let raw = u32::from(a);
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(raw & mask))
+        }
+        std::net::IpAddr::V6(a) => {
+            let bits = block.1.min(128);
+            let raw = u128::from(a);
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(raw & mask))
+        }
+    }
+}
+
 /// Local hostname, used for DISPLAY when X11UseLocalhost is disabled.
 fn local_hostname() -> String {
     let mut buf = [0u8; 256];
@@ -904,6 +984,10 @@ impl Default for ServerConfig {
             x11_use_localhost: true,
             stream_local_bind_mask: default_streamlocal_mask(),
             stream_local_bind_unlink: false,
+            unused_connection_timeout: 0,
+            per_source_max_startups: None,
+            per_source_net_block_size: default_per_source_net_block_size(),
+            refuse_connection: None,
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1243,6 +1327,24 @@ impl ServerConfig {
                 "streamlocalbindunlink" | "stream_local_bind_unlink" => {
                     config.stream_local_bind_unlink = value == "yes";
                 }
+                "unusedconnectiontimeout" | "unused_connection_timeout" => {
+                    config.unused_connection_timeout = parse_time_suffix(value).unwrap_or(0);
+                }
+                "refuseconnection" | "refuse_connection" => {
+                    config.refuse_connection = parse_refuse_connection(value);
+                }
+                "persourcemaxstartups" | "per_source_max_startups" => {
+                    config.per_source_max_startups = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        value.parse().ok()
+                    };
+                }
+                "persourcenetblocksize" | "per_source_net_block_size" => {
+                    if let Some(b) = parse_net_block_size(value) {
+                        config.per_source_net_block_size = b;
+                    }
+                }
                 "allowagentforwarding" | "allow_agent_forwarding" => {
                     config.allow_agent_forwarding = value == "yes";
                 }
@@ -1361,17 +1463,14 @@ impl ServerConfig {
                 | "modulifile" | "moduli_file"
                 | "pamservicename" | "pam_service_name"
                 | "permituserrc" | "permit_user_rc"
-                | "persourcemaxstartups" | "per_source_max_startups"
-                | "persourcenetblocksize" | "per_source_net_block_size"
                 | "persourcepenalties" | "per_source_penalties"
                 | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
-                | "rdomain" | "refuseconnection" | "refuse_connection"
+                | "rdomain"
                 | "revokedkeys" | "revoked_keys"
                 | "securitykeyprovider" | "security_key_provider"
                 | "sshdsessionpath" | "sshd_session_path"
                 | "trustedusercakeys" | "trusted_user_ca_keys"
-                | "unusedconnectiontimeout" | "unused_connection_timeout"
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location"
                 // Deprecated OpenSSH aliases: accepted and ignored.
@@ -1703,5 +1802,47 @@ Match All
 
         let c = ServerConfig::parse("Match User alice\n    StreamLocalBindUnlink yes\n").unwrap();
         assert_eq!(c.match_blocks[0].overrides.stream_local_bind_unlink, Some(true));
+    }
+
+    #[test]
+    fn connection_governance_options_are_parsed() {
+        let c = ServerConfig::parse("UnusedConnectionTimeout 30\n").unwrap();
+        assert_eq!(c.unused_connection_timeout, 30);
+
+        let c = ServerConfig::parse(
+            "PerSourceMaxStartups 5\nPerSourceNetBlockSize 24:64\n",
+        )
+        .unwrap();
+        assert_eq!(c.per_source_max_startups, Some(5));
+        assert_eq!(c.per_source_net_block_size, (24, 64));
+
+        // `none` disables the limit.
+        let c = ServerConfig::parse("PerSourceMaxStartups none\n").unwrap();
+        assert_eq!(c.per_source_max_startups, None);
+
+        // RefuseConnection with a custom text, and `no` restoring default behaviour.
+        let c = ServerConfig::parse("RefuseConnection \"no service\"\n").unwrap();
+        assert_eq!(c.refuse_connection.as_deref(), Some("no service"));
+        let c = ServerConfig::parse("RefuseConnection no\n").unwrap();
+        assert_eq!(c.refuse_connection, None);
+        let c = ServerConfig::parse("RefuseConnection yes\n").unwrap();
+        assert_eq!(c.refuse_connection.as_deref(), Some("Connection refused."));
+
+        // Match block overrides are captured (raw value, interpreted on apply).
+        let c = ServerConfig::parse("Match User alice\n    RefuseConnection \"maintenance\"\n")
+            .unwrap();
+        assert_eq!(
+            parse_refuse_connection(
+                c.match_blocks[0].overrides.refuse_connection.as_deref().unwrap()
+            )
+            .as_deref(),
+            Some("maintenance")
+        );
+
+        // Masked per-source grouping.
+        assert_eq!(
+            per_source_key("127.0.0.5".parse().unwrap(), (24, 128)),
+            "127.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
     }
 }

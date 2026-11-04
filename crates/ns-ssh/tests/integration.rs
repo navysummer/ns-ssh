@@ -2224,3 +2224,138 @@ fn client_streamlocal_bind_mask_and_unlink() {
         String::from_utf8_lossy(&client_out.stderr)
     );
 }
+
+/// A peer that never sends its SSH version must be dropped once
+/// `UnusedConnectionTimeout` elapses.
+#[test]
+fn server_unused_connection_timeout_closes_silent_connection() {
+    let dir = temp_dir("server-unused-timeout");
+    let port = free_port();
+    let (mut server, _id, _kh) =
+        launch_test_server_extra(&dir, port, &["-o", "UnusedConnectionTimeout=2"]);
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .expect("set read timeout");
+    let start = Instant::now();
+    let mut buf = [0u8; 64];
+    // Stay silent: no version string is sent, so the server should give up.
+    let res = stream.read(&mut buf);
+    let elapsed = start.elapsed();
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    match res {
+        Ok(0) => {}
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::ConnectionReset
+                || e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => panic!(
+            "expected EOF/reset after UnusedConnectionTimeout, got {:?} after {:?}",
+            other, elapsed
+        ),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "UnusedConnectionTimeout=2 should close the connection well before 5s, took {:?}",
+        elapsed
+    );
+}
+
+/// `RefuseConnection` must reject the session before authentication.
+#[test]
+fn server_refuse_connection_disconnects_client() {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("server-refuse");
+    let port = free_port();
+    let (server, id_path, kh) =
+        launch_test_server_extra(&dir, port, &["-o", "RefuseConnection=maintenance"]);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let start = Instant::now();
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("echo should-not-run")
+        .output()
+        .expect("run client");
+    let elapsed = start.elapsed();
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "RefuseConnection should reject immediately, took {:?}; client stderr={:?}",
+        elapsed,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("should-not-run"),
+        "the remote command must never run; stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&server_out.stdout).contains("refusing connection: maintenance")
+            || String::from_utf8_lossy(&server_out.stderr)
+                .contains("refusing connection: maintenance"),
+        "server should log the configured refusal text; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&server_out.stdout),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+}
+
+/// `PerSourceMaxStartups` must drop connections beyond the limit from the same
+/// masked source while the first unauthenticated connection is still open.
+#[test]
+fn server_per_source_max_startups_drops_excess() {
+    let dir = temp_dir("server-per-source");
+    let port = free_port();
+    let (mut server, _id, _kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &["-o", "PerSourceMaxStartups=1", "-o", "PerSourceNetBlockSize=32:128"],
+    );
+
+    // Let the port probe connection from `wait_for_port` be accepted and
+    // released before we start holding a slot ourselves.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Hold one unauthenticated connection open (server counts it on accept).
+    let _first = std::net::TcpStream::connect(("127.0.0.1", port)).expect("first connect");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut second = std::net::TcpStream::connect(("127.0.0.1", port)).expect("second connect");
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let start = Instant::now();
+    let mut buf = [0u8; 64];
+    let res = second.read(&mut buf);
+    let elapsed = start.elapsed();
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    match res {
+        Ok(0) => {}
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::ConnectionReset
+                || e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => panic!(
+            "expected the excess connection to be dropped, got {:?} after {:?}",
+            other, elapsed
+        ),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the excess connection should be closed immediately, took {:?}",
+        elapsed
+    );
+}
