@@ -1,6 +1,6 @@
 use crate::error::{Result, SshError};
 use crate::encoding::*;
-use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey, Signature};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey, Signature};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::pkcs1v15::VerifyingKey as RsaVerifyingKey;
@@ -10,7 +10,6 @@ use rsa::signature::{RandomizedSigner, Verifier as RsaVerifier, SignatureEncodin
 use sha2::{Sha256, Sha512};
 use sha1::Sha1;
 use rand::rngs::OsRng;
-use std::io::Write;
 
 pub trait HostKeySigner: Send + Sync {
     fn algorithm_name(&self) -> &str;
@@ -45,6 +44,63 @@ pub trait HostKeyVerifier: Send + Sync {
     }
     fn public_key_bytes(&self) -> Vec<u8>;
     fn key_type(&self) -> &str;
+}
+
+/// Encode an ECDSA signature as OpenSSH does it (RFC 5656 §3.1):
+/// `string type`, then `string (string r || string s)`, where each of r and s
+/// is `field_len` bytes. Encoding r||s as one flat 64-byte string (which this
+/// used to do) is readable by our own code but rejected by OpenSSH, so ECDSA
+/// authentication could never interoperate.
+fn encode_ecdsa_signature(algorithm: &str, signature: &[u8], field_len: usize) -> Vec<u8> {
+    debug_assert_eq!(signature.len(), field_len * 2);
+    let (r, s) = signature.split_at(field_len);
+    let mut inner = Vec::new();
+    SshString(ecdsa_mpint(r)).encode(&mut inner).unwrap();
+    SshString(ecdsa_mpint(s)).encode(&mut inner).unwrap();
+    let mut buf = Vec::new();
+    SshString::new(algorithm).encode(&mut buf).unwrap();
+    SshBytes(inner).encode(&mut buf).unwrap();
+    buf
+}
+
+/// OpenSSH stores the ECDSA components as SSH `mpint`s. A 32-byte (or 66-byte
+/// for P-521) value whose top bit is set would be negative without a leading
+/// zero byte, which the peer rejects, so add the sign byte when necessary.
+fn ecdsa_mpint(component: &[u8]) -> Vec<u8> {
+    let first = component.iter().position(|&b| b != 0).unwrap_or(component.len());
+    let mut out = Vec::with_capacity(component.len() - first + 1);
+    if first < component.len() && component[first] & 0x80 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(&component[first..]);
+    out
+}
+
+/// Parse the OpenSSH ECDSA signature layout produced by
+/// [`encode_ecdsa_signature`] into the flat `r||s` form the curve crate
+/// expects. Components shorter than `field_len` are left-padded with zeros
+/// (OpenSSH normally emits exactly `field_len` bytes).
+fn decode_ecdsa_signature(signature: &[u8], field_len: usize) -> Result<Vec<u8>> {
+    let mut outer = signature;
+    let _sig_type = SshString::decode(&mut outer)?;
+    let inner = SshBytes::decode(&mut outer)?;
+    let mut rest = &inner.0[..];
+    let r = SshString::decode(&mut rest)?;
+    let s = SshString::decode(&mut rest)?;
+    // Strip a leading 0x00 sign byte before checking the component size.
+    let strip = |v: &[u8]| -> Vec<u8> {
+        let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+        v[first..].to_vec()
+    };
+    let r = strip(&r.0);
+    let s = strip(&s.0);
+    if r.len() > field_len || s.len() > field_len {
+        return Err(SshError::InvalidKey("ecdsa signature component too large".into()));
+    }
+    let mut flat = vec![0u8; field_len * 2];
+    flat[field_len - r.len()..field_len].copy_from_slice(&r);
+    flat[field_len * 2 - s.len()..].copy_from_slice(&s);
+    Ok(flat)
 }
 
 pub struct Ed25519HostKey {
@@ -143,14 +199,19 @@ impl EcdsaP256HostKey {
     }
 
     pub fn from_secret_bytes(secret: &[u8]) -> Result<Self> {
-        let signing_key = p256::ecdsa::SigningKey::from_bytes(secret.into())
+        if secret.len() != 32 {
+            return Err(SshError::InvalidKey(format!(
+                "ecdsa p256: secret must be 32 bytes, got {}", secret.len()
+            )));
+        }
+        let signing_key = p256::ecdsa::SigningKey::from_slice(secret)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p256: {}", e)))?;
         let verifying_key = signing_key.verifying_key().to_owned();
         Ok(EcdsaP256HostKey { signing_key, verifying_key })
     }
 
     pub fn from_public_bytes(public: &[u8]) -> Result<Self> {
-        let point = p256::EncodedPoint::from_bytes(public)
+        let _point = p256::EncodedPoint::from_bytes(public)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p256: {}", e)))?;
         let verifying_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p256: {}", e)))?;
@@ -190,17 +251,16 @@ impl HostKeySigner for EcdsaP256HostKey {
         let sig: p256::ecdsa::Signature = self.signing_key
             .sign_prehash(&hash)
             .map_err(|e| SshError::Protocol(format!("ecdsa sign: {}", e)))?;
-        let mut buf = Vec::new();
-        SshString::new("ecdsa-sha2-nistp256").encode(&mut buf).unwrap();
-        SshBytes(sig.to_bytes().to_vec()).encode(&mut buf).unwrap();
-        Ok(buf)
+        Ok(encode_ecdsa_signature(
+            "ecdsa-sha2-nistp256",
+            &sig.to_bytes(),
+            32,
+        ))
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
-        let mut r = &signature[..];
-        let _sig_type = SshString::decode(&mut r)?;
-        let sig_bytes = SshBytes::decode(&mut r)?;
-        let sig = p256::ecdsa::Signature::from_slice(&sig_bytes.0)
+        let flat = decode_ecdsa_signature(signature, 32)?;
+        let sig = p256::ecdsa::Signature::from_slice(&flat)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa sig: {}", e)))?;
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
@@ -246,7 +306,12 @@ impl EcdsaP384HostKey {
     }
 
     pub fn from_secret_bytes(secret: &[u8]) -> Result<Self> {
-        let signing_key = p384::ecdsa::SigningKey::from_bytes(secret.into())
+        if secret.len() != 48 {
+            return Err(SshError::InvalidKey(format!(
+                "ecdsa p384: secret must be 48 bytes, got {}", secret.len()
+            )));
+        }
+        let signing_key = p384::ecdsa::SigningKey::from_slice(secret)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p384: {}", e)))?;
         let verifying_key = signing_key.verifying_key().to_owned();
         Ok(EcdsaP384HostKey { signing_key, verifying_key })
@@ -289,17 +354,16 @@ impl HostKeySigner for EcdsaP384HostKey {
         let sig: p384::ecdsa::Signature = self.signing_key
             .sign_prehash(&hash)
             .map_err(|e| SshError::Protocol(format!("ecdsa p384 sign: {}", e)))?;
-        let mut buf = Vec::new();
-        SshString::new("ecdsa-sha2-nistp384").encode(&mut buf).unwrap();
-        SshBytes(sig.to_bytes().to_vec()).encode(&mut buf).unwrap();
-        Ok(buf)
+        Ok(encode_ecdsa_signature(
+            "ecdsa-sha2-nistp384",
+            &sig.to_bytes(),
+            48,
+        ))
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
-        let mut r = &signature[..];
-        let _sig_type = SshString::decode(&mut r)?;
-        let sig_bytes = SshBytes::decode(&mut r)?;
-        let sig = p384::ecdsa::Signature::from_slice(&sig_bytes.0)
+        let flat = decode_ecdsa_signature(signature, 48)?;
+        let sig = p384::ecdsa::Signature::from_slice(&flat)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p384 sig: {}", e)))?;
         use sha2::{Sha384, Digest};
         let mut hasher = Sha384::new();
@@ -345,7 +409,12 @@ impl EcdsaP521HostKey {
     }
 
     pub fn from_secret_bytes(secret: &[u8]) -> Result<Self> {
-        let signing_key = p521::ecdsa::SigningKey::from_bytes(secret.into())
+        if secret.len() != 66 {
+            return Err(SshError::InvalidKey(format!(
+                "ecdsa p521: secret must be 66 bytes, got {}", secret.len()
+            )));
+        }
+        let signing_key = p521::ecdsa::SigningKey::from_slice(secret)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p521: {}", e)))?;
         let verifying_key = p521::ecdsa::VerifyingKey::from(&signing_key);
         Ok(EcdsaP521HostKey { signing_key, verifying_key })
@@ -386,17 +455,16 @@ impl HostKeySigner for EcdsaP521HostKey {
         let sig = self.signing_key
             .sign_prehash(&hash)
             .map_err(|e| SshError::Protocol(format!("ecdsa p521 sign: {}", e)))?;
-        let mut buf = Vec::new();
-        SshString::new("ecdsa-sha2-nistp521").encode(&mut buf).unwrap();
-        SshBytes(sig.to_bytes().to_vec()).encode(&mut buf).unwrap();
-        Ok(buf)
+        Ok(encode_ecdsa_signature(
+            "ecdsa-sha2-nistp521",
+            &sig.to_bytes(),
+            66,
+        ))
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
-        let mut r = &signature[..];
-        let _sig_type = SshString::decode(&mut r)?;
-        let sig_bytes = SshBytes::decode(&mut r)?;
-        let sig = p521::ecdsa::Signature::from_slice(&sig_bytes.0)
+        let flat = decode_ecdsa_signature(signature, 66)?;
+        let sig = p521::ecdsa::Signature::from_slice(&flat)
             .map_err(|e| SshError::InvalidKey(format!("ecdsa p521 sig: {}", e)))?;
         use sha2::{Sha512, Digest};
         let mut hasher = Sha512::new();
@@ -436,6 +504,11 @@ pub struct RsaHostKey {
 }
 
 impl RsaHostKey {
+    /// RSA modulus size in bits.
+    pub fn bits(&self) -> usize {
+        self.bits
+    }
+
     pub fn generate(bits: usize) -> Result<Self> {
         let private_key = RsaPrivateKey::new(&mut OsRng, bits)
             .map_err(|e| SshError::InvalidKey(format!("RSA gen: {}", e)))?;
@@ -454,13 +527,16 @@ impl RsaHostKey {
 
     pub fn from_public_bytes(public: &[u8]) -> Result<Self> {
         let mut r = &public[..];
-        let n_bytes = SshBytes::decode(&mut r)?.0;
-        let e_bytes = SshBytes::decode(&mut r)?.0;
-        let n = rsa::BigUint::from_bytes_be(&n_bytes);
+        // RFC 4253 §6.6: the key blob after "ssh-rsa" is `mpint e`, then
+        // `mpint n`. Getting these the wrong way around makes the modulus and
+        // exponent swap, which no real peer can verify.
+        let e_bytes = SshMpInt::decode(&mut r)?.0;
+        let n_bytes = SshMpInt::decode(&mut r)?.0;
         let e = rsa::BigUint::from_bytes_be(&e_bytes);
+        let n = rsa::BigUint::from_bytes_be(&n_bytes);
         let public_key = rsa::RsaPublicKey::new(n, e)
             .map_err(|e| SshError::InvalidKey(format!("RSA pubkey: {}", e)))?;
-        let bits = public_key.size();
+        let bits = public_key.size() * 8;
         Ok(RsaHostKey { private_key: None, public_key, bits })
     }
 }
@@ -477,10 +553,11 @@ impl HostKeySigner for RsaHostKey {
         let mut buf = Vec::new();
         SshString::new("ssh-rsa").encode(&mut buf).unwrap();
 
-        let n = self.public_key.n().to_bytes_be();
+        // RFC 4253 §6.6: `mpint e` first, then `mpint n`.
         let e = self.public_key.e().to_bytes_be();
-        SshBytes(n).encode(&mut buf).unwrap();
-        SshBytes(e).encode(&mut buf).unwrap();
+        let n = self.public_key.n().to_bytes_be();
+        SshMpInt(e).encode(&mut buf).unwrap();
+        SshMpInt(n).encode(&mut buf).unwrap();
         buf
     }
 
@@ -528,7 +605,7 @@ impl HostKeySigner for RsaHostKey {
         let mut r = &signature[..];
         let sig_type = SshString::decode(&mut r)?.0;
         let sig_type_str = String::from_utf8_lossy(&sig_type).to_string();
-        let sig_bytes = SshBytes::decode(&mut r)?.0;
+        let _sig_bytes = SshBytes::decode(&mut r)?.0;
         self.verify_with(&sig_type_str, data, signature)
     }
 
@@ -583,11 +660,11 @@ impl HostKeyVerifier for RsaHostKey {
     fn algorithm_name(&self) -> &str { "rsa-sha2-256" }
     fn key_type(&self) -> &str { "ssh-rsa" }
     fn public_key_bytes(&self) -> Vec<u8> {
-        let n = self.public_key.n().to_bytes_be();
         let e = self.public_key.e().to_bytes_be();
+        let n = self.public_key.n().to_bytes_be();
         let mut buf = Vec::new();
-        SshBytes(n).encode(&mut buf).unwrap();
-        SshBytes(e).encode(&mut buf).unwrap();
+        SshMpInt(e).encode(&mut buf).unwrap();
+        SshMpInt(n).encode(&mut buf).unwrap();
         buf
     }
 
@@ -639,11 +716,49 @@ pub fn get_supported_host_key_algorithms() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    /// Strip the `string keytype` prefix from an SSH signature blob.
+    /// Flatten the OpenSSH `string type, string (string r || string s)` layout
+    /// back to `r || s` for direct curve-crate verification.
     fn ssh_sig_bytes(blob: &[u8]) -> Vec<u8> {
         let mut r: &[u8] = blob;
-        let _ = SshString::decode(&mut r).unwrap();
-        SshBytes::decode(&mut r).unwrap().0
+        let ty = SshString::decode(&mut r).unwrap();
+        let field_len = match ty.0.as_slice() {
+            b"ecdsa-sha2-nistp256" => 32,
+            b"ecdsa-sha2-nistp384" => 48,
+            b"ecdsa-sha2-nistp521" => 66,
+            other => panic!("unexpected ecdsa type {:?}", other),
+        };
+        let inner = SshBytes::decode(&mut r).unwrap().0;
+        let mut ir: &[u8] = &inner;
+        let mut out = Vec::with_capacity(field_len * 2);
+        for _ in 0..2 {
+            let v = SshString::decode(&mut ir).unwrap().0;
+            let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+            out.extend(std::iter::repeat_n(0u8, field_len - (v.len() - first)));
+            out.extend_from_slice(&v[first..]);
+        }
+        out
+    }
+
+    /// OpenSSH encodes r and s as two separate SSH strings. A flat 64-byte
+    /// signature blob is self-consistent but never accepted by OpenSSH; guard
+    /// the wire shape so that regression cannot silently return.
+    #[test]
+    fn ecdsa_signature_uses_two_string_components() {
+        let key = EcdsaP256HostKey::generate().unwrap();
+        let blob = key.sign(b"data").unwrap();
+        let mut r: &[u8] = &blob;
+        let ty = SshString::decode(&mut r).unwrap();
+        assert_eq!(ty.0, b"ecdsa-sha2-nistp256");
+        let inner = SshBytes::decode(&mut r).unwrap().0;
+        // r and s are 32-byte mpints; each may grow to 33 bytes when the top
+        // bit is set and needs a positive sign byte.
+        assert!(
+            (72..=74).contains(&inner.len()),
+            "signature must be string r + string s, got {} bytes",
+            inner.len()
+        );
+        assert_eq!(ssh_sig_bytes(&blob).len(), 64);
+        assert!(r.is_empty());
     }
 
     /// RFC 5656 §6.2.1: nistp384 hashes with SHA-384. A round-trip through our

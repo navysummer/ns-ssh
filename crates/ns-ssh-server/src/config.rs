@@ -125,6 +125,10 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub strict_modes: bool,
 
+    /// RequiredRSASize: minimum RSA key size in bits (OpenSSH default 1024).
+    #[serde(default = "default_required_rsa_size")]
+    pub required_rsa_size: u32,
+
     #[serde(default = "default_true")]
     pub permit_tty: bool,
 
@@ -516,6 +520,7 @@ fn default_auth_failure_delay() -> u64 { 2 }
 fn default_port() -> u16 { 22 }
 fn default_listen_address() -> String { "0.0.0.0".to_string() }
 fn default_true() -> bool { true }
+fn default_required_rsa_size() -> u32 { 1024 }
 fn default_max_auth_tries() -> u32 { 6 }
 fn default_max_sessions() -> u32 { 10 }
 fn default_client_alive_interval() -> u32 { 0 }
@@ -740,6 +745,7 @@ impl Default for ServerConfig {
             log_file: default_log_file(),
             force_command: None,
             strict_modes: default_true(),
+            required_rsa_size: default_required_rsa_size(),
             permit_tty: default_true(),
             permit_empty_passwords: false,
             ignore_rhosts: default_true(),
@@ -1207,7 +1213,6 @@ impl ServerConfig {
                 | "persourcepenaltyexemptlist" | "per_source_penalty_exempt_list"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
                 | "rdomain" | "refuseconnection" | "refuse_connection"
-                | "requiredrsasize" | "required_rsa_size"
                 | "revokedkeys" | "revoked_keys"
                 | "securitykeyprovider" | "security_key_provider"
                 | "sshdssessionpath" | "sshd_session_path"
@@ -1218,6 +1223,11 @@ impl ServerConfig {
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location" => {
                     // Accepted; not enforced.
+                }
+                "requiredrsasize" | "required_rsa_size" => {
+                    if let Ok(v) = value.parse().map(|v: u32| v.max(1024)) {
+                        config.required_rsa_size = v;
+                    }
                 }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",
@@ -1404,9 +1414,20 @@ Match All
     fn unimplemented_openssh_directives_do_not_fatal() {
         assert!(ServerConfig::parse(
             "AuthenticationMethods publickey\n\
-             RequiredRSASize 2048\n\
              TrustedUserCAKeys /tmp/ca.pub\n\
              ChannelTimeout session=5m\n"
         ).is_ok());
+    }
+
+    #[test]
+    fn required_rsa_size_is_parsed_and_clamped() {
+        let c = ServerConfig::parse("RequiredRSASize 3072\n").unwrap();
+        assert_eq!(c.required_rsa_size, 3072);
+        // OpenSSH rejects/clamps values below 1024.
+        let c = ServerConfig::parse("RequiredRSASize 512\n").unwrap();
+        assert_eq!(c.required_rsa_size, 1024);
+        // Default when unset.
+        let c = ServerConfig::parse("").unwrap();
+        assert_eq!(c.required_rsa_size, 1024);
     }
 }

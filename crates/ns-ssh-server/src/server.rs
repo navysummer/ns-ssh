@@ -45,6 +45,7 @@ impl SshServer {
             self.config.authorized_keys_command_user.clone(),
         );
         self.auth.lock().await.set_strict_modes(self.config.strict_modes);
+        self.auth.lock().await.set_required_rsa_size(self.config.required_rsa_size);
 
         Ok(())
     }

@@ -163,6 +163,11 @@ fn main() {
                 "strictmodes" | "strict_modes" => {
                     config.strict_modes = value == "yes";
                 }
+                "requiredrsasize" | "required_rsa_size" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        config.required_rsa_size = v.max(1024);
+                    }
+                }
                 "permittty" | "permit_tty" => {
                     config.permit_tty = value == "yes";
                 }

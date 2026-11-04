@@ -171,6 +171,8 @@ pub struct HostConfig {
     pub gateway_ports: Option<bool>,
     #[serde(default)]
     pub clear_all_forwardings: Option<bool>,
+    #[serde(default)]
+    pub required_rsa_size: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +303,8 @@ pub struct ResolvedConfig {
     /// PubkeyAcceptedAlgorithms: restrict which public-key signature algorithms
     /// are offered during publickey authentication. `None` = accept all (default).
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// RequiredRSASize: reject server host keys smaller than this (bits).
+    pub required_rsa_size: u32,
 }
 
 impl ResolvedConfig {
@@ -380,6 +384,7 @@ impl ResolvedConfig {
             rekey_limit_time: 3600,
             identity_agent: None,
             pubkey_accepted_algorithms: None,
+            required_rsa_size: 1024,
         }
     }
 }
@@ -583,6 +588,7 @@ impl SshConfig {
         let mut control_persist = None;
         let mut gateway_ports = None;
         let mut clear_all_forwardings = None;
+        let mut required_rsa_size = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -664,6 +670,7 @@ impl SshConfig {
                              control_persist: control_persist.take(),
                              gateway_ports: gateway_ports.take(),
                              clear_all_forwardings: clear_all_forwardings.take(),
+                             required_rsa_size: required_rsa_size.take(),
                          });
                     }
                     current_host = Some(value.to_string());
@@ -732,6 +739,7 @@ impl SshConfig {
                              control_persist: control_persist.take(),
                              gateway_ports: gateway_ports.take(),
                              clear_all_forwardings: clear_all_forwardings.take(),
+                             required_rsa_size: required_rsa_size.take(),
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
@@ -831,7 +839,6 @@ impl SshConfig {
                 | "kbdinteractivedevices" | "kbd_interactive_devices"
                 | "syslogfacility" | "syslog_facility"
                 | "xauthlocation" | "xauth_location"
-                | "requiredrsasize" | "required_rsa_size"
                 | "hostbasedauthentication" | "hostbased_authentication"
                 | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
@@ -863,6 +870,11 @@ impl SshConfig {
                 | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
                 | "usekeychain" | "use_keychain" => {
                     // Accepted; not enforced.
+                }
+                "requiredrsasize" | "required_rsa_size" => {
+                    if let Ok(v) = value.parse() {
+                        required_rsa_size = Some(v);
+                    }
                 }
                 "ignoreunknown" | "ignore_unknown" => {
                     for tok in value.split(',') {
@@ -951,6 +963,7 @@ impl SshConfig {
                 control_persist: control_persist.clone(),
                 gateway_ports,
                 clear_all_forwardings,
+                required_rsa_size,
             });
         }
 
@@ -1019,6 +1032,7 @@ impl SshConfig {
                     control_persist: control_persist.clone(),
                     gateway_ports,
                     clear_all_forwardings,
+                    required_rsa_size,
                 },
             });
         }
@@ -1473,9 +1487,15 @@ mod tests {
 
     #[test]
     fn unimplemented_openssh_directives_do_not_fatal() {
-        // These are valid OpenSSH client directives we accept but do not enforce.
         assert!(SshConfig::parse(
-            "Host foo\n  RequiredRSASize 2048\n  ChannelTimeout 5m\n  SessionType none\n"
+            "Host foo\n  ChannelTimeout 5m\n  SessionType none\n"
         ).is_ok());
+    }
+
+    #[test]
+    fn required_rsa_size_is_parsed() {
+        let cfg = SshConfig::parse("Host foo\n  RequiredRSASize 3072\n").unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.required_rsa_size, Some(3072));
     }
 

@@ -980,6 +980,9 @@ impl SshClient {
             }
             "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
                 let verifier = RsaHostKey::from_public_bytes(&host_key_bytes)?;
+                if verifier.bits() < self.config.required_rsa_size as usize {
+                    return Err(SshError::HostKeyVerificationFailed);
+                }
                 let sig_alg = {
                     let mut r = &server_signature_blob[..];
                     let got = SshString::decode(&mut r).ok();

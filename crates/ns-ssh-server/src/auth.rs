@@ -1,7 +1,5 @@
 use ssh_core::error::{Result, SshError};
 use ssh_core::encoding::*;
-use ssh_core::hostkey::*;
-use ssh_core::known_hosts::*;
 use std::path::PathBuf;
 use std::path::Path;
 use std::fs;
@@ -228,7 +226,6 @@ impl AuthorizedKeyOptions {
 pub struct AuthorizedKeyEntry {
     pub key_type: String,
     pub public_key: Vec<u8>,
-    pub comment: Option<String>,
     pub options: AuthorizedKeyOptions,
 }
 
@@ -239,6 +236,7 @@ pub struct ServerAuth {
     authorized_keys_command: Option<String>,
     authorized_keys_command_user: Option<String>,
     strict_modes: bool,
+    required_rsa_size: usize,
 }
 
 impl ServerAuth {
@@ -250,7 +248,13 @@ impl ServerAuth {
             authorized_keys_command: None,
             authorized_keys_command_user: None,
             strict_modes: true,
+            required_rsa_size: 1024,
         }
+    }
+
+    /// Set RequiredRSASize (minimum accepted RSA key size, in bits).
+    pub fn set_required_rsa_size(&mut self, bits: u32) {
+        self.required_rsa_size = bits as usize;
     }
 
     /// Set StrictModes (authorized_keys file/directory ownership & permissions).
@@ -500,7 +504,6 @@ impl ServerAuth {
         let mut parts = rest.split_whitespace();
         let key_type = parts.next()?;
         let key_b64 = parts.next()?;
-        let comment = parts.next().map(|s| s.to_string());
 
         let key_bytes = base64::engine::general_purpose::STANDARD
             .decode(key_b64)
@@ -509,9 +512,18 @@ impl ServerAuth {
         Some(AuthorizedKeyEntry {
             key_type: key_type.to_string(),
             public_key: key_bytes,
-            comment,
             options,
         })
+    }
+
+    /// An RSA key is stored in authorized_keys as "ssh-rsa", but RFC 8332 lets
+    /// clients request it as "rsa-sha2-256"/"rsa-sha2-512" while sending the
+    /// same ssh-rsa blob. Treat those as the same key type, otherwise OpenSSH
+    /// clients authenticating with an RSA key are rejected.
+    fn key_type_matches(entry_type: &str, request_type: &str) -> bool {
+        entry_type == request_type
+            || (entry_type == "ssh-rsa"
+                && matches!(request_type, "rsa-sha2-256" | "rsa-sha2-512"))
     }
 
     pub fn verify_public_key(
@@ -520,14 +532,14 @@ impl ServerAuth {
         public_key: &[u8],
     ) -> bool {
         self.authorized_keys.iter().any(|entry| {
-            entry.key_type == key_type && entry.public_key == public_key
+            Self::key_type_matches(&entry.key_type, key_type) && entry.public_key == public_key
         })
     }
 
     /// Find the matching authorized key entry for a given key blob.
     pub fn find_matching_key(&self, key_type: &str, public_key: &[u8]) -> Option<&AuthorizedKeyEntry> {
         self.authorized_keys.iter().find(|entry| {
-            entry.key_type == key_type && entry.public_key == public_key
+            Self::key_type_matches(&entry.key_type, key_type) && entry.public_key == public_key
         })
     }
 
@@ -558,24 +570,6 @@ impl ServerAuth {
         true
     }
 
-    pub fn verify_public_key_with_comment(
-        &self,
-        key_type: &str,
-        public_key: &[u8],
-        username: &str,
-    ) -> bool {
-        self.authorized_keys.iter().any(|entry| {
-            if entry.key_type == key_type && entry.public_key == public_key {
-                if let Some(ref comment) = entry.comment {
-                    return comment.contains(username) || comment.is_empty();
-                }
-                true
-            } else {
-                false
-            }
-        })
-    }
-
     pub fn create_signer_for_key(&self, key_type: &str, public_key: &[u8]) -> Option<Box<dyn ssh_core::hostkey::HostKeySigner>> {
         match key_type {
             "ssh-ed25519" => {
@@ -589,28 +583,44 @@ impl ServerAuth {
                 ssh_core::hostkey::Ed25519HostKey::from_public_bytes(&arr)
                     .ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
-            "ecdsa-sha2-nistp256" => {
+            "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
                 let mut r = public_key;
                 let kt = SshString::decode(&mut r).ok()?;
-                if kt.as_str().ok()? != "ecdsa-sha2-nistp256" { return None; }
+                if kt.as_str().ok()? != key_type { return None; }
                 let curve = SshString::decode(&mut r).ok()?;
-                if curve.as_str().ok()? != "nistp256" { return None; }
+                let curve_name = match key_type {
+                    "ecdsa-sha2-nistp256" => "nistp256",
+                    "ecdsa-sha2-nistp384" => "nistp384",
+                    _ => "nistp521",
+                };
+                if curve.as_str().ok()? != curve_name { return None; }
                 let pk = SshBytes::decode(&mut r).ok()?;
-                ssh_core::hostkey::EcdsaP256HostKey::from_public_bytes(&pk.0)
-                    .ok().map(|k| Box::new(k) as Box<dyn ssh_core::hostkey::HostKeySigner>)
+                let signer: Box<dyn ssh_core::hostkey::HostKeySigner> = match key_type {
+                    "ecdsa-sha2-nistp256" => Box::new(
+                        ssh_core::hostkey::EcdsaP256HostKey::from_public_bytes(&pk.0).ok()?),
+                    "ecdsa-sha2-nistp384" => Box::new(
+                        ssh_core::hostkey::EcdsaP384HostKey::from_public_bytes(&pk.0).ok()?),
+                    _ => Box::new(
+                        ssh_core::hostkey::EcdsaP521HostKey::from_public_bytes(&pk.0).ok()?),
+                };
+                Some(signer)
             }
             "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
                 let mut r = public_key;
                 let kt = SshString::decode(&mut r).ok()?;
                 let kt_str = kt.as_str().ok()?;
                 if kt_str != "ssh-rsa" { return None; }
-                let e_bytes = SshBytes::decode(&mut r).ok()?;
-                let n_bytes = SshBytes::decode(&mut r).ok()?;
+                let e_bytes = SshMpInt::decode(&mut r).ok()?;
+                let n_bytes = SshMpInt::decode(&mut r).ok()?;
                 let n = rsa::BigUint::from_bytes_be(&n_bytes.0);
                 let e = rsa::BigUint::from_bytes_be(&e_bytes.0);
                 let public_key = rsa::RsaPublicKey::new(n.clone(), e).ok()?;
                 // Dynamically compute RSA key bits from n
                 let bits = n.bits() as usize;
+                // RequiredRSASize: reject undersized RSA keys.
+                if bits < self.required_rsa_size {
+                    return None;
+                }
                 Some(Box::new(ssh_core::hostkey::RsaHostKey::new(None, public_key, bits))
                     as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
@@ -671,19 +681,6 @@ impl ServerAuth {
         false
     }
 
-    pub fn add_password_user(&mut self, username: &str, hash: &str) {
-        self.password_hashes.insert(username.to_string(), hash.to_string());
-    }
-
-    pub fn get_authorized_keys_for_user(&self, username: &str) -> Vec<&AuthorizedKeyEntry> {
-        self.authorized_keys.iter().filter(|entry| {
-            if let Some(ref comment) = entry.comment {
-                comment.contains(username)
-            } else {
-                true
-            }
-        }).collect()
-    }
 }
 
 fn verify_unix_password(password: &str, hash: &str) -> bool {
@@ -797,7 +794,7 @@ fn md5_crypt_encode(digest: &[u8]) -> String {
 
     let mut out = String::with_capacity(22);
 
-    let mut b64_24 = |a: u8, b: u8, c: u8, out: &mut String| {
+    let b64_24 = |a: u8, b: u8, c: u8, out: &mut String| {
         let v = ((a as u32) << 16) | ((b as u32) << 8) | (c as u32);
         out.push(ALPHABET[(v & 0x3f) as usize] as char);
         out.push(ALPHABET[((v >> 6) & 0x3f) as usize] as char);

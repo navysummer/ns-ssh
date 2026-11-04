@@ -1887,6 +1887,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = host_config.gateway_ports {
                 resolved.gateway_ports = v;
             }
+            if let Some(v) = host_config.required_rsa_size {
+                resolved.required_rsa_size = v;
+            }
             if let Some(v) = host_config.clear_all_forwardings {
                 if v {
                     resolved.local_forwards.clear();
@@ -2092,6 +2095,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = mc.no_host_authentication_for_localhost {
                 resolved.no_host_authentication_for_localhost = v;
             }
+            if let Some(v) = mc.required_rsa_size {
+                resolved.required_rsa_size = v;
+            }
         }
     }
 
@@ -2206,6 +2212,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
             if let Ok(v) = value.parse::<u32>() { resolved.connection_attempts = v; }
         }
         "verifyhostkeydns" | "verify_host_key_dns" => resolved.verify_host_key_dns = value.to_ascii_lowercase(),
+        "requiredrsasize" | "required_rsa_size" => {
+            if let Ok(v) = value.parse::<u32>() { resolved.required_rsa_size = v; }
+        }
         "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
             resolved.no_host_authentication_for_localhost = value != "no";
         }
