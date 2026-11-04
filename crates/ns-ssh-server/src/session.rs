@@ -1,14 +1,10 @@
 use ssh_core::error::{Result, SshError};
-use ssh_core::encoding::*;
-use ssh_core::msg;
-use ssh_core::channel::*;
 use std::collections::HashMap;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Command as TokioCommand, Child, ChildStdout, ChildStderr};
 use tokio::process::ChildStdin;
 
 pub struct Session {
-    pub id: u32,
     pub username: String,
     pub pty: bool,
     pub term: String,
@@ -80,7 +76,6 @@ impl SessionManager {
         self.next_id += 1;
 
         let session = Session {
-            id,
             username,
             pty,
             term,
@@ -116,10 +111,6 @@ impl SessionManager {
         self.sessions.get_mut(&id)
     }
 
-    pub fn first_session_id(&self) -> Option<u32> {
-        self.sessions.keys().next().cloned()
-    }
-
     pub fn session_ids(&self) -> Vec<u32> {
         self.sessions.keys().cloned().collect()
     }
@@ -131,10 +122,6 @@ impl SessionManager {
             session.width = width;
             session.height = height;
         }
-    }
-
-    pub fn remove_session(&mut self, id: u32) {
-        self.sessions.remove(&id);
     }
 
     pub fn len(&self) -> usize {
@@ -361,14 +348,6 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn check_exit_status(&mut self, id: u32) -> Option<i32> {
-        match self.poll_child_exit(id) {
-            Some(ChildExit::Status(code)) => Some(code),
-            Some(ChildExit::Signal(sig, _)) => Some(128 + sig),
-            None => None,
-        }
-    }
-
     /// Poll a session child and report how it terminated (status or signal).
     pub fn poll_child_exit(&mut self, id: u32) -> Option<ChildExit> {
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -410,12 +389,6 @@ impl SessionManager {
         } else {
             None
         }
-    }
-
-    pub fn is_running(&self, id: u32) -> bool {
-        self.sessions.get(&id)
-            .map(|s| s.status == SessionStatus::Running)
-            .unwrap_or(false)
     }
 }
 

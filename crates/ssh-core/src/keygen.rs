@@ -51,8 +51,36 @@ pub fn format_openssh_ed25519(secret: &[u8; 32]) -> String {
     encode_pem(&buf)
 }
 
-/// Format a P-256 ECDSA private key as an OpenSSH private key (no passphrase).
-pub fn format_openssh_ecdsa(secret: &[u8]) -> String {
+/// Format an ECDSA (P-256/P-384/P-521) private key as an OpenSSH private key
+/// (no passphrase). The curve is selected from the scalar length.
+pub fn format_openssh_ecdsa(secret: &[u8]) -> Result<String> {
+    let (key_type, curve_name, point_bytes) = match secret.len() {
+        32 => {
+            let signing_key = p256::ecdsa::SigningKey::from_slice(secret)
+                .map_err(|e| SshError::InvalidKey(format!("ecdsa p256: {}", e)))?;
+            let point = signing_key.verifying_key().to_encoded_point(false);
+            ("ecdsa-sha2-nistp256", "nistp256", point.as_bytes().to_vec())
+        }
+        48 => {
+            let signing_key = p384::ecdsa::SigningKey::from_slice(secret)
+                .map_err(|e| SshError::InvalidKey(format!("ecdsa p384: {}", e)))?;
+            let point = signing_key.verifying_key().to_encoded_point(false);
+            ("ecdsa-sha2-nistp384", "nistp384", point.as_bytes().to_vec())
+        }
+        66 => {
+            let signing_key = p521::ecdsa::SigningKey::from_slice(secret)
+                .map_err(|e| SshError::InvalidKey(format!("ecdsa p521: {}", e)))?;
+            let point = p521::ecdsa::VerifyingKey::from(&signing_key)
+                .to_encoded_point(false);
+            ("ecdsa-sha2-nistp521", "nistp521", point.as_bytes().to_vec())
+        }
+        _ => {
+            return Err(SshError::InvalidKey(
+                "unsupported ECDSA secret length".into(),
+            ))
+        }
+    };
+
     let mut buf = Vec::new();
     buf.extend_from_slice(b"openssh-key-v1\0");
     buf.extend_from_slice(&4u32.to_be_bytes());
@@ -62,29 +90,25 @@ pub fn format_openssh_ecdsa(secret: &[u8]) -> String {
     buf.extend_from_slice(&0u32.to_be_bytes()); // kdf options: empty string
     buf.extend_from_slice(&1u32.to_be_bytes());
 
-    let signing_key = p256::ecdsa::SigningKey::from_bytes(secret.into()).unwrap();
-    let verifying_key = signing_key.verifying_key();
-    let point = verifying_key.to_encoded_point(false);
-
     let mut pub_key_buf = Vec::new();
-    pub_key_buf.extend_from_slice(&(19u32).to_be_bytes());
-    pub_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
-    pub_key_buf.extend_from_slice(&(8u32).to_be_bytes());
-    pub_key_buf.extend_from_slice(b"nistp256");
-    pub_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
-    pub_key_buf.extend_from_slice(point.as_bytes());
+    pub_key_buf.extend_from_slice(&(key_type.len() as u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(key_type.as_bytes());
+    pub_key_buf.extend_from_slice(&(curve_name.len() as u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(curve_name.as_bytes());
+    pub_key_buf.extend_from_slice(&(point_bytes.len() as u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(&point_bytes);
     buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
     buf.extend_from_slice(&pub_key_buf);
 
     let mut priv_key_buf = Vec::new();
     priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
     priv_key_buf.extend_from_slice(&0u32.to_be_bytes());
-    priv_key_buf.extend_from_slice(&(19u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(b"ecdsa-sha2-nistp256");
-    priv_key_buf.extend_from_slice(&(8u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(b"nistp256");
-    priv_key_buf.extend_from_slice(&(point.as_bytes().len() as u32).to_be_bytes());
-    priv_key_buf.extend_from_slice(point.as_bytes());
+    priv_key_buf.extend_from_slice(&(key_type.len() as u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(key_type.as_bytes());
+    priv_key_buf.extend_from_slice(&(curve_name.len() as u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(curve_name.as_bytes());
+    priv_key_buf.extend_from_slice(&(point_bytes.len() as u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(&point_bytes);
     // Private scalar encoded as mpint: prepend 0x00 if the high bit is set.
     let mut scalar_mpint = Vec::new();
     if secret.first().map(|b| b & 0x80 != 0).unwrap_or(false) {
@@ -102,7 +126,7 @@ pub fn format_openssh_ecdsa(secret: &[u8]) -> String {
     buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
     buf.extend_from_slice(&priv_key_buf);
 
-    encode_pem(&buf)
+    Ok(encode_pem(&buf))
 }
 
 fn encode_pem(buf: &[u8]) -> String {
@@ -160,7 +184,7 @@ mod tests {
     #[test]
     fn openssh_ecdsa_pem() {
         let key = crate::hostkey::EcdsaP256HostKey::generate().unwrap();
-        let pem = format_openssh_ecdsa(&key.secret_bytes());
+        let pem = format_openssh_ecdsa(&key.secret_bytes()).unwrap();
         assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
     }
 }

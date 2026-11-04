@@ -1,8 +1,5 @@
 use crate::error::{Result, SshError};
 use crate::encoding::*;
-use crate::msg;
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 
 pub const SSH_FXP_INIT: u8 = 1;
 pub const SSH_FXP_VERSION: u8 = 2;
@@ -368,12 +365,15 @@ pub fn build_sftp_readlink(id: u32, path: &str) -> Vec<u8> {
     wrap_sftp_payload(&payload)
 }
 
-pub fn build_sftp_symlink(id: u32, linkpath: &str, targetpath: &str) -> Vec<u8> {
+/// SFTP v3 `SSH_FXP_SYMLINK` carries the target before the link path. This
+/// ordering matches OpenSSH's sftp-server (`oldpath` then `newpath`); sending
+/// the link first made every v3 server reject the request.
+pub fn build_sftp_symlink(id: u32, targetpath: &str, linkpath: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_FXP_SYMLINK);
     payload.extend(id.to_be_bytes());
-    SshString::new(linkpath).encode(&mut payload).unwrap();
     SshString::new(targetpath).encode(&mut payload).unwrap();
+    SshString::new(linkpath).encode(&mut payload).unwrap();
     wrap_sftp_payload(&payload)
 }
 

@@ -11,7 +11,6 @@ async fn new_scp_client(config: &ResolvedConfig) -> Result<SshClient> {
     client.connect().await?;
     client.handshake().await?;
     client.authenticate().await?;
-    client.request_connection_service().await?;
     Ok(client)
 }
 

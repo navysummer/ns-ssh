@@ -7,7 +7,6 @@
 //! The wire protocol is a small length-prefixed frame format (u32 length,
 //! then payload), shared over the Unix socket.
 
-use crate::config::ResolvedConfig;
 use ssh_core::encoding::*;
 use ssh_core::error::{Result, SshError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -405,16 +404,14 @@ pub async fn run_control_slave(
     write_frame(&mut sock, &frame).await?;
 
     // Wait for the open confirmation.
-    let mut remote_id: Option<u32> = None;
-    loop {
+    let _remote_id = loop {
         let Some(frame) = read_frame(&mut sock).await? else {
             return Err(SshError::Protocol("control socket closed".into()));
         };
         match decode_response(&frame)? {
             ControlResponse::OpenConfirm { request_id, remote_id: rid } => {
                 if request_id == req_id {
-                    remote_id = Some(rid);
-                    break;
+                    break rid;
                 }
             }
             ControlResponse::OpenFailure { reason, .. } => {
@@ -423,8 +420,7 @@ pub async fn run_control_slave(
             }
             _ => {}
         }
-    }
-    let remote_id = remote_id.ok_or_else(|| SshError::Protocol("no open confirm".into()))?;
+    };
 
     // Forward stdin/stdout over the control socket.
     let (mut rd, mut wr) = sock.into_split();
@@ -432,7 +428,7 @@ pub async fn run_control_slave(
     let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     // When the session is done (close/exit-status received), signal the writer
     // to drop its write half so the master sees the connection close.
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
     let reader_task = tokio::spawn(async move {
         loop {
             let Some(frame) = read_frame(&mut rd).await? else {

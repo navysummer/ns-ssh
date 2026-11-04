@@ -1,8 +1,6 @@
-use crate::config::ResolvedConfig;
 use ssh_core::error::{Result, SshError};
 use ssh_core::encoding::*;
 use ssh_core::hostkey::*;
-use ssh_core::msg;
 use rsa::traits::PublicKeyParts;
 use std::path::PathBuf;
 use tokio::net::UnixStream;
@@ -13,7 +11,6 @@ pub const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 pub const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 pub const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 pub const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
-pub const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
 pub const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
 pub const SSH_AGENT_FAILURE: u8 = 5;
 pub const SSH_AGENT_SUCCESS: u8 = 6;
@@ -462,7 +459,7 @@ fn load_openssh_key(content: &str, password: Option<&str>) -> Result<Box<dyn Hos
                 &secret_bytes.try_into().map_err(|_| SshError::InvalidKey("wrong ed25519 key size".into()))?
             )?))
         }
-        "ecdsa-sha2-nistp256" => {
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
             let _pub_curve = read_simplified_string(&mut pr)?;
             let _pub_len = read_simplified_uint32(&mut pr)? as usize;
             pr = &pr[_pub_len..];
@@ -470,9 +467,29 @@ fn load_openssh_key(content: &str, password: Option<&str>) -> Result<Box<dyn Hos
             let avail = pr.len();
             let take = secret_len.min(avail);
             let secret_bytes = read_simplified_raw(&mut pr, take)?;
-            let mut sb = secret_bytes;
-            if sb.len() > 32 { sb = sb[sb.len()-32..].to_vec(); }
-            Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&sb)?))
+            let field_len = match key_type.as_str() {
+                "ecdsa-sha2-nistp256" => 32,
+                "ecdsa-sha2-nistp384" => 48,
+                _ => 66,
+            };
+            // OpenSSH writes the scalar as an mpint, so it may carry a leading
+            // 0x00 sign byte even though it is at most `field_len` bytes long.
+            let first = secret_bytes.iter().position(|&b| b != 0)
+                .unwrap_or(secret_bytes.len());
+            let scalar = &secret_bytes[first..];
+            if scalar.len() > field_len {
+                return Err(SshError::InvalidKey(format!(
+                    "{} private scalar is {} bytes, expected at most {}",
+                    key_type, scalar.len(), field_len
+                )));
+            }
+            let mut sb = vec![0u8; field_len];
+            sb[field_len - scalar.len()..].copy_from_slice(scalar);
+            match key_type.as_str() {
+                "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_secret_bytes(&sb)?)),
+                "ecdsa-sha2-nistp384" => Ok(Box::new(EcdsaP384HostKey::from_secret_bytes(&sb)?)),
+                _ => Ok(Box::new(EcdsaP521HostKey::from_secret_bytes(&sb)?)),
+            }
         }
         "ssh-rsa" => {
             let n_bytes = read_simplified_string_bytes(&mut pr)?;

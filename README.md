@@ -6,10 +6,10 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 
 ### ns-ssh (Client)
 - SSH-2.0 protocol support
-- Key exchange: Curve25519-SHA256, ECDH P-256, Diffie-Hellman Group 14
-- Ciphers: ChaCha20-Poly1305, AES-128/192/256-CTR, AES-128/256-GCM
-- MAC: HMAC-SHA2-256, HMAC-SHA2-512
-- Host key algorithms: Ed25519, ECDSA P-256, RSA
+- Key exchange: Curve25519-SHA256, ECDH P-256/384/521, DH group14/16/18, DH group-exchange (SHA-256/SHA-1)
+- Ciphers: ChaCha20-Poly1305, AES-128/192/256-CTR, AES-128/256-GCM, AES-CBC, 3DES-CBC
+- MAC: HMAC-SHA2-256/512, HMAC-SHA1 (including the ETM variants)
+- Host key algorithms: Ed25519, ECDSA P-256/384/521, RSA (rsa-sha2-256/512)
 - Authentication: Public key, Password, SSH Agent
 - Session management with PTY support
 - Remote command execution
@@ -17,6 +17,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Local and remote port forwarding
 - Known hosts management
 - SSH client config file parsing (~/.ssh/config)
+- Automatic rekeying (RekeyLimit; client- and server-initiated)
 
 ### ns-ssh-server (Server)
 - SSH-2.0 protocol support
@@ -29,6 +30,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Server config file (/etc/ssh/sshd_config compatible)
 - Automatic host key generation
 - Daemon mode support
+- Automatic rekeying (RekeyLimit)
 
 ## Building
 

@@ -3,8 +3,7 @@ use crate::config::ResolvedConfig;
 use ssh_core::channel::ChannelId;
 use ssh_core::error::{Result, SshError};
 use ssh_core::sftp::*;
-use ssh_core::{SshBytes, SshDecode, SshEncode, SshString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct SftpSession {
     client: SshClient,
@@ -19,7 +18,6 @@ async fn new_sftp_client(config: &ResolvedConfig) -> Result<SftpSession> {
     client.connect().await?;
     client.handshake().await?;
     client.authenticate().await?;
-    client.request_connection_service().await?;
     let channel = client.request_session_subsystem("sftp").await?;
 
     let mut s = SftpSession {
@@ -307,7 +305,13 @@ impl SftpSession {
 
     pub async fn cmd_symlink(&mut self, linkpath: &str, targetpath: &str) -> Result<()> {
         let l = self.resolve(linkpath);
-        self.ok_id(|id| build_sftp_symlink(id, &l, targetpath)).await
+        self.ok_id(|id| build_sftp_symlink(id, targetpath, &l)).await
+    }
+
+    pub async fn cmd_hardlink(&mut self, linkpath: &str, targetpath: &str) -> Result<()> {
+        let l = self.resolve(linkpath);
+        let t = self.resolve(targetpath);
+        self.ok_id(|id| build_sftp_hardlink(id, &t, &l)).await
     }
 
     pub async fn cmd_readlink(&mut self, path: &str) -> Result<String> {
@@ -326,7 +330,7 @@ pub async fn run_sftp(config: &ResolvedConfig) -> Result<()> {
     let mut lines = tokio::io::BufReader::new(stdin).lines();
 
     loop {
-        let cwd = match s.cmd_pwd().await {
+        let _cwd = match s.cmd_pwd().await {
             Ok(p) => p,
             Err(_) => "?".to_string(),
         };
@@ -402,8 +406,10 @@ impl SftpSession {
             }
             "ls" | "dir" => {
                 let mut path = None;
+                let mut long = false;
                 for arg in parts.iter().skip(1).copied() {
                     if arg.starts_with('-') {
+                        long |= arg.contains('l');
                         continue;
                     }
                     if path.is_none() {
@@ -411,7 +417,12 @@ impl SftpSession {
                     }
                 }
                 let path = path.or(Some("."));
-                match self.cmd_ls(path).await {
+                let result = if long {
+                    self.cmd_ls_long(path).await
+                } else {
+                    self.cmd_ls(path).await
+                };
+                match result {
                     Ok(items) => {
                         for it in items {
                             println!("{}", it);
@@ -493,12 +504,18 @@ impl SftpSession {
                     println!("usage: ln [-s] oldpath newpath");
                 } else {
                     let args: Vec<&str> = parts[1..].to_vec();
-                    let (link, target) = if args[0] == "-s" {
+                    let symlink = args[0] == "-s";
+                    let (link, target) = if symlink {
                         (args[2], args[1])
                     } else {
                         (args[1], args[0])
                     };
-                    if let Err(e) = self.cmd_symlink(link, target).await {
+                    let result = if symlink {
+                        self.cmd_symlink(link, target).await
+                    } else {
+                        self.cmd_hardlink(link, target).await
+                    };
+                    if let Err(e) = result {
                         println!("{}", e);
                     }
                 }

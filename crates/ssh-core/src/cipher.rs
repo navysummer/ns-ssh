@@ -9,9 +9,8 @@ use cipher::{
     generic_array::GenericArray,
 };
 use chacha20::ChaCha20Legacy;
-use chacha20::cipher::{StreamCipher as ChaChaStreamCipher, KeyIvInit as ChaChaKeyIvInit, StreamCipherSeek as ChaChaStreamCipherSeek};
+use chacha20::cipher::StreamCipherSeek as ChaChaStreamCipherSeek;
 use poly1305::Poly1305;
-use poly1305::universal_hash::UniversalHash as PolyUniversalHash;
 
 // OpenSSH chacha20-poly1305 uses a 64-byte key: a 32-byte main key and a
 // 32-byte header key (OpenSSH cipher-chachapoly.c: keylen == 32+32).
@@ -73,7 +72,7 @@ pub trait SshCipher: Send + Sync {
     fn is_chachapoly(&self) -> bool { false }
     /// Decrypt just the 4-byte packet_length field. For chacha20-poly1305 this
     /// uses the header key; for everything else the length is plaintext.
-    fn decrypt_length(&self, seq: u64, len_bytes: &[u8]) -> Result<u32> {
+    fn decrypt_length(&self, _seq: u64, len_bytes: &[u8]) -> Result<u32> {
         if len_bytes.len() < 4 {
             return Err(SshError::InvalidPacket("short length".into()));
         }
