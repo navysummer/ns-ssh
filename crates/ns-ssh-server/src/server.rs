@@ -6,10 +6,8 @@ use ssh_core::error::{Result, SshError};
 use ssh_core::encoding::*;
 use ssh_core::msg;
 use ssh_core::transport::*;
-use ssh_core::auth::*;
 use ssh_core::channel::*;
 use ssh_core::kex::{KexExchange, KexAlgorithm};
-use ssh_core::hostkey::*;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -19,10 +17,6 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> StreamBox for T {}
 type BoxStream = Box<dyn StreamBox + Send + Unpin>;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-
-fn hex_str(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{:02x}", x)).take(32).collect()
-}
 
 pub struct SshServer {
     config: ServerConfig,
@@ -112,13 +106,21 @@ impl SshServer {
                     }
                 }
                 let _guard = Guard(pending_guard);
-                if let Err(e) = handle_connection(
+                match handle_connection(
                     stream,
                     config,
                     host_keys,
                     auth,
                 ).await {
-                    tracing::error!("Connection error from {}: {}", peer_addr, e);
+                    Ok(()) => {}
+                    // A peer that disconnects (RFC 4253 §11.1) is a normal end
+                    // of connection, not an error worth alarming about.
+                    Err(SshError::ConnectionClosed) => {
+                        tracing::debug!("connection from {} closed", peer_addr);
+                    }
+                    Err(e) => {
+                        tracing::error!("Connection error from {}: {}", peer_addr, e);
+                    }
                 }
             });
         }
@@ -147,7 +149,7 @@ async fn handle_connection(
     let match_host = host_name;
     let match_addr = peer_ip.clone();
 
-    let mut config = base_config.resolve_for_match("", &[], &match_host, &match_addr);
+    let config = base_config.resolve_for_match("", &[], &match_host, &match_addr);
 
     let mut transport = SshTransport::new();
     // Apply RekeyLimit so server-initiated rekeying follows the configured thresholds.
@@ -175,13 +177,38 @@ async fn handle_connection(
     transport.incoming_seq += 1;
     transport.client_kex_init = client_kex.clone();
 
-    let host_key_algs: Vec<String> = {
-            let hk = host_keys.lock().await;
-            hk.get_all_keys().iter().map(|k| k.algorithm_name().to_string()).collect()
-        };
-    let hk_algs: Option<Vec<String>> = config.host_key_algorithms.as_ref().map(|s| {
-        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
-    });
+    let mut host_key_algs: Vec<String> = {
+        let hk = host_keys.lock().await;
+        let mut algs = Vec::new();
+        for k in hk.get_all_keys() {
+            // An RSA key backs both SHA-2 signature variants. OpenSSH offers
+            // rsa-sha2-512 before rsa-sha2-256 and leaves the SHA-1 `ssh-rsa`
+            // variant out of its default host key list.
+            if k.key_type() == "ssh-rsa" {
+                for alg in ["rsa-sha2-512", "rsa-sha2-256"] {
+                    if !algs.contains(&alg.to_string()) {
+                        algs.push(alg.to_string());
+                    }
+                }
+            } else {
+                let alg = k.algorithm_name().to_string();
+                if !algs.contains(&alg) {
+                    algs.push(alg);
+                }
+            }
+        }
+        algs
+    };
+    if let Some(configured) = config.host_key_algorithms.as_ref() {
+        let allowed: Vec<String> = configured
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect();
+        host_key_algs.retain(|a| allowed.iter().any(|x| x == a));
+        // Honor the configured preference order.
+        host_key_algs.sort_by_key(|a| allowed.iter().position(|x| x == a).unwrap_or(usize::MAX));
+    }
     let kex_algs: Option<Vec<String>> = config.kex_algorithms.as_ref().map(|s| {
         s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
     });
@@ -196,6 +223,7 @@ async fn handle_connection(
         kex_algs.as_deref(),
         cipher_algs.as_deref(),
         mac_algs.as_deref(),
+        true,
     );
     send_raw_packet(&mut stream, &kex_init).await?;
     transport.outgoing_seq += 1;
@@ -217,6 +245,11 @@ async fn handle_connection(
             return Err(e);
         }
     };
+    // Terrapin mitigation: enable the strict KEX rules only when both the
+    // client's `-c-` and our `-s-` pseudo algorithms were advertised. We have
+    // the client's KEXINIT at this point, so the peer-side rule is active.
+    transport.strict_kex = negotiation.strict_kex;
+    transport.strict_kex_peer_kexinit = negotiation.strict_kex;
 
     let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
 
@@ -352,10 +385,14 @@ async fn handle_connection(
     if use_gex_msg {
         use ssh_core::encoding::SshMpInt;
         SshMpInt(kex.public_key_bytes()).encode(&mut dh_reply)?;
-    } else {
+    } else if negotiation.kex_algorithm.starts_with("diffie-hellman-group") {
         // f is an mpint: values with the high bit set must carry a leading
         // 0x00 byte, otherwise peers read it as a negative bignum.
         SshMpInt(kex.public_key_bytes()).encode(&mut dh_reply)?;
+    } else {
+        // ECDH/curve25519 public keys are byte strings, not mpints; adding a
+        // sign byte would make the peer reject an over-long key.
+        SshBytes(kex.public_key_bytes()).encode(&mut dh_reply)?;
     }
     SshBytes(server_signature).encode(&mut dh_reply)?;
     send_raw_packet(&mut stream, &dh_reply).await?;
@@ -374,6 +411,8 @@ async fn handle_connection(
 
     let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
     send_encrypted_packet_server(&mut stream, &newkeys_msg, &mut transport, true, aead).await?;
+    // Strict KEX restarts both sequence numbers at zero after NEWKEYS.
+    transport.reset_sequences_after_newkeys();
 
     // Only now is it safe to install and use the new keys.
     transport.install_new_keys(
@@ -806,7 +845,6 @@ async fn handle_authenticated_session(
 enum ChildOutputMsg {
     Stdout(u32, Vec<u8>),
     Stderr(u32, Vec<u8>),
-    Exit(u32, i32),
 }
 
 fn permit_entry_matches(entry: &str, host: &str, port: u32, is_listen: bool) -> bool {
@@ -1163,13 +1201,11 @@ async fn handle_connection_service(
     let (eof_tx, mut eof_rx) = mpsc::unbounded_channel::<ChannelId>();
     let mut pending_open: HashMap<ChannelId, oneshot::Sender<(ChannelId, u32, u32)>> = HashMap::new();
     let mut pending_open_sockets: HashMap<ChannelId, (BoxStream, oneshot::Receiver<(ChannelId, u32, u32)>)> = HashMap::new();
-    let mut session_remote_id: Option<ChannelId> = None;
-    let mut session_local_id: Option<ChannelId> = None;
-    let mut session_is_sftp = false;
+    let mut sftp_channels: std::collections::HashSet<ChannelId> = std::collections::HashSet::new();
     // Set once exit-status + CHANNEL_CLOSE have been sent for the session, so
     // the connection can stay open (for ControlMaster multiplexing) instead of
     // being torn down after a single session finishes.
-    let mut session_exit_sent = false;
+    let _session_exit_sent = false;
     // Per-session routing for multiplexed (ControlMaster) connections:
     // sid -> remote (server) channel id, and local channel id -> sid.
     let mut session_remote: std::collections::HashMap<u32, ChannelId> = std::collections::HashMap::new();
@@ -1275,258 +1311,13 @@ async fn handle_connection_service(
         tokio::select! {
             biased;
 
-            () = &mut rekey_sleep => {
-                rekey_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60));
-            }
-
-            () = &mut exit_poll, if session_started => {
-                // Drain all pending child output first so exit-status and
-                // CHANNEL_CLOSE are sent strictly after every CHANNEL_DATA
-                // (FIFO ordering, matching OpenSSH). Without this, a child that
-                // finishes writing before the client has received all its
-                // output causes the server to send exit-status early and
-                // truncate the transfer (the unbounded child_rx buffers the
-                // child's output while exit_poll races ahead of it).
-                loop {
-                    match child_rx.try_recv() {
-                        Ok(ChildOutputMsg::Stdout(sid, data)) => {
-                            if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                            let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                            let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
-                            remote.encode(&mut channel_data)?;
-                            SshBytes(data).encode(&mut channel_data)?;
-                            send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
-                        }
-                        Ok(ChildOutputMsg::Stderr(sid, data)) => {
-                            if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                            let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                            let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
-                            remote.encode(&mut channel_data)?;
-                            1u32.encode(&mut channel_data)?;
-                            SshBytes(data).encode(&mut channel_data)?;
-                            send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
-                        }
-                        Ok(ChildOutputMsg::Exit(_, _)) => {}
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                        | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            // Channel drained (Disconnected never fires here because
-                            // the caller keeps child_tx alive for multiplexing).
-                            break;
-                        }
-                    }
-                }
-                // Send exit-status/CLOSE only once ALL reader tasks for a session
-                // have finished (counter == 0, meaning every byte of child output
-                // has been forwarded) AND the child has been reaped. This keeps the
-                // FIFO ordering: exit always follows the last CHANNEL_DATA.
-                let sids: Vec<u32> = session_manager.session_ids();
-                for sid in sids {
-                    if session_exit_sent_map.get(&sid).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    let readers_finished = session_readers_done.get(&sid)
-                        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst) == 0)
-                        .unwrap_or(false);
-                    if !readers_finished {
-                        continue;
-                    }
-                    if let Some(exit) = session_manager.poll_child_exit(sid) {
-                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                        send_child_exit_message(stream, transport, remote, &exit, aead).await?;
-                        let close_msg = build_channel_close(remote);
-                        send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
-                        session_exit_sent_map.insert(sid, true);
-                        session_readers_done.remove(&sid);
-                        // Do NOT close the whole connection here: a ControlMaster
-                        // multiplexes several sessions over one connection. The
-                        // client (master) keeps the connection alive and sends
-                        // SSH_MSG_DISCONNECT when it is done. Regular clients also
-                        // send DISCONNECT after their session ends, so the
-                        // connection is still torn down promptly.
-                    }
-                }
-                exit_poll.as_mut().reset(tokio::time::Instant::now() + tokio::time::Duration::from_millis(50));
-            }
-
-            to_client = to_client_rx.recv() => {
-                if let Some((remote_id, data)) = to_client {
-                    let msg = build_channel_data(remote_id, &data);
-                    let _ = send_encrypted_packet_server(stream, &msg, transport, false, aead).await;
-                }
-            }
-
-            eof_ev = eof_rx.recv() => {
-                if let Some(remote_id) = eof_ev {
-                    let eof_msg = build_channel_eof(remote_id);
-                    let _ = send_encrypted_packet_server(stream, &eof_msg, transport, false, aead).await;
-                    let close_msg = build_channel_close(remote_id);
-                    let _ = send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await;
-                }
-            }
-
-            fwd_ev = fwd_rx.recv(), if !forwarded_ports.is_empty() => {
-                if let Some(ForwardAccept::Incoming(bind_port, sock, peer)) = fwd_ev {
-                    let local_id = channel_manager.alloc_channel(
-                        msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                    );
-                    let (otx, orx) = oneshot::channel();
-                    pending_open.insert(local_id, otx);
-                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
-                    let pkt = build_forwarded_tcpip_open(
-                        local_id,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                        "0.0.0.0",
-                        bind_port as u32,
-                        &peer.ip().to_string(),
-                        peer.port() as u32,
-                    );
-                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
-                }
-            }
-
-            sl_ev = streamlocal_rx.recv(), if !forwarded_streamlocal_paths.is_empty() => {
-                if let Some(StreamLocalAccept::Incoming(path, sock)) = sl_ev {
-                    let local_id = channel_manager.alloc_channel(
-                        msg::SSH_CHANNEL_TYPE_FORWARDED_STREAMLOCAL,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                    );
-                    let (otx, orx) = oneshot::channel();
-                    pending_open.insert(local_id, otx);
-                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
-                    let pkt = build_forwarded_streamlocal_open(
-                        local_id,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                        &path,
-                    );
-                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
-                }
-            }
-
-            agent_ev = agent_rx.recv(), if agent_sock_path.is_some() => {
-                if let Some(AgentAccept::Incoming(sock)) = agent_ev {
-                    let local_id = channel_manager.alloc_channel(
-                        msg::SSH_CHANNEL_TYPE_AUTH_AGENT,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                    );
-                    let (otx, orx) = oneshot::channel();
-                    pending_open.insert(local_id, otx);
-                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
-                    let pkt = build_auth_agent_open(
-                        local_id,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                    );
-                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
-                }
-            }
-
-            x11_ev = x11_rx.recv(), if x11_enabled => {
-                if let Some(X11Accept::Incoming(sock, peer)) = x11_ev {
-                    let local_id = channel_manager.alloc_channel(
-                        msg::SSH_CHANNEL_TYPE_X11,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                    );
-                    let (otx, orx) = oneshot::channel();
-                    pending_open.insert(local_id, otx);
-                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
-                    let pkt = build_x11_open(
-                        local_id,
-                        msg::CHANNEL_PACKET_WINDOW_SIZE,
-                        msg::CHANNEL_MAX_PACKET_SIZE,
-                        &peer.ip().to_string(),
-                        peer.port() as u32,
-                    );
-                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
-                }
-            }
-
-            child_msg = child_rx.recv() => {
-                match child_msg {
-                    Some(ChildOutputMsg::Stdout(sid, data)) => {
-                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                        let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
-                        remote.encode(&mut channel_data)?;
-                        SshBytes(data).encode(&mut channel_data)?;
-                        send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
-                    }
-                    Some(ChildOutputMsg::Stderr(sid, data)) => {
-                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                        let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
-                        remote.encode(&mut channel_data)?;
-                        1u32.encode(&mut channel_data)?;
-                        SshBytes(data).encode(&mut channel_data)?;
-                        send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
-                    }
-                    Some(ChildOutputMsg::Exit(sid, code)) => {
-                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                        let mut exit_msg = vec![msg::SSH_MSG_CHANNEL_REQUEST];
-                        remote.encode(&mut exit_msg)?;
-                        SshString::new("exit-status").encode(&mut exit_msg)?;
-                        exit_msg.push(0);
-                        (code as u32).encode(&mut exit_msg)?;
-                        send_encrypted_packet_server(stream, &exit_msg, transport, false, aead).await?;
-
-                        let close_msg = build_channel_close(remote);
-                        send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
-                        session_exit_sent_map.insert(sid, true);
-                        // Keep the connection alive for ControlMaster reuse.
-                    }
-                    None => {
-                        // Child pipes closed (all senders dropped). Fall back to
-                        // per-session polling for any session that hasn't been
-                        // finalized, but keep the connection open for multiplexing.
-                        // Note: this arm rarely fires because the connection loop
-                        // keeps child_tx alive; exit_poll is the primary path.
-                        if session_started {
-                            let sids: Vec<u32> = session_manager.session_ids();
-                            for sid in sids {
-                                if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
-                                let remote = session_remote.get(&sid).copied().unwrap_or(0);
-                                if let Some(exit) = session_manager.poll_child_exit(sid) {
-                                    send_child_exit_message(stream, transport, remote, &exit, aead).await?;
-                                } else {
-                                    // Child not reaped yet; exit_poll will handle it
-                                    // on the next cycle. Do not close prematurely.
-                                    continue;
-                                }
-                                let close_msg = build_channel_close(remote);
-                                send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
-                                session_exit_sent_map.insert(sid, true);
-                            }
-                        }
-                    }
-                }
-            }
-
-            _ = &mut alive_sleep, if alive_enabled => {
-                missed_alive = missed_alive.saturating_add(1);
-                if missed_alive >= config.client_alive_count_max {
-                    tracing::info!("ClientAliveCountMax exceeded, disconnecting");
-                    break 'conn;
-                }
-                let mut req = vec![msg::SSH_MSG_GLOBAL_REQUEST];
-                SshString::new("keepalive@openssh.com").encode(&mut req)?;
-                true.encode(&mut req)?;
-                let _ = send_encrypted_packet_server(stream, &req, transport, false, aead).await;
-                alive_sleep = Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(alive_interval_ms as u64)));
-            }
-
             packet = receive_encrypted_packet_server(stream, transport, false, aead) => {
                 let packet = packet?;
                 if packet.is_empty() {
                     continue;
+                }
+                if packet[0] != msg::SSH_MSG_CHANNEL_DATA {
+                    tracing::trace!("recv packet type {}", packet[0]);
                 }
 
                 match packet[0] {
@@ -1550,6 +1341,18 @@ async fn handle_connection_service(
                         match perform_rekey_server(stream, transport, config, host_keys, Some(packet), server_rekey_kex_sent).await {
                             Ok(()) => {
                                 server_rekey_kex_sent = false;
+                            }
+                            Err(SshError::ConnectionClosed) => {
+                                break 'conn;
+                            }
+                            Err(SshError::Io(ref e))
+                                if matches!(e.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::UnexpectedEof) =>
+                            {
+                                // Peer vanished mid-rekey; nothing left to do.
+                                break 'conn;
                             }
                             Err(e) => {
                                 tracing::warn!("rekey failed: {:?}", e);
@@ -1763,8 +1566,6 @@ async fn handle_connection_service(
                                 );
                                 channel_session.insert(local_channel, sid);
                                 session_remote.insert(sid, sender_channel);
-                                session_remote_id = Some(sender_channel);
-                                session_local_id = Some(local_channel);
                                 let confirmation = build_channel_open_confirmation(
                                     sender_channel, local_channel,
                                     msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE,
@@ -1854,13 +1655,18 @@ async fn handle_connection_service(
                         }
                     }
                     msg::SSH_MSG_CHANNEL_DATA => {
-                        let (channel_id, data) = parse_channel_data(&packet)?;
+                        // RFC 4254 §5.2: the recipient channel of an inbound
+                        // message is *our* local channel id. Replies must
+                        // target the peer's id for that channel.
+                        let (recipient, data) = parse_channel_data(&packet)?;
                         let data_len = data.len() as u32;
-                        let local_channel = channel_manager.find_by_remote_id(channel_id)
+                        let local_channel = channel_manager.get_channel(recipient)
                             .map(|c| c.local_id);
+                        let reply_channel = channel_manager.reply_recipient(recipient)
+                            .unwrap_or(recipient);
                         if let Some(local_id) = local_channel {
                             if let Some(ch) = channel_manager.get_channel(local_id) {
-                                if ch.channel_type == "session" && !session_is_sftp {
+                                if ch.channel_type == "session" && !sftp_channels.contains(&local_id) {
                                     if let Some(sid) = channel_session.get(&local_id).copied() {
                                         if let Some(session) = session_manager.get_session_mut(sid) {
                                             // Non-blocking write to the child's stdin/pty.
@@ -1896,13 +1702,13 @@ async fn handle_connection_service(
                         // transfers (uploads) do not stall once the window exhausts.
                         send_encrypted_packet_server(
                             stream,
-                            &build_channel_window_adjust(channel_id, data_len),
+                            &build_channel_window_adjust(reply_channel, data_len),
                             transport, false, aead,
                         ).await?;
                     }
                     msg::SSH_MSG_CHANNEL_EXTENDED_DATA => {
                         let mut r = &packet[1..];
-                        let remote = u32::decode(&mut r)?;
+                        let recipient = u32::decode(&mut r)?;
                         let dt = u32::decode(&mut r)?;
                         let data = SshBytes::decode(&mut r)?.0;
                         let data_len = data.len() as u32;
@@ -1910,21 +1716,28 @@ async fn handle_connection_service(
                             use std::io::Write;
                             let _ = std::io::stderr().write_all(&data);
                         }
-                        let _ = remote;
-                        // Replenish the client's send window for stderr too.
+                        // Replenish the client's send window for stderr too;
+                        // the recipient field of that reply is the peer's id.
+                        let reply_channel = channel_manager
+                            .reply_recipient(recipient)
+                            .unwrap_or(recipient);
                         send_encrypted_packet_server(
                             stream,
-                            &build_channel_window_adjust(remote, data_len),
+                            &build_channel_window_adjust(reply_channel, data_len),
                             transport, false, aead,
                         ).await?;
                     }
                     msg::SSH_MSG_CHANNEL_REQUEST => {
-                        let (channel_id, request_type, want_reply) = parse_channel_request(&packet)?;
+                        // Inbound recipient is our local id; every reply must
+                        // carry the peer's id for that channel instead.
+                        let (recipient, request_type, want_reply) = parse_channel_request(&packet)?;
 
-                        let local_channel = channel_manager.find_by_remote_id(channel_id)
+                        let local_channel = channel_manager.get_channel(recipient)
                             .map(|c| c.local_id);
 
-                        if let Some(_local_id) = local_channel {
+                        if local_channel.is_some() {
+                            let channel_id = channel_manager.reply_recipient(recipient)
+                                .unwrap_or(recipient);
                             let extra_offset = 10 + request_type.len();
                             let mut r = &packet[extra_offset..];
                             match request_type.as_str() {
@@ -2168,11 +1981,11 @@ async fn handle_connection_service(
 
                                     if let Some(subsystem_path) = config.subsystems.get(&subsystem_name) {
                                         if subsystem_path == "internal-sftp" {
-                                            session_is_sftp = true;
                                             if let Some(sid) = local_channel.and_then(|lc| channel_session.get(&lc).copied()) {
                                                 session_manager.set_command(sid, subsystem_path.clone());
                                             }
                                             if let Some(local_id) = local_channel {
+                                                sftp_channels.insert(local_id);
                                                 if let Some(sid) = channel_session.get(&local_id).copied() {
                                                     if let Some(remote_id) = session_remote.get(&sid).copied() {
                                                         if let Some(rx) = channel_manager.take_data_rx(local_id) {
@@ -2279,9 +2092,35 @@ async fn handle_connection_service(
                     }
                     msg::SSH_MSG_CHANNEL_EOF => {
                         let mut r = &packet[1..];
-                        let channel_id = u32::decode(&mut r)?;
-                        if !session_is_sftp {
-                            if let Some(local_id) = channel_manager.find_by_remote_id(channel_id).map(|c| c.local_id) {
+                        let recipient = u32::decode(&mut r)?;
+                        let is_sftp_channel = sftp_channels.contains(&recipient);
+                        if is_sftp_channel {
+                            // The in-process SFTP subsystem has nothing further
+                            // to send once the client signals EOF, so finish the
+                            // channel the way OpenSSH's internal-sftp does:
+                            // EOF, exit-status(0), CLOSE. OpenSSH's sftp client
+                            // blocks in its shutdown path until it sees the
+                            // peer's CLOSE; sending only EOF is not enough.
+                            if let Some(remote_id) = channel_manager.reply_recipient(recipient)
+                            {
+                                let eof_msg = build_channel_eof(remote_id);
+                                send_encrypted_packet_server(stream, &eof_msg, transport, false, aead).await?;
+                                let mut exit = vec![msg::SSH_MSG_CHANNEL_REQUEST];
+                                remote_id.encode(&mut exit)?;
+                                SshString::new("exit-status").encode(&mut exit)?;
+                                exit.push(0);
+                                exit.extend(0u32.to_be_bytes());
+                                send_encrypted_packet_server(stream, &exit, transport, false, aead).await?;
+                                let close_msg = build_channel_close(remote_id);
+                                send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                                // We have already sent CLOSE, so a later CLOSE
+                                // from the peer needs no further reply.
+                                channel_manager.close_channel(recipient);
+                                sftp_channels.remove(&recipient);
+                            }
+                        }
+                        if !is_sftp_channel {
+                            if let Some(local_id) = channel_manager.get_channel(recipient).map(|c| c.local_id) {
                                 if let Some(sid) = channel_session.get(&local_id).copied() {
                                     if let Some(session) = session_manager.get_session_mut(sid) {
                                         session.stdin.take();
@@ -2291,7 +2130,7 @@ async fn handle_connection_service(
                         }
                         // For non-session channels (direct-tcpip etc), drop data_tx
                         // so pump_socket's channel_rx returns None and shuts down the TCP socket
-                        if let Some(local_id) = channel_manager.find_by_remote_id(channel_id).map(|c| c.local_id) {
+                        if let Some(local_id) = channel_manager.get_channel(recipient).map(|c| c.local_id) {
                         if let Some(ch) = channel_manager.get_channel_mut(local_id) {
                             if ch.channel_type != "session" {
                                 ch.data_tx.take();
@@ -2301,9 +2140,14 @@ async fn handle_connection_service(
                     }
                     msg::SSH_MSG_CHANNEL_CLOSE => {
                         let mut r = &packet[1..];
-                        let channel_id = u32::decode(&mut r)?;
-                        let close_msg = build_channel_close(channel_id);
-                        send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                        let recipient = u32::decode(&mut r)?;
+                        if let Some(remote_id) = channel_manager.reply_recipient(recipient) {
+                            let close_msg = build_channel_close(remote_id);
+                            send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                            // Drop the channel (and its data_tx) so the
+                            // subsystem/forwarding task sees the stream end.
+                            channel_manager.close_channel(recipient);
+                        }
                     }
                     msg::SSH_MSG_CHANNEL_WINDOW_ADJUST => {
                         let mut r = &packet[1..];
@@ -2319,10 +2163,267 @@ async fn handle_connection_service(
                     }
                     _ => {
                         let seq = transport.incoming_seq.saturating_sub(1) as u32;
-                        send_encrypted_packet_server(stream, &build_unimplemented(seq), transport, false, aead).await?;
+                        send_encrypted_packet_server(stream, &build_unimplemented(seq)?, transport, false, aead).await?;
                     }
                 }
             }
+
+            () = &mut rekey_sleep => {
+                rekey_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + tokio::time::Duration::from_secs(60));
+            }
+
+            // While a server-initiated rekey is in flight, strict KEX forbids
+            // sending generic packets. Do not poll the data-producing arms
+            // until the client's KEXINIT completes the exchange.
+            () = &mut exit_poll, if session_started && !server_rekey_kex_sent => {
+                // Drain all pending child output first so exit-status and
+                // CHANNEL_CLOSE are sent strictly after every CHANNEL_DATA
+                // (FIFO ordering, matching OpenSSH). Without this, a child that
+                // finishes writing before the client has received all its
+                // output causes the server to send exit-status early and
+                // truncate the transfer (the unbounded child_rx buffers the
+                // child's output while exit_poll races ahead of it).
+                // Bound how much output one pass may forward. A child that
+                // emits a large burst must not monopolize the connection loop:
+                // while we sit in this arm the peer's KEXINIT (rekey), window
+                // adjustments and interrupts go unread. Forward a window-sized
+                // chunk, then return to `select!` so inbound packets are
+                // serviced; the timer is re-armed near-immediately while more
+                // output is queued.
+                const DRAIN_BUDGET: usize = 128 * 1024;
+                let mut drained_bytes: usize = 0;
+                let mut more_pending = false;
+                loop {
+                    match child_rx.try_recv() {
+                        Ok(ChildOutputMsg::Stdout(sid, data)) => {
+                            if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                            let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                            let data_len = data.len();
+                            let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
+                            remote.encode(&mut channel_data)?;
+                            SshBytes(data).encode(&mut channel_data)?;
+                            send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
+                            drained_bytes += data_len;
+                            if drained_bytes >= DRAIN_BUDGET { more_pending = true; break; }
+                        }
+                        Ok(ChildOutputMsg::Stderr(sid, data)) => {
+                            if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                            let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                            let data_len = data.len();
+                            let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
+                            remote.encode(&mut channel_data)?;
+                            1u32.encode(&mut channel_data)?;
+                            SshBytes(data).encode(&mut channel_data)?;
+                            send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
+                            drained_bytes += data_len;
+                            if drained_bytes >= DRAIN_BUDGET { more_pending = true; break; }
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                        | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            // Channel drained (Disconnected never fires here because
+                            // the caller keeps child_tx alive for multiplexing).
+                            break;
+                        }
+                    }
+                }
+                // Send exit-status/CLOSE only once ALL reader tasks for a session
+                // have finished (counter == 0, meaning every byte of child output
+                // has been forwarded) AND the child has been reaped. This keeps the
+                // FIFO ordering: exit always follows the last CHANNEL_DATA.
+                // `more_pending` means the forward budget was hit while output is
+                // still queued in child_rx, so this pass must not finalize yet.
+                if !more_pending {
+                    let sids: Vec<u32> = session_manager.session_ids();
+                    for sid in sids {
+                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let readers_finished = session_readers_done.get(&sid)
+                            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst) == 0)
+                            .unwrap_or(false);
+                        if !readers_finished {
+                            continue;
+                        }
+                        if let Some(exit) = session_manager.poll_child_exit(sid) {
+                            let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                            send_child_exit_message(stream, transport, remote, &exit, aead).await?;
+                            let close_msg = build_channel_close(remote);
+                            send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                            session_exit_sent_map.insert(sid, true);
+                            session_readers_done.remove(&sid);
+                            // Do NOT close the whole connection here: a ControlMaster
+                            // multiplexes several sessions over one connection. The
+                            // client (master) keeps the connection alive and sends
+                            // SSH_MSG_DISCONNECT when it is done. Regular clients also
+                            // send DISCONNECT after their session ends, so the
+                            // connection is still torn down promptly.
+                        }
+                    }
+                }
+                let next_delay_ms = if more_pending { 1 } else { 50 };
+                exit_poll.as_mut().reset(tokio::time::Instant::now() + tokio::time::Duration::from_millis(next_delay_ms));
+            }
+
+            to_client = to_client_rx.recv(), if !server_rekey_kex_sent => {
+                if let Some((remote_id, data)) = to_client {
+                    let msg = build_channel_data(remote_id, &data);
+                    let _ = send_encrypted_packet_server(stream, &msg, transport, false, aead).await;
+                }
+            }
+
+            eof_ev = eof_rx.recv(), if !server_rekey_kex_sent => {
+                if let Some(remote_id) = eof_ev {
+                    let eof_msg = build_channel_eof(remote_id);
+                    let _ = send_encrypted_packet_server(stream, &eof_msg, transport, false, aead).await;
+                    let close_msg = build_channel_close(remote_id);
+                    let _ = send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await;
+                }
+            }
+
+            fwd_ev = fwd_rx.recv(), if !forwarded_ports.is_empty() && !server_rekey_kex_sent => {
+                if let Some(ForwardAccept::Incoming(bind_port, sock, peer)) = fwd_ev {
+                    let local_id = channel_manager.alloc_channel(
+                        msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                    );
+                    let (otx, orx) = oneshot::channel();
+                    pending_open.insert(local_id, otx);
+                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
+                    let pkt = build_forwarded_tcpip_open(
+                        local_id,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                        "0.0.0.0",
+                        bind_port as u32,
+                        &peer.ip().to_string(),
+                        peer.port() as u32,
+                    );
+                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
+                }
+            }
+
+            sl_ev = streamlocal_rx.recv(), if !forwarded_streamlocal_paths.is_empty() && !server_rekey_kex_sent => {
+                if let Some(StreamLocalAccept::Incoming(path, sock)) = sl_ev {
+                    let local_id = channel_manager.alloc_channel(
+                        msg::SSH_CHANNEL_TYPE_FORWARDED_STREAMLOCAL,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                    );
+                    let (otx, orx) = oneshot::channel();
+                    pending_open.insert(local_id, otx);
+                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
+                    let pkt = build_forwarded_streamlocal_open(
+                        local_id,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                        &path,
+                    );
+                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
+                }
+            }
+
+            agent_ev = agent_rx.recv(), if agent_sock_path.is_some() && !server_rekey_kex_sent => {
+                if let Some(AgentAccept::Incoming(sock)) = agent_ev {
+                    let local_id = channel_manager.alloc_channel(
+                        msg::SSH_CHANNEL_TYPE_AUTH_AGENT,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                    );
+                    let (otx, orx) = oneshot::channel();
+                    pending_open.insert(local_id, otx);
+                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
+                    let pkt = build_auth_agent_open(
+                        local_id,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                    );
+                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
+                }
+            }
+
+            x11_ev = x11_rx.recv(), if x11_enabled && !server_rekey_kex_sent => {
+                if let Some(X11Accept::Incoming(sock, peer)) = x11_ev {
+                    let local_id = channel_manager.alloc_channel(
+                        msg::SSH_CHANNEL_TYPE_X11,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                    );
+                    let (otx, orx) = oneshot::channel();
+                    pending_open.insert(local_id, otx);
+                    pending_open_sockets.insert(local_id, (Box::new(sock), orx));
+                    let pkt = build_x11_open(
+                        local_id,
+                        msg::CHANNEL_PACKET_WINDOW_SIZE,
+                        msg::CHANNEL_MAX_PACKET_SIZE,
+                        &peer.ip().to_string(),
+                        peer.port() as u32,
+                    );
+                    send_encrypted_packet_server(stream, &pkt, transport, false, aead).await?;
+                }
+            }
+
+            child_msg = child_rx.recv(), if !server_rekey_kex_sent => {
+                match child_msg {
+                    Some(ChildOutputMsg::Stdout(sid, data)) => {
+                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                        let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
+                        remote.encode(&mut channel_data)?;
+                        SshBytes(data).encode(&mut channel_data)?;
+                        send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
+                    }
+                    Some(ChildOutputMsg::Stderr(sid, data)) => {
+                        if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                        let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                        let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
+                        remote.encode(&mut channel_data)?;
+                        1u32.encode(&mut channel_data)?;
+                        SshBytes(data).encode(&mut channel_data)?;
+                        send_encrypted_packet_server(stream, &channel_data, transport, false, aead).await?;
+                    }
+                    None => {
+                        // Child pipes closed (all senders dropped). Fall back to
+                        // per-session polling for any session that hasn't been
+                        // finalized, but keep the connection open for multiplexing.
+                        // Note: this arm rarely fires because the connection loop
+                        // keeps child_tx alive; exit_poll is the primary path.
+                        if session_started {
+                            let sids: Vec<u32> = session_manager.session_ids();
+                            for sid in sids {
+                                if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                                let remote = session_remote.get(&sid).copied().unwrap_or(0);
+                                if let Some(exit) = session_manager.poll_child_exit(sid) {
+                                    send_child_exit_message(stream, transport, remote, &exit, aead).await?;
+                                } else {
+                                    // Child not reaped yet; exit_poll will handle it
+                                    // on the next cycle. Do not close prematurely.
+                                    continue;
+                                }
+                                let close_msg = build_channel_close(remote);
+                                send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                                session_exit_sent_map.insert(sid, true);
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ = &mut alive_sleep, if alive_enabled && !server_rekey_kex_sent => {
+                missed_alive = missed_alive.saturating_add(1);
+                if missed_alive >= config.client_alive_count_max {
+                    tracing::info!("ClientAliveCountMax exceeded, disconnecting");
+                    break 'conn;
+                }
+                let mut req = vec![msg::SSH_MSG_GLOBAL_REQUEST];
+                SshString::new("keepalive@openssh.com").encode(&mut req)?;
+                true.encode(&mut req)?;
+                let _ = send_encrypted_packet_server(stream, &req, transport, false, aead).await;
+                alive_sleep = Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(alive_interval_ms as u64)));
+            }
+
         }
 
         // Rekey is checked *after* processing each packet (or the idle 60s
@@ -2638,7 +2739,9 @@ async fn receive_encrypted_packet_server(
         stream.read_exact(&mut body).await?;
         transport.bytes_in += (4 + packet_len) as u64;
         transport.incoming_seq += 1;
-        return unpack_packet_body(&body);
+        let payload = unpack_packet_body(&body)?;
+        transport.check_strict_kex_packet(&payload)?;
+        return Ok(payload);
     }
 
     let cipher = transport.client_to_server_cipher.as_mut().unwrap();
@@ -2646,7 +2749,7 @@ async fn receive_encrypted_packet_server(
     let chachapoly = cipher.is_chachapoly();
     let etm = mac.map(|m| m.is_etm()).unwrap_or(false);
 
-    let mut wire_len: usize = 0;
+    let wire_len: usize;
 
     let body: Vec<u8> = if chachapoly {
         // chacha20-poly1305@openssh.com: the 4-byte packet_length is encrypted
@@ -2782,7 +2885,10 @@ async fn receive_encrypted_packet_server(
         return Err(SshError::Protocol("empty packet".into()));
     }
 
-    unpack_packet_body(&body)
+    let payload = unpack_packet_body(&body)?;
+    // Strict KEX rejects generic transport packets between KEXINIT and NEWKEYS.
+    transport.check_strict_kex_packet(&payload)?;
+    Ok(payload)
 }
 
 async fn run_internal_sftp(
@@ -2882,6 +2988,85 @@ async fn run_internal_sftp(
                 | SSH_FILEXFER_ATTR_ACMODTIME;
         }
         attrs
+    }
+
+    /// Render the `longname` field of an SSH_FXP_NAME entry the same way
+    /// OpenSSH's sftp-server does: symbolic mode, link count, numeric uid/gid
+    /// (used when the name cannot be resolved), real size and mtime.
+    #[cfg(unix)]
+    fn sftp_longname(meta: &std::fs::Metadata, name: &str) -> String {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode();
+        let type_char = match mode & libc::S_IFMT as u32 {
+            x if x == libc::S_IFDIR as u32 => 'd',
+            x if x == libc::S_IFLNK as u32 => 'l',
+            x if x == libc::S_IFBLK as u32 => 'b',
+            x if x == libc::S_IFCHR as u32 => 'c',
+            x if x == libc::S_IFIFO as u32 => 'p',
+            x if x == libc::S_IFSOCK as u32 => 's',
+            _ => '-',
+        };
+        let mut perms = String::with_capacity(10);
+        perms.push(type_char);
+        for shift in [6u32, 3, 0] {
+            let bits = (mode >> shift) & 0o7;
+            perms.push(if bits & 4 != 0 { 'r' } else { '-' });
+            perms.push(if bits & 2 != 0 { 'w' } else { '-' });
+            perms.push(if bits & 1 != 0 { 'x' } else { '-' });
+        }
+
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let mtime = meta.mtime() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let date = unsafe {
+            if libc::localtime_r(&mtime, &mut tm).is_null() {
+                format!("{}", mtime)
+            } else {
+                format!(
+                    "{} {:>2} {:02}:{:02}",
+                    MONTHS[tm.tm_mon.clamp(0, 11) as usize],
+                    tm.tm_mday,
+                    tm.tm_hour,
+                    tm.tm_min,
+                )
+            }
+        };
+        format!(
+            "{} {:>3} {:>8} {:>8} {:>8} {} {}",
+            perms,
+            meta.nlink(),
+            meta.uid(),
+            meta.gid(),
+            meta.len(),
+            date,
+            name
+        )
+    }
+
+    #[cfg(unix)]
+    fn statvfs_fields(path: &std::path::Path) -> Option<[u64; 11]> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some([
+            st.f_bsize as u64,
+            st.f_frsize as u64,
+            st.f_blocks as u64,
+            st.f_bfree as u64,
+            st.f_bavail as u64,
+            st.f_files as u64,
+            st.f_ffree as u64,
+            st.f_favail as u64,
+            st.f_fsid as u64,
+            st.f_flag as u64,
+            st.f_namemax as u64,
+        ])
     }
 
     fn ioerr_to_code(err: &std::io::Error) -> u32 {
@@ -3165,14 +3350,7 @@ async fn run_internal_sftp(
                                 let meta = e.metadata().ok();
                                 let longname = meta.as_ref().map(|m| {
                                     #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::MetadataExt;
-                                        let is_dir = m.is_dir();
-                                        let perms = m.mode() & 0o7777;
-                                        format!("{}{:o} {} {} {} {} {} {}",
-                                            if is_dir { 'd' } else { '-' },
-                                            perms, 1u32, m.uid(), m.gid(), m.len(), "Jan  1 00:00", name)
-                                    }
+                                    { sftp_longname(m, &name) }
                                     #[cfg(not(unix))]
                                     { name.clone() }
                                 }).unwrap_or_else(|| name.clone());
@@ -3316,10 +3494,11 @@ async fn run_internal_sftp(
                     }
                 }
                 SSH_FXP_SYMLINK => {
-                    let link = SshString::decode(&mut r).ok().and_then(sftp_string);
+                    // v3 order: target (oldpath) first, then the link path.
                     let target = SshString::decode(&mut r).ok().and_then(sftp_string);
-                    match (link, target) {
-                        (Some(lp), Some(tp)) => {
+                    let link = SshString::decode(&mut r).ok().and_then(sftp_string);
+                    match (target, link) {
+                        (Some(tp), Some(lp)) => {
                             let fl = resolve_path(&base_dir, &lp);
                             #[cfg(unix)]
                             match std::os::unix::fs::symlink(&tp, &fl) {
@@ -3395,46 +3574,18 @@ async fn run_internal_sftp(
                             };
                             #[cfg(unix)]
                             {
-                                use std::os::unix::fs::MetadataExt;
                                 match path {
                                     Some(p) => {
-                                        let meta = std::fs::metadata(&p);
-                                        let reply = match meta {
-                                            Ok(m) => {
-                                                let bsize = 4096u64;
-                                                let frsize = 4096u64;
-                                                let blocks = m.blocks() * 512 / frsize;
-                                                let bfree = blocks;
-                                                let bavail = blocks;
-                                                let files = 0u64;
-                                                let ffree = 0u64;
-                                                let favail = 0u64;
-                                                let fsid = 0u64;
-                                                let flag = 0u64;
-                                                let namemax = 255u32;
-                                                let mut rp = Vec::new();
-                                                rp.extend(bsize.to_be_bytes());
-                                                rp.extend(frsize.to_be_bytes());
-                                                rp.extend(blocks.to_be_bytes());
-                                                rp.extend(bfree.to_be_bytes());
-                                                rp.extend(bavail.to_be_bytes());
-                                                rp.extend(files.to_be_bytes());
-                                                rp.extend(ffree.to_be_bytes());
-                                                rp.extend(favail.to_be_bytes());
-                                                rp.extend(fsid.to_be_bytes());
-                                                rp.extend(flag.to_be_bytes());
-                                                rp.extend(namemax.to_be_bytes());
-                                                rp
-                                            }
-                                            Err(_) => Vec::new(),
-                                        };
-                                        if reply.is_empty() {
-                                            send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_FAILURE, "statvfs failed"));
-                                        } else {
+                                        let reply = statvfs_fields(&p);
+                                        if let Some(fields) = reply {
                                             let mut out = vec![SSH_FXP_EXTENDED_REPLY];
                                             out.extend(id.to_be_bytes());
-                                            out.extend(reply);
+                                            for f in fields {
+                                                out.extend(f.to_be_bytes());
+                                            }
                                             send_raw(&to_client_tx, remote_id, &out);
+                                        } else {
+                                            send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_FAILURE, "statvfs failed"));
                                         }
                                     }
                                     None => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, "")),
@@ -3445,11 +3596,13 @@ async fn run_internal_sftp(
                         }
                         Some("limits@openssh.com") => {
                             let mut rp = Vec::new();
-                            // max packet size, max read length, max write length, max open handles
-                            rp.extend((256u64 * 1024 * 1024).to_be_bytes());
-                            rp.extend((256u64 * 1024 * 1024).to_be_bytes());
-                            rp.extend((256u64 * 1024 * 1024).to_be_bytes());
-                            rp.extend(0u32.to_be_bytes());
+                            // All four fields are uint64 per the limits@openssh.com
+                            // payload. The last one used to be written as a uint32,
+                            // which made OpenSSH's client report "incomplete message".
+                            rp.extend((256u64 * 1024).to_be_bytes()); // max packet length
+                            rp.extend((64u64 * 1024).to_be_bytes());  // max read length
+                            rp.extend((64u64 * 1024).to_be_bytes());  // max write length
+                            rp.extend(1000u64.to_be_bytes());         // max open handles
                             let mut out = vec![SSH_FXP_EXTENDED_REPLY];
                             out.extend(id.to_be_bytes());
                             out.extend(rp);
@@ -3493,10 +3646,21 @@ fn glob_match(pattern: &str, s: &str) -> bool {
     dp[m][n]
 }
 
+/// RFC 4253 §11.1: SSH_MSG_DISCONNECT may arrive at any point, including while
+/// a key exchange is in flight (OpenSSH clients send it when a session finishes
+/// mid-rekey). Surface it as a normal close so the connection loop stops in an
+/// orderly way instead of reporting "expected <kex message>".
+fn rekey_disconnect_guard(packet: &[u8]) -> Result<()> {
+    if packet.first() == Some(&msg::SSH_MSG_DISCONNECT) {
+        return Err(SshError::ConnectionClosed);
+    }
+    Ok(())
+}
+
 async fn perform_rekey_server(
     stream: &mut TcpStream,
     transport: &mut SshTransport,
-    config: &ServerConfig,
+    _config: &ServerConfig,
     host_keys: &Arc<Mutex<HostKeyManager>>,
     pre_received_client_kex: Option<Vec<u8>>,
     kex_sent: bool,
@@ -3525,6 +3689,8 @@ async fn perform_rekey_server(
         }
         transport.client_kex_init = c_kex_init.clone();
         let neg = SshTransport::negotiate_algorithms(&transport.client_kex_init, &transport.server_kex_init)?;
+        transport.strict_kex = neg.strict_kex;
+        transport.strict_kex_peer_kexinit = neg.strict_kex;
         let (hk_name, pk_bytes) = {
             let algo = neg.host_key_algorithm.clone();
             let signer = hk.get_key_for_algorithm(&algo)
@@ -3542,6 +3708,7 @@ async fn perform_rekey_server(
     let (shared_secret, exchange_hash, kex_hash_name) =
         if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
             let req = receive_encrypted_packet_server(stream, transport, false, aead).await?;
+            rekey_disconnect_guard(&req)?;
             let (min, nbits, max) = match req.first() {
                 Some(&msg::SSH_MSG_KEX_DH_GEX_REQUEST_OLD) => {
                     // RFC 4419 §3: legacy form carries min and n only.
@@ -3574,6 +3741,7 @@ async fn perform_rekey_server(
             send_encrypted_packet_server(stream, &group_msg, transport, false, aead).await?;
 
             let init = receive_encrypted_packet_server(stream, transport, false, aead).await?;
+            rekey_disconnect_guard(&init)?;
             if init.first() != Some(&msg::SSH_MSG_KEX_DH_GEX_INIT) {
                 return Err(SshError::Protocol("expected DH GEX INIT".into()));
             }
@@ -3618,6 +3786,7 @@ async fn perform_rekey_server(
             kex.generate_keypair()?;
             let server_pub = kex.public_key_bytes();
             let client_init = receive_encrypted_packet_server(stream, transport, false, aead).await?;
+            rekey_disconnect_guard(&client_init)?;
             if client_init.first() != Some(&msg::SSH_MSG_KEXDH_INIT) {
                 return Err(SshError::Protocol("expected SSH_MSG_KEXDH_INIT".into()));
             }
@@ -3643,7 +3812,11 @@ async fn perform_rekey_server(
             let mut dh_reply = Vec::new();
             dh_reply.push(msg::SSH_MSG_KEXDH_REPLY);
             SshBytes(hostkey_blob).encode(&mut dh_reply)?;
-            SshMpInt(server_pub).encode(&mut dh_reply)?;
+            if negotiation.kex_algorithm.starts_with("diffie-hellman-group") {
+                SshMpInt(server_pub).encode(&mut dh_reply)?;
+            } else {
+                SshBytes(server_pub).encode(&mut dh_reply)?;
+            }
             SshBytes(sig_blob).encode(&mut dh_reply)?;
             send_encrypted_packet_server(stream, &dh_reply, transport, false, aead).await?;
 
@@ -3651,17 +3824,25 @@ async fn perform_rekey_server(
         };
 
     let session_id = transport.session_id.clone().unwrap_or_default();
-    transport.install_new_keys(&negotiation, &kex_hash_name, &shared_secret, &exchange_hash, &session_id)?;
 
+    // RFC 4253 §7.3: NEWKEYS itself is exchanged under the OLD keys. Installing
+    // the new keys before these two packets makes the peer fail to parse our
+    // NEWKEYS (it still decrypts with the old keys). Install only after both
+    // NEWKEYS messages have crossed the wire.
     let newkeys_send = vec![msg::SSH_MSG_NEWKEYS];
     send_encrypted_packet_server(stream, &newkeys_send, transport, true, aead).await?;
     transport.state = KexState::NewKeysSent;
 
     let nk = receive_encrypted_packet_server(stream, transport, true, aead).await?;
+    rekey_disconnect_guard(&nk)?;
     if nk.first() != Some(&msg::SSH_MSG_NEWKEYS) {
         return Err(SshError::Protocol("expected NEWKEYS during rekey".into()));
     }
     transport.state = KexState::NewKeysReceived;
+    transport.reset_sequences_after_newkeys();
+
+    transport.install_new_keys(&negotiation, &kex_hash_name, &shared_secret, &exchange_hash, &session_id)?;
+
     transport.kex_algorithm = Some(kex);
     transport.state = KexState::Established;
     transport.last_rekey_bytes = transport.total_bytes();

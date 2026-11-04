@@ -340,6 +340,237 @@ fn large_transfer_window_replenishment() {
     );
 }
 
+/// Upload only: the server command produces no output until stdin EOF, so the
+/// client must keep flushing its window-gated backlog purely from WINDOW_ADJUST
+/// packets. If recv_packet silently consumes those adjustments (instead of
+/// handing them to the event loop that owns the deferred queue), this test
+/// deadlocks at the 2 MiB channel window instead of finishing.
+#[test]
+fn large_upload_to_non_echoing_command_completes() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("upload-only");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg("maxauthtries=10")
+        .arg("-o")
+        .arg("login_grace_time=30")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let mut payload = Vec::with_capacity(3 << 20);
+    for i in 0..(3 << 20) {
+        payload.push((i % 251) as u8);
+    }
+    let expected_len = payload.len();
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let kh = dir.join("known_hosts");
+    let mut child = Command::new(client_bin)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-l")
+        .arg(&user)
+        .arg("-i")
+        .arg(&id_path)
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("127.0.0.1")
+        .arg("wc -c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn client");
+
+    use std::io::Write;
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        let _ = stdin.write_all(&payload);
+    }
+    let output = child.wait_with_output().expect("wait client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if !output.status.success() {
+        panic!(
+            "client failed: status={:?}\nstderr={}\nserver_stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&server_out.stderr)
+        );
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        reported.trim(),
+        expected_len.to_string(),
+        "upload-only transfer stalled or truncated (window adjust was not flushed?)"
+    );
+}
+
+/// A client-initiated rekey in the middle of a transfer must complete without
+/// losing data. This exercises: deferring data packets that arrive before the
+/// peer's KEXINIT, exchanging NEWKEYS under the OLD keys, and installing the
+/// new keys only afterwards. The 500000-byte payload crosses the 16 KiB
+/// RekeyLimit many times.
+#[test]
+fn rekey_mid_transfer_client_initiated() {
+    let dir = temp_dir("rekey-client");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            "kexalgorithms=curve25519-sha256",
+            "-o",
+            "ciphers=aes128-ctr",
+            "-o",
+            "macs=hmac-sha2-256",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("RekeyLimit=16K")
+        .arg("127.0.0.1")
+        .arg("head -c 500000 /dev/zero")
+        .output()
+        .expect("run rekey client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "client failed: status={:?}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert_eq!(
+        output.stdout.len(),
+        500000,
+        "rekey truncated the transfer: got {} bytes",
+        output.stdout.len()
+    );
+}
+
+/// Same requirement, but the server drives the rekey through its own
+/// RekeyLimit: it sends KEXINIT unsolicited while the session is running.
+#[test]
+fn rekey_mid_transfer_server_initiated() {
+    let dir = temp_dir("rekey-server");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            "rekeylimit=16K",
+            "-o",
+            "kexalgorithms=diffie-hellman-group14-sha256",
+            "-o",
+            "ciphers=aes128-ctr",
+            "-o",
+            "macs=hmac-sha2-256",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("head -c 500000 /dev/zero")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "client failed: status={:?}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert_eq!(
+        output.stdout.len(),
+        500000,
+        "server-initiated rekey truncated the transfer: got {} bytes",
+        output.stdout.len(),
+    );
+}
+
 #[test]
 fn exec_round_trip_authorized_keys_command() {
     let server_bin = workspace_target_dir();
@@ -1347,7 +1578,7 @@ fn subsystem_sftp_round_trip() {
         .expect("spawn sftp subsystem client");
 
     // Send an SFTP INIT (version 3) and expect a VERSION reply (type 2).
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut stdin = child.stdin.take().expect("child stdin");
     let init = {
         let mut b = Vec::new();

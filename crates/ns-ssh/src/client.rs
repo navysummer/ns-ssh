@@ -21,7 +21,7 @@ pub type BoxedStream = Pin<Box<dyn IoStream>>;
 
 #[cfg(unix)]
 fn terminal_size() -> std::io::Result<(u32, u32)> {
-    use std::os::unix::io::AsRawFd;
+    
     let winsize: libc::winsize = unsafe { std::mem::zeroed() };
     let mut ws = winsize;
     let r = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) };
@@ -281,8 +281,8 @@ fn randomart(key_blob: &[u8]) -> String {
         grid[y * W + x] = grid[y * W + x].saturating_add(1);
     }
     // Start (S) and end (E) positions; OpenSSH marks them explicitly.
-    let mut sx = W / 2;
-    let mut sy = H / 2;
+    let sx = W / 2;
+    let sy = H / 2;
     grid[sy * W + sx] = 0; // will be 'S'
     // Recompute the final drift position for 'E'.
     let mut ex = W / 2;
@@ -400,9 +400,16 @@ fn display_auth_banner(pkt: &[u8]) {
 /// Verify a host key against SSHFP DNS records (`VerifyHostKeyDNS`).
 /// Returns `Some(true)` on a match, `Some(false)` if records exist but none
 /// match (hard failure), and `None` if there are no SSHFP records (fall back).
-fn check_host_key_dns(lookup_host: &str, key_type: &str, key_blob: &[u8]) -> Option<bool> {
+async fn check_host_key_dns(lookup_host: &str, key_type: &str, key_blob: &[u8]) -> Option<bool> {
     use sha2::{Digest, Sha256};
-    let records = crate::dns_sshfp::lookup_sshfp(lookup_host);
+    // The lookup is synchronous std::net code with a per-server timeout. Run it
+    // on a blocking thread so a slow resolver cannot stall the async runtime
+    // (this previously froze every concurrent connection in the integration
+    // tests).
+    let host = lookup_host.to_string();
+    let records = tokio::task::spawn_blocking(move || crate::dns_sshfp::lookup_sshfp(&host))
+        .await
+        .unwrap_or_default();
     if records.is_empty() {
         return None;
     }
@@ -661,6 +668,7 @@ impl SshClient {
             self.config.kex_algorithms.as_deref(),
             self.config.ciphers.as_deref(),
             self.config.macs.as_deref(),
+            false,
         );
         send_raw_packet(stream, &kex_init).await?;
         self.transport.outgoing_seq += 1; // seq counts every packet (RFC 4253 §6.4)
@@ -675,10 +683,12 @@ impl SshClient {
             &self.transport.client_kex_init,
             &self.transport.server_kex_init,
         )?;
+        self.transport.strict_kex = negotiation.strict_kex;
+        self.transport.strict_kex_peer_kexinit = negotiation.strict_kex;
 
         let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
 
-        let (server_host_key_blob, server_public_key, server_signature_blob, shared_secret, exchange_hash, kex_hash_name) = if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
+        let (server_host_key_blob, _server_public_key, server_signature_blob, shared_secret, exchange_hash, kex_hash_name) = if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
             // RFC 4419 §3: min = 2048, preferred = 3072, max = 8192 (the same
             // range OpenSSH requests).
             let (min, nbits, max) = (2048u32, 3072u32, 8192u32);
@@ -769,10 +779,15 @@ impl SshClient {
             kex.generate_keypair()?;
             let mut dh_payload = Vec::new();
             dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-            // e is an mpint: encode with the 0x00 sign prefix when the high
-            // bit is set. Sending it as a plain string makes peers interpret
-            // roughly half of all values as negative bignums.
-            SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
+            // Finite-field DH sends e as an mpint (0x00 sign byte when the
+            // high bit is set); ECDH/curve25519 send the ephemeral public key
+            // as a plain byte string, where an extra byte would make peers
+            // reject an over-long key.
+            if negotiation.kex_algorithm.starts_with("diffie-hellman-group") {
+                SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
+            } else {
+                SshBytes(kex.public_key_bytes()).encode(&mut dh_payload)?;
+            }
             send_raw_packet(stream, &dh_payload).await?;
             self.transport.outgoing_seq += 1;
             self.transport.state = KexState::KexDhInitSent;
@@ -818,6 +833,11 @@ impl SshClient {
         let host_key_bytes = if host_key_type.starts_with("ecdsa-") {
             let _curve = SshString::decode(&mut r2)?;
             SshBytes::decode(&mut r2)?.0
+        } else if host_key_type == "ssh-rsa" || host_key_type.starts_with("rsa-sha2-") {
+            // RSA keys carry two fields (e, n); keep both instead of decoding
+            // a single string (reading only `e` made verification fail with an
+            // end-of-buffer error).
+            r2.to_vec()
         } else {
             SshBytes::decode(&mut r2)?.0
         };
@@ -850,13 +870,19 @@ impl SshClient {
             );
 
             // VerifyHostKeyDNS: verify the host key against SSHFP records.
-            // A mismatch is a hard failure (OpenSSH behavior); "no" disables it.
+            // OpenSSH semantics: a match accepts the key; a mismatch is fatal
+            // only for "yes", while "ask" only warns and falls through to the
+            // normal known_hosts handling. "no" (the default) disables the
+            // lookup entirely.
             if self.config.verify_host_key_dns != "no" {
-                match check_host_key_dns(&lookup_host, &host_key_type, &server_host_key_blob) {
+                match check_host_key_dns(&lookup_host, &host_key_type, &server_host_key_blob).await {
                     Some(true) => status = HostKeyStatus::Known,
                     Some(false) => {
-                        eprintln!("Warning: host key verification failed: SSHFP DNS records do not match.");
-                        return Err(SshError::HostKeyVerificationFailed);
+                        if self.config.verify_host_key_dns == "yes" {
+                            eprintln!("Warning: host key verification failed: SSHFP DNS records do not match.");
+                            return Err(SshError::HostKeyVerificationFailed);
+                        }
+                        eprintln!("Warning: no matching SSHFP DNS record found for {}.", lookup_host);
                     }
                     None => {}
                 }
@@ -986,6 +1012,8 @@ impl SshClient {
             return Err(SshError::Protocol("expected NEWKEYS".into()));
         }
         self.transport.state = KexState::NewKeysReceived;
+        // Strict KEX restarts both sequence numbers at zero after NEWKEYS.
+        self.transport.reset_sequences_after_newkeys();
 
         // Only now is it safe to install and use the new keys.
         self.transport.install_new_keys(
@@ -1019,7 +1047,7 @@ impl SshClient {
             let pkt = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
             match pkt.first() {
                 Some(&msg::SSH_MSG_SERVICE_ACCEPT) => break pkt,
-                Some(&msg::SSH_EXT_INFO_C) | Some(&msg::SSH_EXT_INFO_S) => {
+                Some(&msg::SSH_EXT_INFO_S) => {
                     let mut r = &pkt[1..];
                     if let Ok(nr_ext) = u32::decode(&mut r) {
                         for _ in 0..nr_ext {
@@ -1436,10 +1464,20 @@ impl SshClient {
             }
             _ => return Err(SshError::Protocol("unexpected response to channel open".into())),
         }
+        let remote_id = self.channel_manager.get_channel(local_id)
+            .and_then(|c| c.remote_id)
+            .unwrap_or(local_id);
         let sub_data = build_subsystem_request(subsystem);
-        let sub_msg = build_channel_request(local_id, msg::SSH_REQUEST_SUBSYSTEM, true, Some(&sub_data));
+        let sub_msg = build_channel_request(remote_id, msg::SSH_REQUEST_SUBSYSTEM, true, Some(&sub_data));
         self.send_packet(&sub_msg, false).await?;
-        let _resp = self.recv_packet().await?;
+        let resp = self.recv_packet().await?;
+        match resp.first() {
+            Some(&msg::SSH_MSG_CHANNEL_SUCCESS) => {}
+            Some(&msg::SSH_MSG_CHANNEL_FAILURE) => {
+                return Err(SshError::Channel(format!("subsystem '{}' refused", subsystem)))
+            }
+            _ => return Err(SshError::Protocol("unexpected subsystem response".into())),
+        }
         Ok(local_id)
     }
 
@@ -1932,26 +1970,29 @@ impl SshClient {
                     }
                 }
 
-                packet = self.recv_packet() => {
+                packet = self.recv_packet_impl(false) => {
                     last_any_packet = std::time::Instant::now();
                     match packet {
                         Ok(payload) if !payload.is_empty() => {
                             match payload[0] {
                                 msg::SSH_MSG_CHANNEL_DATA => {
-                                    if let Ok((remote_id, data)) = parse_channel_data(&payload) {
+                                    if let Ok((recipient, data)) = parse_channel_data(&payload) {
                                         let data_len = data.len() as u32;
-                                        if let Some(rid) = stdio_forward_remote_id {
-                                            if rid == remote_id {
-                                                use std::io::Write;
-                                                let _ = std::io::stdout().write_all(&data);
-                                                let _ = std::io::stdout().flush();
-                                                // Replenish the server's send window for this channel.
-                                                let adj = build_channel_window_adjust(remote_id, data_len);
-                                                let _ = self.queue_send(&adj, &mut pending_write);
-                                                continue;
-                                            }
+                                        // Inbound recipient is our local id; the
+                                        // window-adjust reply must use the peer's
+                                        // id for that channel (RFC 4254 §5.2).
+                                        let channel = self.channel_manager.get_channel(recipient);
+                                        let reply_id = self.channel_manager.reply_recipient(recipient).unwrap_or(recipient);
+                                        if stdio_forward_channel_id == Some(recipient) {
+                                            use std::io::Write;
+                                            let _ = std::io::stdout().write_all(&data);
+                                            let _ = std::io::stdout().flush();
+                                            // Replenish the server's send window for this channel.
+                                            let adj = build_channel_window_adjust(reply_id, data_len);
+                                            let _ = self.queue_send(&adj, &mut pending_write);
+                                            continue;
                                         }
-                                        if let Some(local_id) = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
+                                        if let Some(local_id) = channel.map(|c| c.local_id) {
                                             if let Some(ch) = self.channel_manager.get_channel(local_id) {
                                                 if let Some(tx) = &ch.data_tx { let _ = tx.try_send(data); }
                                             }
@@ -1959,17 +2000,19 @@ impl SshClient {
                                         // Replenish the server's send window so large
                                         // server->client transfers do not stall once the
                                         // advertised window is exhausted.
-                                        let adj = build_channel_window_adjust(remote_id, data_len);
+                                        let adj = build_channel_window_adjust(reply_id, data_len);
                                         let _ = self.queue_send(&adj, &mut pending_write);
                                     }
                                 }
                                 msg::SSH_MSG_CHANNEL_EXTENDED_DATA => {
                                     let mut r = &payload[1..];
-                                    let remote_id = u32::decode(&mut r)?;
+                                    let recipient = u32::decode(&mut r)?;
                                     let dt = u32::decode(&mut r)?;
                                     let data = SshBytes::decode(&mut r)?.0;
                                     let data_len = data.len() as u32;
-                                    if let Some(local_id) = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
+                                    let reply_id = self.channel_manager.reply_recipient(recipient)
+                                        .unwrap_or(recipient);
+                                    if let Some(local_id) = self.channel_manager.get_channel(recipient).map(|c| c.local_id) {
                                         if let Some(ch) = self.channel_manager.get_channel(local_id) {
                                             if let Some(ref ext_tx) = ch.ext_data_tx {
                                                 let _ = ext_tx.try_send((dt, data));
@@ -1977,14 +2020,14 @@ impl SshClient {
                                         }
                                     }
                                     // Replenish the server's send window for stderr too.
-                                    let adj = build_channel_window_adjust(remote_id, data_len);
+                                    let adj = build_channel_window_adjust(reply_id, data_len);
                                     let _ = self.queue_send(&adj, &mut pending_write);
                                 }
                                 msg::SSH_MSG_CHANNEL_WINDOW_ADJUST => {
                                     let mut r = &payload[1..];
-                                    let remote_id = u32::decode(&mut r)?;
+                                    let recipient = u32::decode(&mut r)?;
                                     let amount = u32::decode(&mut r)?;
-                                    if let Some(local_id) = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
+                                    if let Some(local_id) = self.channel_manager.get_channel(recipient).map(|c| c.local_id) {
                                         self.channel_manager.add_window(local_id, amount);
                                     }
                                     // Flush forward-channel data deferred when the
@@ -2010,8 +2053,8 @@ impl SshClient {
                                     }
                                 }
                                 msg::SSH_MSG_CHANNEL_REQUEST => {
-                                    if let Ok((remote_id, req_type, want_reply)) = parse_channel_request(&payload) {
-                                        let local_id = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id);
+                                    if let Ok((recipient, req_type, want_reply)) = parse_channel_request(&payload) {
+                                        let local_id = self.channel_manager.get_channel(recipient).map(|c| c.local_id);
                                         if req_type == "exit-status" {
                                             let mut r = &payload[10 + req_type.len()..];
                                             exit_code = u32::decode(&mut r)? as i32;
@@ -2036,9 +2079,11 @@ impl SshClient {
                                                 }
                                             }
                                         }
-                                        if req_type == "exit-status" || req_type == "exit-signal" {
-                                            should_exit = true;
-                                        }
+                                        // Do NOT stop on exit-status/exit-signal: OpenSSH
+                                        // senders may follow it with the tail of the
+                                        // channel output before CHANNEL_CLOSE. Record the
+                                        // status and let the CLOSE/EOF handler end the
+                                        // session, otherwise the last data chunk is lost.
                                     }
                                 }
                                 msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
@@ -2184,19 +2229,13 @@ impl SshClient {
                                     }
                                 }
                                 msg::SSH_MSG_CHANNEL_EOF | msg::SSH_MSG_CHANNEL_CLOSE => {
-                                    if let Some(sid) = session_id {
-                                        let mut r = &payload[1..];
-                                        if let Ok(rid) = u32::decode(&mut r) {
-                                            if self.channel_manager.find_by_remote_id(rid).map(|c| c.local_id) == Some(sid) {
-                                                should_exit = true;
-                                            }
-                                        }
-                                    } else if let Some(rid) = stdio_forward_remote_id {
-                                        let mut r = &payload[1..];
-                                        if let Ok(remote_id) = u32::decode(&mut r) {
-                                            if rid == remote_id {
-                                                should_exit = true;
-                                            }
+                                    let mut r = &payload[1..];
+                                    if let Ok(recipient) = u32::decode(&mut r) {
+                                        // The recipient is our local channel id.
+                                        if session_id == Some(recipient)
+                                            || stdio_forward_channel_id == Some(recipient)
+                                        {
+                                            should_exit = true;
                                         }
                                     }
                                 }
@@ -2265,6 +2304,26 @@ impl SshClient {
                         Err(_) => { should_exit = true; }
                     }
                 }
+            }
+        }
+
+        // The loop can stop on CHANNEL_CLOSE/DISCONNECT while bytes decoded from
+        // earlier CHANNEL_DATA packets are still queued in the forwarding
+        // channels (the select! only moves one item per iteration). Flush them
+        // before exiting, otherwise the tail of the command's output is dropped.
+        {
+            use std::io::Write;
+            if let Some(mut rx) = session_data_rx.take() {
+                while let Ok(data) = rx.try_recv() {
+                    let _ = std::io::stdout().write_all(&data);
+                }
+                let _ = std::io::stdout().flush();
+            }
+            if let Some(mut rx) = session_ext_rx.take() {
+                while let Ok((_dt, data)) = rx.try_recv() {
+                    let _ = std::io::stderr().write_all(&data);
+                }
+                let _ = std::io::stderr().flush();
             }
         }
 
@@ -2504,13 +2563,11 @@ impl SshClient {
                     Some(&msg::SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                         // Track the channel's peer window so multiplexed session
                         // and forwarded agent/X11 channels stay protocol-correct.
-                        // Prefer mapping via the peer channel number (the de-facto
-                        // convention used by the data pumps); fall back to treating
-                        // the field as a local id for robustness.
+                        // The recipient field is our local channel id.
                         let mut r = &payload[1..];
                         if let Ok(recipient) = u32::decode(&mut r) {
                             if let Ok(amount) = u32::decode(&mut r) {
-                                let local_id = self.channel_manager.find_by_remote_id(recipient)
+                                let local_id = self.channel_manager.get_channel(recipient)
                                     .map(|c| c.local_id)
                                     .unwrap_or(recipient);
                                 self.channel_manager.add_window(local_id, amount);
@@ -2668,8 +2725,7 @@ impl SshClient {
         send_encrypted_packet(stream, &open_msg, &mut self.transport, false, aead).await?;
 
         // Wait for open confirmation (handle intermediate packets).
-        let mut remote_id: Option<u32> = None;
-        loop {
+        let remote_id = loop {
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             let pkt = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
             match pkt.first() {
@@ -2680,8 +2736,7 @@ impl SshClient {
                     }
                     self.channel_manager.set_remote_id(local_id, sender);
                     self.channel_manager.set_peer_window(local_id, w);
-                    remote_id = Some(sender);
-                    break;
+                    break sender;
                 }
                 Some(&msg::SSH_MSG_CHANNEL_OPEN_FAILURE) => {
                     let (_, reason, message) = parse_channel_open_failure(&pkt)?;
@@ -2694,8 +2749,7 @@ impl SshClient {
                 }
                 _ => {}
             }
-        }
-        let remote_id = remote_id.unwrap();
+        };
 
         // Record agent/X11 forwarding paths for this connection so the master
         // can serve forwarded channels opened by the server later.
@@ -2976,14 +3030,6 @@ impl SshClient {
         Ok(local_id)
     }
 
-    pub async fn send_global_request(&mut self, req: &[u8]) -> Result<Option<Vec<u8>>> {        let aead = self.is_aead();
-        let (tx, rx) = oneshot::channel();
-        self.pending_global.push_back(tx);
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-        send_encrypted_packet(stream, req, &mut self.transport, false, aead).await?;
-        rx.await.map_err(|_| SshError::Channel("global request cancelled".into()))?
-    }
-
     fn is_aead(&self) -> bool {
         self.transport.client_to_server_cipher.as_ref()
             .map(|c| c.is_aead())
@@ -3003,6 +3049,16 @@ impl SshClient {
     /// so synchronous setup paths (channel open / exec) transparently survive
     /// a server-initiated rekey.
     async fn recv_packet(&mut self) -> Result<Vec<u8>> {
+        // Setup paths expect the *next* reply and cannot treat a flow-control
+        // packet as one, so they let recv_packet fold WINDOW_ADJUST into the
+        // channel state and keep reading. The event loop needs those packets
+        // returned so it can also flush data deferred on an exhausted window;
+        // consuming them here would deadlock a window-gated upload when the
+        // peer sends no further data packets.
+        self.recv_packet_impl(true).await
+    }
+
+    async fn recv_packet_impl(&mut self, skip_window_adjust: bool) -> Result<Vec<u8>> {
         loop {
             if let Some(p) = self.deferred_packets.pop_front() {
                 return Ok(p);
@@ -3011,7 +3067,6 @@ impl SshClient {
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
             if p.first() == Some(&msg::SSH_MSG_KEXINIT) {
-                drop(stream);
                 let deferred = self.perform_rekey_with_kex(p).await?;
                 for d in deferred {
                     self.deferred_packets.push_back(d);
@@ -3027,6 +3082,24 @@ impl SshClient {
                         let resp = build_request_failure();
                         self.send_packet(&resp, false).await?;
                     }
+                }
+                continue;
+            }
+            // Flow-control changes may arrive while waiting for an unrelated
+            // reply. OpenSSH confirms a session channel with a zero window and
+            // immediately follows up with SSH_MSG_CHANNEL_WINDOW_ADJUST; if the
+            // setup path consumed that packet as "the reply" the channel stayed
+            // at window 0 and every write blocked forever.
+            if skip_window_adjust && p.first() == Some(&msg::SSH_MSG_CHANNEL_WINDOW_ADJUST) {
+                let mut r = &p[1..];
+                if let (Ok(recipient), Ok(amount)) =
+                    (u32::decode(&mut r), u32::decode(&mut r))
+                {
+                    let local_id = self.channel_manager
+                        .get_channel(recipient)
+                        .map(|c| c.local_id)
+                        .unwrap_or(recipient);
+                    self.channel_manager.add_window(local_id, amount);
                 }
                 continue;
             }
@@ -3071,8 +3144,19 @@ impl SshClient {
         let server_kex = if let Some(k) = pre_server_kex {
             k
         } else {
-            let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-            p
+            // Data packets sent by the peer before it processed our KEXINIT may
+            // still be in flight and arrive ahead of its KEXINIT. RFC 4253 §7
+            // allows this; they are deferred and replayed after the rekey.
+            loop {
+                let p = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+                if p.first() == Some(&msg::SSH_MSG_DISCONNECT) {
+                    return Err(SshError::ConnectionClosed);
+                }
+                if p.first() == Some(&msg::SSH_MSG_KEXINIT) {
+                    break p;
+                }
+                deferred.push(p);
+            }
         };
         if server_kex.first() != Some(&msg::SSH_MSG_KEXINIT) {
             return Err(SshError::KexFailed("expected KEXINIT during rekey".into()));
@@ -3083,10 +3167,12 @@ impl SshClient {
             &self.transport.client_kex_init,
             &self.transport.server_kex_init,
         )?;
+        self.transport.strict_kex = negotiation.strict_kex;
+        self.transport.strict_kex_peer_kexinit = negotiation.strict_kex;
 
         let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
 
-        let (server_host_key_blob, server_pub_key, server_sig_blob, shared_secret, exchange_hash, kex_hash_name) =
+        let (_server_host_key_blob, _server_pub_key, _server_sig_blob, shared_secret, exchange_hash, kex_hash_name) =
             if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
                 // RFC 4419 §3: modern servers reject the legacy REQUEST_OLD
                 // (30) form, so rekey must use the same REQUEST (34) message
@@ -3184,7 +3270,11 @@ impl SshClient {
                 kex.generate_keypair()?;
                 let mut dh_payload = Vec::new();
                 dh_payload.push(msg::SSH_MSG_KEXDH_INIT);
-                SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
+                if negotiation.kex_algorithm.starts_with("diffie-hellman-group") {
+                    SshMpInt(kex.public_key_bytes()).encode(&mut dh_payload)?;
+                } else {
+                    SshBytes(kex.public_key_bytes()).encode(&mut dh_payload)?;
+                }
                 send_encrypted_packet(stream, &dh_payload, &mut self.transport, false, aead).await?;
 
                 let reply = loop {
@@ -3223,6 +3313,29 @@ impl SshClient {
 
         let session_id = self.session_id.clone().unwrap_or_default();
 
+        // RFC 4253 §7.3: NEWKEYS is exchanged under the OLD keys; installing the
+        // new keys first makes the peer fail to parse our NEWKEYS (it still
+        // decrypts with the old keys). Install only after both NEWKEYS crossed.
+        let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
+        send_encrypted_packet(stream, &newkeys_msg, &mut self.transport, true, aead).await?;
+        self.transport.state = KexState::NewKeysSent;
+
+        let newkeys_response = loop {
+            let p = receive_encrypted_packet(stream, &mut self.transport, true, aead).await?;
+            if p.first() == Some(&msg::SSH_MSG_DISCONNECT) {
+                return Err(SshError::ConnectionClosed);
+            }
+            if p.first() == Some(&msg::SSH_MSG_NEWKEYS) {
+                break p;
+            }
+            deferred.push(p);
+        };
+        if newkeys_response.first() != Some(&msg::SSH_MSG_NEWKEYS) {
+            return Err(SshError::Protocol("expected NEWKEYS during rekey".into()));
+        }
+        self.transport.state = KexState::NewKeysReceived;
+        self.transport.reset_sequences_after_newkeys();
+
         self.transport.install_new_keys(
             &negotiation,
             &kex_hash_name,
@@ -3231,15 +3344,6 @@ impl SshClient {
             &session_id,
         )?;
 
-        let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
-        send_encrypted_packet(stream, &newkeys_msg, &mut self.transport, true, aead).await?;
-        self.transport.state = KexState::NewKeysSent;
-
-        let newkeys_response = receive_encrypted_packet(stream, &mut self.transport, true, aead).await?;
-        if newkeys_response.first() != Some(&msg::SSH_MSG_NEWKEYS) {
-            return Err(SshError::Protocol("expected NEWKEYS during rekey".into()));
-        }
-        self.transport.state = KexState::NewKeysReceived;
         self.transport.kex_algorithm = Some(kex);
         self.transport.state = KexState::Established;
         self.transport.last_rekey_bytes = self.transport.total_bytes();
@@ -3501,8 +3605,8 @@ fn spawn_proxy_tunnel_forwarder(
 
     let stream = stream.take().unwrap();
     let (r, w) = tokio::io::split(stream);
-    let (mut duplex_rd, mut outer_wr) = tokio::io::duplex(1 << 20);
-    let (mut outer_rd, mut duplex_wr) = tokio::io::duplex(1 << 20);
+    let (mut duplex_rd, outer_wr) = tokio::io::duplex(1 << 20);
+    let (outer_rd, mut duplex_wr) = tokio::io::duplex(1 << 20);
 
     // Combine halves back into one stream to pass into existing functions
     let mut combined = CombinedStream::new(r, w);
@@ -3701,7 +3805,9 @@ impl<R, W> CombinedStream<R, W> {
 }
 
 struct ProxyStream {
-    child: tokio::process::Child,
+    // Kept alive so the proxy command's child is not dropped while the
+    // stream is in use.
+    _child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
     stdin: tokio::process::ChildStdin,
 }
@@ -3800,7 +3906,7 @@ fn connect_proxy_command(config: &ResolvedConfig, cmd: &str, target_host: &str, 
         .map_err(|e| SshError::Io(e))?;
     let stdout = child.stdout.take().ok_or_else(|| SshError::Protocol("proxy stdout not captured".into()))?;
     let stdin = child.stdin.take().ok_or_else(|| SshError::Protocol("proxy stdin not captured".into()))?;
-    Ok(Box::pin(ProxyStream { child, stdout, stdin }))
+    Ok(Box::pin(ProxyStream { _child: child, stdout, stdin }))
 }
 
 impl<R: tokio::io::AsyncRead + Unpin, W: Unpin> tokio::io::AsyncRead for CombinedStream<R, W> {
@@ -3836,7 +3942,7 @@ impl<R: Unpin, W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Combi
 }
 
 fn parse_global_request(payload: &[u8]) -> Result<(String, bool, Vec<u8>)> {
-    use ssh_core::encoding::{SshDecode, SshEncode as _};
+    use ssh_core::encoding::SshDecode;
     if payload.is_empty() || payload[0] != msg::SSH_MSG_GLOBAL_REQUEST {
         return Err(SshError::InvalidPacket("not global request".into()));
     }
@@ -4067,7 +4173,7 @@ async fn receive_encrypted_packet(
         .unwrap_or(8)
         .max(8);
 
-    let mut wire_len: usize = 0;
+    let wire_len: usize;
 
     let body: Vec<u8> = if chachapoly {
         // chacha20-poly1305@openssh.com: the 4-byte packet_length is encrypted
@@ -4205,7 +4311,7 @@ async fn receive_encrypted_packet(
             }
         }
 
-        let mut body_plain = if let Some(ref mut cipher) = transport.server_to_client_cipher {
+        let body_plain = if let Some(ref mut cipher) = transport.server_to_client_cipher {
             if aead {
                 // AES-GCM authenticates the cleartext packet_length as AAD.
                 cipher.decrypt_with_aad(seq, &len_buf, &body)?
@@ -4244,36 +4350,13 @@ async fn receive_encrypted_packet(
         return Err(SshError::Protocol("empty packet".into()));
     }
 
-    unpack_packet_body(&body)
+    let payload = unpack_packet_body(&body)?;
+    // Strict KEX rejects generic transport packets between KEXINIT and NEWKEYS.
+    transport.check_strict_kex_packet(&payload)?;
+    Ok(payload)
 }
 
 impl SshClient {
-    pub async fn request_connection_service(&mut self) -> Result<()> {
-        let aead = self.is_aead();
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-        let req = vec![msg::SSH_MSG_SERVICE_REQUEST]
-            .into_iter()
-            .chain(SshString::new(msg::SSH_SERVICE_NAME_CONNECTION).0)
-            .collect::<Vec<u8>>();
-        send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
-        let resp = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
-        if resp.first() != Some(&msg::SSH_MSG_SERVICE_ACCEPT) {
-            return Err(SshError::Protocol("connection service not accepted".into()));
-        }
-        Ok(())
-    }
-
-    pub async fn enable_agent_forwarding(&mut self, session_local_id: ChannelId) -> Result<()> {
-        let aead = self.is_aead();
-        let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
-        let remote_id = self.channel_manager.get_channel(session_local_id)
-            .and_then(|c| c.remote_id)
-            .unwrap_or(0);
-        let req = build_channel_request(remote_id, msg::SSH_REQUEST_AUTH_AGENT, false, None);
-        send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
-        Ok(())
-    }
-
     /// Queue a payload for sending without ever blocking on the socket. Builds
     /// the encrypted packet and attempts a non-blocking `try_write`; if the
     /// socket would block (peer's receive buffer full), the packet is buffered
@@ -4331,7 +4414,7 @@ impl SshClient {
         data: Vec<u8>,
         pending: &mut VecDeque<(ChannelId, Vec<u8>)>,
         pending_write: &mut VecDeque<Vec<u8>>,
-        aead: bool,
+        _aead: bool,
     ) {
         let local_id = self.channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id);
         let window = local_id.map(|l| self.channel_manager.peer_window(l)).unwrap_or(u32::MAX);
@@ -4355,7 +4438,7 @@ impl SshClient {
         &mut self,
         pending: &mut VecDeque<(ChannelId, Vec<u8>)>,
         pending_write: &mut VecDeque<Vec<u8>>,
-        aead: bool,
+        _aead: bool,
     ) {
         let mut still_pending: VecDeque<(ChannelId, Vec<u8>)> = VecDeque::new();
         while let Some((remote_id, data)) = pending.pop_front() {
@@ -4469,23 +4552,22 @@ impl SshClient {
                     let _dt = u32::decode(&mut r)?;
                     SshBytes::decode(&mut r)?.0
                 };
-                // Match the channel by either id convention: the first session
-                // channel has local_id == remote_id == 0, but be robust anyway.
-                let local_id = self.channel_manager.find_by_remote_id(cid)
-                    .or_else(|| self.channel_manager.get_channel(cid))
-                    .map(|c| c.local_id)
-                    .unwrap_or(cid);
+                // RFC 4254 §5.2: an inbound recipient is our local id. Map it
+                // to the channel and answer on the peer's id for that channel.
+                let channel = self.channel_manager.get_channel(cid);
+                let local_id = channel.map(|c| c.local_id).unwrap_or(cid);
+                let reply_id = channel.and_then(|c| c.remote_id).unwrap_or(cid);
                 self.pump_in.push_back((local_id, data.clone()));
                 // Replenish the peer's send window for the data we consumed so
                 // large downloads do not stall.
-                let adj = build_channel_window_adjust(cid, data.len() as u32);
+                let adj = build_channel_window_adjust(reply_id, data.len() as u32);
                 let _ = self.queue_send(&adj, pump_write);
             }
             msg::SSH_MSG_CHANNEL_WINDOW_ADJUST => {
                 let mut r = &packet[1..];
                 let recipient = u32::decode(&mut r)?;
                 let amount = u32::decode(&mut r)?;
-                let local_id = self.channel_manager.find_by_remote_id(recipient)
+                let local_id = self.channel_manager.get_channel(recipient)
                     .map(|c| c.local_id)
                     .unwrap_or(recipient);
                 self.channel_manager.add_window(local_id, amount);
