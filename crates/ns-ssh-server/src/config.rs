@@ -185,6 +185,12 @@ pub struct ServerConfig {
     #[serde(default = "default_x11_display_offset")]
     pub x11_display_offset: u32,
 
+    /// X11UseLocalhost: bind the X11 listener to loopback and advertise
+    /// DISPLAY as `localhost:N` (default yes). With `no` the listener binds
+    /// all interfaces and DISPLAY uses the server's hostname.
+    #[serde(default = "default_true")]
+    pub x11_use_localhost: bool,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -275,6 +281,7 @@ pub struct MatchOverrides {
     pub kbd_interactive_auth: Option<bool>,
     pub allow_tcp_forwarding_mode: Option<String>,
     pub x11_forwarding: Option<bool>,
+    pub x11_use_localhost: Option<bool>,
     pub allow_agent_forwarding: Option<bool>,
     pub allow_streamlocal_forwarding: Option<bool>,
     pub allow_users: Option<Vec<String>>,
@@ -356,6 +363,7 @@ impl ServerMatch {
         if let Some(v) = o.kbd_interactive_auth { cfg.kbd_interactive_auth = v; }
         if let Some(v) = &o.allow_tcp_forwarding_mode { cfg.allow_tcp_forwarding_mode = v.clone(); }
         if let Some(v) = o.x11_forwarding { cfg.x11_forwarding = v; }
+        if let Some(v) = o.x11_use_localhost { cfg.x11_use_localhost = v; }
         if let Some(v) = o.allow_agent_forwarding { cfg.allow_agent_forwarding = v; }
         if let Some(v) = o.allow_streamlocal_forwarding { cfg.allow_streamlocal_forwarding = v; }
         if let Some(v) = &o.allow_users { cfg.allow_users = v.clone(); }
@@ -408,6 +416,7 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
             o.allow_tcp_forwarding_mode = Some(value.to_lowercase());
         }
         "x11forwarding" | "x11_forwarding" => o.x11_forwarding = Some(value == "yes"),
+        "x11uselocalhost" | "x11_use_localhost" => o.x11_use_localhost = Some(value == "yes"),
         "allowagentforwarding" | "allow_agent_forwarding" => {
             o.allow_agent_forwarding = Some(value == "yes");
         }
@@ -775,6 +784,41 @@ fn default_accept_env() -> Vec<String> {
 
 fn default_x11_display_offset() -> u32 { 10 }
 
+/// Local hostname, used for DISPLAY when X11UseLocalhost is disabled.
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ok = unsafe {
+        libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) == 0
+    };
+    if ok {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if end > 0 {
+            if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                return s.to_string();
+            }
+        }
+    }
+    "localhost".to_string()
+}
+
+/// DISPLAY value exported to the session: `localhost:N` by default, or
+/// `hostname:N` when X11UseLocalhost is disabled.
+pub fn x11_display_name(config: &ServerConfig) -> String {
+    let host = if config.x11_use_localhost {
+        "localhost".to_string()
+    } else {
+        local_hostname()
+    };
+    format!("{}:{}", host, config.x11_display_offset)
+}
+
+/// Address the X11 listener binds to: loopback by default, otherwise all
+/// interfaces (matching X11UseLocalhost=no).
+pub fn x11_listen_addr(config: &ServerConfig) -> String {
+    let addr = if config.x11_use_localhost { "127.0.0.1" } else { "0.0.0.0" };
+    format!("{}:{}", addr, 6000 + config.x11_display_offset as u16)
+}
+
 fn default_forwarding_mode() -> String { "yes".to_string() }
 
 impl Default for ServerConfig {
@@ -839,6 +883,7 @@ impl Default for ServerConfig {
             allow_streamlocal_forwarding: default_true(),
             x11_forwarding: false,
             x11_display_offset: default_x11_display_offset(),
+            x11_use_localhost: true,
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1166,6 +1211,9 @@ impl ServerConfig {
                 "x11forwarding" | "x11_forwarding" => {
                     config.x11_forwarding = value == "yes";
                 }
+                "x11uselocalhost" | "x11_use_localhost" => {
+                    config.x11_use_localhost = value == "yes";
+                }
                 "allowagentforwarding" | "allow_agent_forwarding" => {
                     config.allow_agent_forwarding = value == "yes";
                 }
@@ -1292,7 +1340,7 @@ impl ServerConfig {
                 | "rdomain" | "refuseconnection" | "refuse_connection"
                 | "revokedkeys" | "revoked_keys"
                 | "securitykeyprovider" | "security_key_provider"
-                | "sshdssessionpath" | "sshd_session_path"
+                | "sshdsessionpath" | "sshd_session_path"
                 | "streamlocalbindmask" | "stream_local_bind_mask"
                 | "streamlocalbindunlink" | "stream_local_bind_unlink"
                 | "trustedusercakeys" | "trusted_user_ca_keys"
@@ -1567,5 +1615,35 @@ Match All
         // Default when unset.
         let c = ServerConfig::parse("").unwrap();
         assert_eq!(c.required_rsa_size, 1024);
+    }
+
+    #[test]
+    fn x11_use_localhost_controls_display_and_bind_address() {
+        // Default: loopback listener, `localhost:N` DISPLAY.
+        let c = ServerConfig::parse("").unwrap();
+        assert!(c.x11_use_localhost);
+        assert_eq!(x11_listen_addr(&c), "127.0.0.1:6010");
+        assert_eq!(x11_display_name(&c), "localhost:10");
+
+        // X11UseLocalhost no: listen on all interfaces and use the hostname.
+        let c = ServerConfig::parse("X11DisplayOffset 12\nX11UseLocalhost no\n").unwrap();
+        assert!(!c.x11_use_localhost);
+        assert_eq!(x11_listen_addr(&c), "0.0.0.0:6012");
+        assert!(!x11_display_name(&c).starts_with("localhost:"));
+
+        // Match block override reaches the effective config.
+        let c = ServerConfig::parse(
+            "Match User alice\n    X11UseLocalhost no\n",
+        )
+        .unwrap();
+        assert_eq!(c.match_blocks[0].overrides.x11_use_localhost, Some(false));
+    }
+
+    #[test]
+    fn sshd_session_path_is_accepted() {
+        // Regression: the accept list used to spell it `sshdssessionpath`,
+        // so the real directive name was rejected as unknown.
+        let c = ServerConfig::parse("SshdSessionPath /usr/lib/ssh/sshd-session\n").unwrap();
+        assert_eq!(c.port, default_port());
     }
 }

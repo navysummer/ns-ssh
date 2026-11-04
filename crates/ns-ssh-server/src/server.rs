@@ -1,4 +1,4 @@
-use crate::config::ServerConfig;
+use crate::config::{x11_display_name, x11_listen_addr, ServerConfig};
 use crate::hostkey::HostKeyManager;
 use crate::auth::ServerAuth;
 use crate::session::SessionManager;
@@ -2033,12 +2033,12 @@ async fn handle_connection_service(
 
                                     if config.x11_forwarding {
                                         if let Some(sid) = local_channel.and_then(|lc| channel_session.get(&lc).copied()) {
-                                            let display = format!("localhost:{}", config.x11_display_offset);
+                                            let display = x11_display_name(config);
                                             session_manager.set_env_var(sid, "DISPLAY".to_string(), display);
                                         }
                                         if !x11_enabled {
-                                            let x11_port = 6000u16 + config.x11_display_offset as u16;
-                                            match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", x11_port)).await {
+                                            let bind_addr = x11_listen_addr(config);
+                                            match tokio::net::TcpListener::bind(&bind_addr).await {
                                                 Ok(listener) => {
                                                     x11_enabled = true;
                                                     let tx = x11_tx.clone();
@@ -2054,7 +2054,7 @@ async fn handle_connection_service(
                                                     })));
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!("x11 listener bind on {} failed: {}", x11_port, e);
+                                                    tracing::warn!("x11 listener bind on {} failed: {}", bind_addr, e);
                                                 }
                                             }
                                         }

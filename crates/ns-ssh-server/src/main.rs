@@ -206,6 +206,9 @@ fn main() {
                         config.x11_display_offset = v;
                     }
                 }
+                "x11uselocalhost" | "x11_use_localhost" => {
+                    config.x11_use_localhost = value == "yes";
+                }
                 "forcecommand" | "force_command" => {
                     config.force_command = Some(value.to_string());
                 }
