@@ -283,6 +283,11 @@ fn main() {
                         value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string())
                     );
                 }
+                "setenv" | "set_env" => {
+                    if let Ok(pair) = config::parse_set_env(value) {
+                        config.set_env.push(pair);
+                    }
+                }
                 "allowtcpforwarding" | "allow_tcp_forwarding" => {
                     config.allow_tcp_forwarding_mode = value.to_lowercase();
                 }

@@ -1506,6 +1506,7 @@ fn start_session_and_readers(
     permit_user_rc: bool,
     expose_auth_info: bool,
     auth_info: &[String],
+    set_env: &[(String, String)],
     child_tx: tokio::sync::mpsc::UnboundedSender<ChildOutputMsg>,
     readers_done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<()> {
@@ -1515,6 +1516,18 @@ fn start_session_and_readers(
     session_manager.set_permit_user_rc(sid, permit_user_rc);
     if expose_auth_info {
         session_manager.set_auth_info(sid, auth_info.to_vec(), true);
+    }
+    // SetEnv: server-configured session environment. Client variables passed
+    // via AcceptEnv (already recorded on the session) take precedence, and
+    // authorized_keys `environment=` options below override both.
+    for (name, value) in set_env {
+        let already_set = session_manager
+            .get_session(sid)
+            .map(|s| s.env_vars.contains_key(name))
+            .unwrap_or(false);
+        if !already_set {
+            session_manager.set_env_var(sid, name.clone(), value.clone());
+        }
     }
     // Apply authorized_keys restrictions: command=, no-pty, environment= (if permitted)
     if let Some(opts) = auth_key_options {
@@ -2276,7 +2289,7 @@ async fn handle_connection_service(
                                     session_manager.set_command(sid, command.clone());
                                     let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                     session_readers_done.insert(sid, readers_done.clone());
-                                    if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
+                                    if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, &config.set_env, child_tx.clone(), readers_done) {
                                         tracing::error!("Failed to start session: {}", e);
                                     }
                                     session_started = true;
@@ -2295,7 +2308,7 @@ async fn handle_connection_service(
                                         {
                                             let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                             session_readers_done.insert(sid, readers_done.clone());
-                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
+                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, &config.set_env, child_tx.clone(), readers_done) {
                                                 tracing::error!("Failed to start shell: {}", e);
                                             }
                                             session_started = true;
@@ -2481,7 +2494,7 @@ async fn handle_connection_service(
                                             session_manager.set_command(sid, subsystem_path.clone());
                                             let readers_done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                                             session_readers_done.insert(sid, readers_done.clone());
-                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, child_tx.clone(), readers_done) {
+                                            if let Err(e) = start_session_and_readers(session_manager, sid, &work_dir, config.chroot_directory.as_deref(), auth_key_options, config.permit_user_environment, config.print_motd, config.permit_user_rc, config.expose_auth_info, auth_info, &config.set_env, child_tx.clone(), readers_done) {
                                                 tracing::error!("Failed to start subsystem {}: {}", subsystem_name, e);
                                             }
                                             session_started = true;

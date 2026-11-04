@@ -172,6 +172,12 @@ pub struct ServerConfig {
     #[serde(default = "default_accept_env")]
     pub accept_env: Vec<String>,
 
+    /// SetEnv: environment variables the server sets for the session, as
+    /// ordered `NAME=VALUE` pairs. Client-sent (AcceptEnv) and authorized_keys
+    /// `environment=` values take precedence.
+    #[serde(default)]
+    pub set_env: Vec<(String, String)>,
+
     #[serde(default = "default_true")]
     pub allow_agent_forwarding: bool,
 
@@ -374,6 +380,7 @@ pub struct MatchOverrides {
     pub tcp_keep_alive: Option<bool>,
     pub permit_user_environment: Option<bool>,
     pub accept_env: Option<Vec<String>>,
+    pub set_env: Option<Vec<(String, String)>>,
     pub login_grace_time: Option<u32>,
     pub log_level: Option<String>,
     pub hostbased_auth: Option<bool>,
@@ -475,6 +482,7 @@ impl ServerMatch {
         if let Some(v) = o.tcp_keep_alive { cfg.tcp_keep_alive = v; }
         if let Some(v) = o.permit_user_environment { cfg.permit_user_environment = v; }
         if let Some(v) = &o.accept_env { cfg.accept_env = v.clone(); }
+        if let Some(v) = &o.set_env { cfg.set_env.extend(v.iter().cloned()); }
         if let Some(v) = o.login_grace_time { cfg.login_grace_time = v; }
         if let Some(v) = &o.log_level { cfg.log_level = Some(v.clone()); }
         if let Some(v) = o.hostbased_auth { cfg.hostbased_auth = v; }
@@ -565,6 +573,12 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
             let mut list = o.accept_env.take().unwrap_or_default();
             list.extend(value.split_whitespace().map(|s| s.to_string()));
             o.accept_env = Some(list);
+        }
+        "setenv" | "set_env" => {
+            let pair = parse_set_env(value)?;
+            let mut list = o.set_env.take().unwrap_or_default();
+            list.push(pair);
+            o.set_env = Some(list);
         }
         "logingracetime" | "login_grace_time" => {
             if let Ok(v) = value.parse() { o.login_grace_time = Some(v); }
@@ -909,6 +923,18 @@ fn default_accept_env() -> Vec<String> {
     Vec::new()
 }
 
+/// Parse one `SetEnv NAME=VALUE` directive value. The name must be non-empty;
+/// the value may contain further `=` characters and may be empty.
+pub fn parse_set_env(value: &str) -> Result<(String, String)> {
+    let (name, val) = value
+        .split_once('=')
+        .ok_or_else(|| SshError::Config(format!("badly formatted SetEnv: {}", value)))?;
+    if name.is_empty() {
+        return Err(SshError::Config(format!("badly formatted SetEnv: {}", value)));
+    }
+    Ok((name.to_string(), val.to_string()))
+}
+
 fn default_x11_display_offset() -> u32 { 10 }
 
 fn default_streamlocal_mask() -> u32 { 0o177 }
@@ -1058,6 +1084,7 @@ impl Default for ServerConfig {
             max_startups: default_max_startups(),
             login_grace_time: default_login_grace_time(),
             accept_env: default_accept_env(),
+            set_env: Vec::new(),
             allow_agent_forwarding: default_true(),
             allow_streamlocal_forwarding: default_true(),
             x11_forwarding: false,
@@ -1489,6 +1516,11 @@ impl ServerConfig {
                     // OpenSSH allows whitespace/comma-separated patterns.
                     config.accept_env.extend(value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()));
                 }
+                "setenv" | "set_env" => {
+                    // OpenSSH: `SetEnv NAME=VALUE`, one variable per directive;
+                    // repeated directives accumulate.
+                    config.set_env.push(parse_set_env(value)?);
+                }
                 "gatewayports" | "gateway_ports" => {
                     config.gateway_ports = value.to_lowercase();
                 }
@@ -1680,6 +1712,54 @@ mod tests {
         let l = resolve_pubkey_algorithms_server("default");
         assert!(!pubkey_alg_accepted_server("ssh-rsa", &l));
         assert!(pubkey_alg_accepted_server("ssh-ed25519", &l));
+    }
+
+    #[test]
+    fn set_env_parsing() {
+        let cfg = ServerConfig::parse(
+            "\
+SetEnv FOO=bar
+SetEnv EMPTY=
+SetEnv URL=http://example?a=b
+",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.set_env,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("URL".to_string(), "http://example?a=b".to_string()),
+            ]
+        );
+
+        // Malformed values (no `=` or empty name) are rejected like OpenSSH.
+        assert!(ServerConfig::parse("SetEnv NOEQUALS\n").is_err());
+        assert!(ServerConfig::parse("SetEnv =novalue\n").is_err());
+    }
+
+    #[test]
+    fn set_env_in_match_block_accumulates() {
+        let cfg = ServerConfig::parse(
+            "\
+SetEnv GLOBAL=1
+Match User alice
+    SetEnv PERUSER=2
+",
+        )
+        .unwrap();
+        // Global directive applies to everyone.
+        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        assert_eq!(r.set_env, vec![("GLOBAL".to_string(), "1".to_string())]);
+        // A matching Match block appends its SetEnv entries.
+        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        assert_eq!(
+            r.set_env,
+            vec![
+                ("GLOBAL".to_string(), "1".to_string()),
+                ("PERUSER".to_string(), "2".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -1500,6 +1500,51 @@ fn setenv_propagates() {
     let _ = server_out;
 }
 
+/// Server-side `SetEnv` must be injected into the session environment, and a
+/// client-sent variable of the same name (accepted via `AcceptEnv`) takes
+/// precedence over the server's SetEnv, matching OpenSSH.
+#[test]
+fn server_setenv_propagates() {
+    let dir = temp_dir("server_setenv");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            "setenv=NS_SSH_SERVER_VAR=from_server",
+            "-o",
+            "setenv=LANG=server_lang",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        // Client sends LANG via its own SetEnv; the test server accepts it
+        // through `AcceptEnv LANG LC_*` and it must override the server value.
+        .arg("-o")
+        .arg("SetEnv=LANG=client_lang")
+        .arg("127.0.0.1")
+        .arg("echo \"SRV=[$NS_SSH_SERVER_VAR] LANG=[$LANG]\"")
+        .output()
+        .expect("run server setenv client");
+
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SRV=[from_server] LANG=[client_lang]"),
+        "expected server SetEnv injected and client LANG to win, got: {:?} (stderr={:?})",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = server_out;
+}
+
 /// `-s subsystem` requests a server subsystem (e.g. `sftp`). This verifies the
 /// client sends a proper subsystem channel request and that the server's
 /// internal-sftp replies to an SFTP INIT with a VERSION packet.
