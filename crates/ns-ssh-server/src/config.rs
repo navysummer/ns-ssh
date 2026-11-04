@@ -129,6 +129,11 @@ pub struct ServerConfig {
     #[serde(default = "default_required_rsa_size")]
     pub required_rsa_size: u32,
 
+    /// AuthenticationMethods: each entry is one alternative chain of
+    /// whitespace-separated steps. Empty means "any single method".
+    #[serde(default)]
+    pub authentication_methods: Vec<Vec<String>>,
+
     #[serde(default = "default_true")]
     pub permit_tty: bool,
 
@@ -290,6 +295,7 @@ pub struct MatchOverrides {
     pub log_level: Option<String>,
     pub hostbased_auth: Option<bool>,
     pub ignore_rhosts: Option<bool>,
+    pub authentication_methods: Option<Vec<Vec<String>>>,
 }
 
 impl ServerMatch {
@@ -369,6 +375,7 @@ impl ServerMatch {
         if let Some(v) = &o.log_level { cfg.log_level = Some(v.clone()); }
         if let Some(v) = o.hostbased_auth { cfg.hostbased_auth = v; }
         if let Some(v) = o.ignore_rhosts { cfg.ignore_rhosts = v; }
+        if let Some(v) = &o.authentication_methods { cfg.authentication_methods = v.clone(); }
     }
 }
 
@@ -458,9 +465,11 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "loglevel" | "log_level" => o.log_level = Some(value.to_string()),
         "hostbasedauthentication" | "hostbased_auth" => o.hostbased_auth = Some(value == "yes"),
         "ignorerhosts" | "ignore_rhosts" => o.ignore_rhosts = Some(value == "yes"),
+        "authenticationmethods" | "authentication_methods" => {
+            o.authentication_methods = Some(parse_authentication_methods(value));
+        }
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
-        "authenticationmethods" | "authentication_methods"
-        | "authorizedprincipalsfile" | "authorized_principals_file"
+        "authorizedprincipalsfile" | "authorized_principals_file"
         | "casignaturealgorithms" | "ca_signature_algorithms"
         | "channeltimeout" | "channel_timeout"
         | "exposeauthinfo" | "expose_auth_info"
@@ -586,6 +595,23 @@ fn parse_time_suffix(tok: &str) -> Option<u64> {
         _ => return None,
     };
     digits.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+/// Parse an OpenSSH `AuthenticationMethods` value. Whitespace separates
+/// alternative chains; each chain is a comma-separated ordered list of steps.
+/// e.g. `publickey,password publickey,keyboard-interactive`.
+pub fn parse_authentication_methods(value: &str) -> Vec<Vec<String>> {
+    value
+        .split_whitespace()
+        .map(|chain| {
+            chain
+                .split(',')
+                .map(|m| m.trim().to_ascii_lowercase())
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<String>>()
+        })
+        .filter(|chain| !chain.is_empty())
+        .collect()
 }
 
 /// OpenSSH default `PubkeyAcceptedAlgorithms` base list for sshd. Matches the
@@ -746,6 +772,7 @@ impl Default for ServerConfig {
             force_command: None,
             strict_modes: default_true(),
             required_rsa_size: default_required_rsa_size(),
+            authentication_methods: Vec::new(),
             permit_tty: default_true(),
             permit_empty_passwords: false,
             ignore_rhosts: default_true(),
@@ -1186,8 +1213,7 @@ impl ServerConfig {
                 // Known OpenSSH directives accepted but not enforced. Accepting
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
-                "authenticationmethods" | "authentication_methods"
-                | "authorizedprincipalsfile" | "authorized_principals_file"
+                "authorizedprincipalsfile" | "authorized_principals_file"
                 | "authorizedprincipalscommand" | "authorized_principals_command"
                 | "authorizedprincipalscommanduser" | "authorized_principals_command_user"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
@@ -1228,6 +1254,9 @@ impl ServerConfig {
                     if let Ok(v) = value.parse().map(|v: u32| v.max(1024)) {
                         config.required_rsa_size = v;
                     }
+                }
+                "authenticationmethods" | "authentication_methods" => {
+                    config.authentication_methods = parse_authentication_methods(value);
                 }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",
@@ -1417,6 +1446,35 @@ Match All
              TrustedUserCAKeys /tmp/ca.pub\n\
              ChannelTimeout session=5m\n"
         ).is_ok());
+    }
+
+    #[test]
+    fn authentication_methods_is_parsed() {
+        let c = ServerConfig::parse(
+            "AuthenticationMethods publickey,password publickey,keyboard-interactive\n",
+        ).unwrap();
+        assert_eq!(
+            c.authentication_methods,
+            vec![
+                vec!["publickey".to_string(), "password".to_string()],
+                vec!["publickey".to_string(), "keyboard-interactive".to_string()],
+            ]
+        );
+        // Unset: enforcement disabled.
+        let c = ServerConfig::parse("").unwrap();
+        assert!(c.authentication_methods.is_empty());
+        // A Match block may override it for a user.
+        let cfg = ServerConfig::parse(
+            "AuthenticationMethods publickey\n\
+             Match User alice\n    AuthenticationMethods publickey,password\n",
+        ).unwrap();
+        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        assert_eq!(
+            r.authentication_methods,
+            vec![vec!["publickey".to_string(), "password".to_string()]]
+        );
+        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        assert_eq!(r.authentication_methods, vec![vec!["publickey".to_string()]]);
     }
 
     #[test]

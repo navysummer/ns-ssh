@@ -1843,3 +1843,88 @@ fn x11_forwarding_round_trip() {
     let _ = server.wait_with_output();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// AuthenticationMethods: a multi-step chain must be enforced. A client that
+/// only completes the first step is rejected, while a single-step chain still
+/// logs in.
+#[test]
+fn authentication_methods_chain_is_enforced() {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    // publickey,password: publickey alone must no longer authenticate.
+    let dir = temp_dir("authmethods-chain");
+    let port = free_port();
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            "passwordauthentication=yes",
+            "-o",
+            "authenticationmethods=publickey,password",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("echo hello")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !output.status.success(),
+        "pubkey-only auth must be rejected when AuthenticationMethods requires \
+         publickey,password; stdout={:?} stderr={:?} server_stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("hello"),
+        "rejected client must not run the remote command"
+    );
+
+    // A single-step chain is satisfied by publickey alone and must succeed.
+    let dir = temp_dir("authmethods-single");
+    let port = free_port();
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &["-o", "authenticationmethods=publickey"],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("echo hello")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "single-step AuthenticationMethods=publickey must succeed: status={:?} \
+         stdout={:?} stderr={:?} server_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello"),
+        "expected 'hello' in stdout, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

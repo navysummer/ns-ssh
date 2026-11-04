@@ -168,6 +168,9 @@ fn main() {
                         config.required_rsa_size = v.max(1024);
                     }
                 }
+                "authenticationmethods" | "authentication_methods" => {
+                    config.authentication_methods = config::parse_authentication_methods(value);
+                }
                 "permittty" | "permit_tty" => {
                     config.permit_tty = value == "yes";
                 }

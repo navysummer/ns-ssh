@@ -468,6 +468,120 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Outcome of evaluating `AuthenticationMethods` against the methods already
+/// completed on this connection.
+enum AuthStep {
+    /// No chain is configured, or the current chain is fully satisfied.
+    Complete,
+    /// The client must still complete one of these methods next.
+    Continue(Vec<String>),
+    /// The completed sequence matches none of the configured chains.
+    Invalid,
+}
+
+/// Advance the authentication state machine. `required` holds the alternative
+/// chains from `AuthenticationMethods` (empty = enforcement disabled), and
+/// `done` the methods that have already succeeded in order.
+fn next_auth_step(required: &[Vec<String>], done: &[String]) -> AuthStep {
+    if required.is_empty() {
+        return AuthStep::Complete;
+    }
+    if done.is_empty() {
+        // Every chain is still reachable; the client may pick any first step.
+        let mut firsts: Vec<String> = Vec::new();
+        for chain in required {
+            if let Some(first) = chain.first() {
+                if !firsts.contains(first) {
+                    firsts.push(first.clone());
+                }
+            }
+        }
+        return AuthStep::Continue(firsts);
+    }
+    for chain in required {
+        if done.len() <= chain.len() && done.iter().zip(chain.iter()).all(|(a, b)| a == b) {
+            return if done.len() == chain.len() {
+                AuthStep::Complete
+            } else {
+                AuthStep::Continue(vec![chain[done.len()].clone()])
+            };
+        }
+    }
+    AuthStep::Invalid
+}
+
+/// Methods this server has enabled, in the order OpenSSH advertises them.
+fn enabled_auth_methods(config: &ServerConfig) -> Vec<String> {
+    let mut methods = Vec::new();
+    if config.pubkey_auth { methods.push("publickey".to_string()); }
+    if config.password_auth { methods.push("password".to_string()); }
+    if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
+    methods
+}
+
+/// Build the method list and `partial success` flag for a USERAUTH_FAILURE
+/// response. With `AuthenticationMethods` configured only the next required
+/// step is advertised; `partial` is set once a step has already completed.
+fn failure_methods(
+    config: &ServerConfig,
+    completed: &[String],
+    default_methods: Vec<String>,
+) -> (Vec<String>, bool) {
+    if config.authentication_methods.is_empty() {
+        return (default_methods, false);
+    }
+    match next_auth_step(&config.authentication_methods, completed) {
+        AuthStep::Continue(methods) => (methods, !completed.is_empty()),
+        _ => (Vec::new(), false),
+    }
+}
+
+async fn send_auth_failure(
+    stream: &mut TcpStream,
+    transport: &mut SshTransport,
+    aead: bool,
+    methods: Vec<String>,
+    partial: bool,
+) -> Result<()> {
+    let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
+    SshNameList(methods).encode(&mut failure)?;
+    // RFC 4252 §5.1: TRUE means the previous request partially succeeded.
+    failure.push(if partial { 1 } else { 0 });
+    send_encrypted_packet_server(stream, &failure, transport, false, aead).await?;
+    Ok(())
+}
+
+/// Record a successful authentication step and reply to the client: either
+/// USERAUTH_SUCCESS when the configured chain is complete, or a partial
+/// success failure naming the next required step. Returns `true` when the
+/// user is fully authenticated.
+async fn complete_auth_step(
+    stream: &mut TcpStream,
+    transport: &mut SshTransport,
+    aead: bool,
+    config: &ServerConfig,
+    completed: &mut Vec<String>,
+    method: &str,
+) -> Result<bool> {
+    completed.push(method.to_string());
+    match next_auth_step(&config.authentication_methods, completed) {
+        AuthStep::Complete => {
+            let success = vec![msg::SSH_MSG_USERAUTH_SUCCESS];
+            send_encrypted_packet_server(stream, &success, transport, false, aead).await?;
+            Ok(true)
+        }
+        AuthStep::Continue(remaining) => {
+            send_auth_failure(stream, transport, aead, remaining, true).await?;
+            Ok(false)
+        }
+        AuthStep::Invalid => {
+            // The method succeeded but breaks every configured chain.
+            send_auth_failure(stream, transport, aead, Vec::new(), false).await?;
+            Ok(false)
+        }
+    }
+}
+
 async fn handle_authenticated_session(
     mut stream: TcpStream,
     mut transport: SshTransport,
@@ -517,6 +631,8 @@ async fn handle_authenticated_session(
     let mut auth_tries = 0;
     let mut pending_kbd_user: Option<String> = None;
     let mut auth_key_options: Option<crate::auth::AuthorizedKeyOptions> = None;
+    // Methods successfully completed so far, in order, for AuthenticationMethods.
+    let mut completed_methods: Vec<String> = Vec::new();
 
     while auth_tries < config.max_auth_tries {
         let auth_request = if config.login_grace_time > 0 {
@@ -551,19 +667,24 @@ async fn handle_authenticated_session(
                     && config.password_auth
                     && auth.lock().await.verify_password(&current_user, &answer)
                 {
-                    let success = vec![msg::SSH_MSG_USERAUTH_SUCCESS];
-                    send_encrypted_packet_server(&mut stream, &success, &mut transport, false, aead).await?;
-                    authenticated = true;
-                    break;
+                    if complete_auth_step(
+                        &mut stream,
+                        &mut transport,
+                        aead,
+                        &config,
+                        &mut completed_methods,
+                        "keyboard-interactive",
+                    ).await? {
+                        authenticated = true;
+                        break;
+                    }
                 } else {
-                    let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                    let mut methods = Vec::new();
-                    if config.pubkey_auth { methods.push("publickey".to_string()); }
-                    if config.password_auth { methods.push("password".to_string()); }
-                    if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                    SshNameList(methods).encode(&mut failure)?;
-                    failure.push(0);
-                    send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                    let (methods, partial) = failure_methods(
+                        &config,
+                        &completed_methods,
+                        enabled_auth_methods(&config),
+                    );
+                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                     if config.auth_failure_delay > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                     }
@@ -581,12 +702,12 @@ async fn handle_authenticated_session(
                 config = base_config.resolve_for_match(&username, &groups, &match_host, &match_addr);
 
                 if !crate::auth::check_user_authorized(&username, &match_host, &config.allow_users, &config.deny_users) {
-                    let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                    let mut methods = vec!["publickey".to_string(), "password".to_string()];
-                    if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                    SshNameList(methods).encode(&mut failure)?;
-                    failure.push(0);
-                    send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                    let (methods, partial) = failure_methods(
+                        &config,
+                        &completed_methods,
+                        enabled_auth_methods(&config),
+                    );
+                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                     auth_tries += 1;
                     if config.auth_failure_delay > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
@@ -618,12 +739,12 @@ async fn handle_authenticated_session(
                     && !root_password_ok
                     && (method == "password" || method == "keyboard-interactive")
                 {
-                    let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                    let mut methods = Vec::new();
-                    if config.pubkey_auth { methods.push("publickey".to_string()); }
-                    SshNameList(methods).encode(&mut failure)?;
-                    failure.push(0);
-                    send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                    let (methods, partial) = failure_methods(
+                        &config,
+                        &completed_methods,
+                        vec!["publickey".to_string()],
+                    );
+                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                     auth_tries += 1;
                     continue;
                 }
@@ -639,6 +760,28 @@ async fn handle_authenticated_session(
                     continue;
                 }
 
+                // AuthenticationMethods: reject any method that is not the next
+                // required step, and advertise the expected step instead.
+                if !config.authentication_methods.is_empty() && method != "none" {
+                    let next = match next_auth_step(&config.authentication_methods, &completed_methods) {
+                        AuthStep::Continue(next) => next,
+                        AuthStep::Complete | AuthStep::Invalid => Vec::new(),
+                    };
+                    if !next.iter().any(|m| m == &method) {
+                        let (methods, partial) = failure_methods(
+                            &config,
+                            &completed_methods,
+                            enabled_auth_methods(&config),
+                        );
+                        send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                        auth_tries += 1;
+                        if config.auth_failure_delay > 0 {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                        }
+                        continue;
+                    }
+                }
+
                 match method.as_str() {
                     "publickey" => {
                         let has_sig = bool::decode(&mut r)?;
@@ -649,13 +792,12 @@ async fn handle_authenticated_session(
                         // that are not in the server's allowed set.
                         if let Some(ref accepted) = config.pubkey_accepted_algorithms {
                             if !crate::config::pubkey_alg_accepted_server(&key_type, accepted) {
-                                let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                                let mut methods = vec!["publickey".to_string()];
-                                if config.password_auth { methods.push("password".to_string()); }
-                                if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                                SshNameList(methods).encode(&mut failure)?;
-                                failure.push(0);
-                                send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                                let (methods, partial) = failure_methods(
+                                    &config,
+                                    &completed_methods,
+                                    enabled_auth_methods(&config),
+                                );
+                                send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                                 if config.auth_failure_delay > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                                 }
@@ -677,13 +819,12 @@ async fn handle_authenticated_session(
                                         let peer_addr = peer_addr.to_string();
                                         if !g.check_from_pattern(entry, &peer_addr) {
                                             drop(g);
-                                            let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                                            let mut methods = vec!["publickey".to_string()];
-                                            if config.password_auth { methods.push("password".to_string()); }
-                                            if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                                            SshNameList(methods).encode(&mut failure)?;
-                                            failure.push(0);
-                                            send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                                            let (methods, partial) = failure_methods(
+                                                &config,
+                                                &completed_methods,
+                                                enabled_auth_methods(&config),
+                                            );
+                                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                                             if config.auth_failure_delay > 0 {
                                                 tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                                             }
@@ -694,18 +835,24 @@ async fn handle_authenticated_session(
                                     auth_key_options = Some(entry.options.clone());
                                 }
                                 drop(g);
-                                let success = vec![msg::SSH_MSG_USERAUTH_SUCCESS];
-                                send_encrypted_packet_server(&mut stream, &success, &mut transport, false, aead).await?;
-                                authenticated = true;
-                                break;
+                                if complete_auth_step(
+                                    &mut stream,
+                                    &mut transport,
+                                    aead,
+                                    &config,
+                                    &mut completed_methods,
+                                    "publickey",
+                                ).await? {
+                                    authenticated = true;
+                                    break;
+                                }
                             } else {
-                                let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                                let mut methods = vec!["publickey".to_string()];
-                                if config.password_auth { methods.push("password".to_string()); }
-                                if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                                SshNameList(methods).encode(&mut failure)?;
-                                failure.push(0);
-                                send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                                let (methods, partial) = failure_methods(
+                                    &config,
+                                    &completed_methods,
+                                    enabled_auth_methods(&config),
+                                );
+                                send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                                 if config.auth_failure_delay > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                                 }
@@ -717,13 +864,12 @@ async fn handle_authenticated_session(
                                 SshBytes(public_key).encode(&mut pk_ok)?;
                                 send_encrypted_packet_server(&mut stream, &pk_ok, &mut transport, false, aead).await?;
                             } else {
-                                let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                                let mut methods = vec!["publickey".to_string()];
-                                if config.password_auth { methods.push("password".to_string()); }
-                                if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                                SshNameList(methods).encode(&mut failure)?;
-                                failure.push(0);
-                                send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                                let (methods, partial) = failure_methods(
+                                    &config,
+                                    &completed_methods,
+                                    enabled_auth_methods(&config),
+                                );
+                                send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                                 if config.auth_failure_delay > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                                 }
@@ -738,21 +884,30 @@ async fn handle_authenticated_session(
                         let empty_ok = config.permit_empty_passwords || !password.is_empty();
                         if config.password_auth && empty_ok
                             && auth.lock().await.verify_password(&username, &password) {
-                            let success = vec![msg::SSH_MSG_USERAUTH_SUCCESS];
-                            send_encrypted_packet_server(&mut stream, &success, &mut transport, false, aead).await?;
                             if config.print_last_log {
                                 tracing::info!("Accepted password for {} from {}", username, match_addr);
                             }
-                            authenticated = true;
-                            break;
+                            if complete_auth_step(
+                                &mut stream,
+                                &mut transport,
+                                aead,
+                                &config,
+                                &mut completed_methods,
+                                "password",
+                            ).await? {
+                                authenticated = true;
+                                break;
+                            }
                         } else {
-                            let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                            let mut methods = vec!["password".to_string()];
-                            if config.pubkey_auth { methods.insert(0, "publickey".to_string()); }
-                            if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                            SshNameList(methods).encode(&mut failure)?;
-                            failure.push(0);
-                            send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                            let mut default_methods = vec!["password".to_string()];
+                            if config.pubkey_auth { default_methods.insert(0, "publickey".to_string()); }
+                            if config.kbd_interactive_auth { default_methods.push("keyboard-interactive".to_string()); }
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                default_methods,
+                            );
+                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                             if config.auth_failure_delay > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                             }
@@ -763,13 +918,12 @@ async fn handle_authenticated_session(
                         let _submethods = SshString::decode(&mut r)?.as_str()?.to_string();
 
                         if !config.kbd_interactive_auth {
-                            let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                            let mut methods = Vec::new();
-                            if config.pubkey_auth { methods.push("publickey".to_string()); }
-                            if config.password_auth { methods.push("password".to_string()); }
-                            SshNameList(methods).encode(&mut failure)?;
-                            failure.push(0);
-                            send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                enabled_auth_methods(&config),
+                            );
+                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                             continue;
                         }
 
@@ -784,29 +938,20 @@ async fn handle_authenticated_session(
                         send_encrypted_packet_server(&mut stream, &info_req, &mut transport, false, aead).await?;
                     }
                     "none" => {
-                        let mut methods = Vec::new();
-                        if config.pubkey_auth {
-                            methods.push("publickey".to_string());
-                        }
-                        if config.password_auth {
-                            methods.push("password".to_string());
-                        }
-                        if config.kbd_interactive_auth {
-                            methods.push("keyboard-interactive".to_string());
-                        }
-                        let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                        SshNameList(methods).encode(&mut failure)?;
-                        failure.push(0);
-                        send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                        let (methods, partial) = failure_methods(
+                            &config,
+                            &completed_methods,
+                            enabled_auth_methods(&config),
+                        );
+                        send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                     }
                     _ => {
-                        let mut failure = vec![msg::SSH_MSG_USERAUTH_FAILURE];
-                        let mut methods = vec!["publickey".to_string()];
-                        if config.password_auth { methods.push("password".to_string()); }
-                        if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
-                        SshNameList(methods).encode(&mut failure)?;
-                        failure.push(0);
-                        send_encrypted_packet_server(&mut stream, &failure, &mut transport, false, aead).await?;
+                        let (methods, partial) = failure_methods(
+                            &config,
+                            &completed_methods,
+                            enabled_auth_methods(&config),
+                        );
+                        send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
                     }
                 }
             }
@@ -3849,4 +3994,80 @@ async fn perform_rekey_server(
     transport.last_rekey_bytes = transport.total_bytes();
     transport.last_rekey_instant = std::time::Instant::now();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(steps: &[&str]) -> Vec<String> {
+        steps.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn auth_step_without_configuration_is_complete() {
+        let done: Vec<String> = Vec::new();
+        assert!(matches!(next_auth_step(&[], &done), AuthStep::Complete));
+    }
+
+    #[test]
+    fn auth_step_first_step_offers_every_chain_head() {
+        let required = vec![chain(&["publickey", "password"]), chain(&["password", "publickey"])];
+        match next_auth_step(&required, &[]) {
+            AuthStep::Continue(m) => assert_eq!(m, vec!["publickey", "password"]),
+            _ => panic!("expected Continue"),
+        }
+    }
+
+    #[test]
+    fn auth_step_advances_through_chain() {
+        let required = vec![chain(&["publickey", "password"])];
+        match next_auth_step(&required, &chain(&["publickey"])) {
+            AuthStep::Continue(m) => assert_eq!(m, vec!["password"]),
+            _ => panic!("expected Continue"),
+        }
+        assert!(matches!(
+            next_auth_step(&required, &chain(&["publickey", "password"])),
+            AuthStep::Complete
+        ));
+    }
+
+    #[test]
+    fn auth_step_rejects_out_of_order_sequence() {
+        let required = vec![chain(&["publickey", "password"])];
+        assert!(matches!(
+            next_auth_step(&required, &chain(&["password"])),
+            AuthStep::Invalid
+        ));
+        assert!(matches!(
+            next_auth_step(&required, &chain(&["publickey", "publickey"])),
+            AuthStep::Invalid
+        ));
+    }
+
+    #[test]
+    fn auth_step_supports_repeated_methods() {
+        let required = vec![chain(&["publickey", "publickey"])];
+        match next_auth_step(&required, &chain(&["publickey"])) {
+            AuthStep::Continue(m) => assert_eq!(m, vec!["publickey"]),
+            _ => panic!("expected Continue"),
+        }
+        assert!(matches!(
+            next_auth_step(&required, &chain(&["publickey", "publickey"])),
+            AuthStep::Complete
+        ));
+    }
+
+    #[test]
+    fn failure_advertises_next_step_with_partial_flag() {
+        let mut config = ServerConfig::default();
+        config.authentication_methods = vec![chain(&["publickey", "password"])];
+        let (methods, partial) = failure_methods(&config, &chain(&["publickey"]), Vec::new());
+        assert_eq!(methods, vec!["password"]);
+        assert!(partial);
+        // First step: no partial success yet.
+        let (methods, partial) = failure_methods(&config, &[], Vec::new());
+        assert_eq!(methods, vec!["publickey"]);
+        assert!(!partial);
+    }
 }
