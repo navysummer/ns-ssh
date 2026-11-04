@@ -409,7 +409,8 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "permitrootlogin" | "permit_root_login" => o.permit_root_login_mode = Some(value.to_lowercase()),
         "passwordauthentication" | "password_auth" => o.password_auth = Some(value == "yes"),
         "pubkeyauthentication" | "pubkey_auth" => o.pubkey_auth = Some(value == "yes"),
-        "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth" => {
+        "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
+        | "challengeresponseauthentication" | "challenge_response_authentication" => {
             o.kbd_interactive_auth = Some(value == "yes");
         }
         "allowtcpforwarding" | "allow_tcp_forwarding" => {
@@ -1115,7 +1116,8 @@ impl ServerConfig {
                 "passwordauthentication" | "password_auth" => {
                     config.password_auth = value == "yes";
                 }
-                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth" => {
+                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
+                | "challengeresponseauthentication" | "challenge_response_authentication" => {
                     config.kbd_interactive_auth = value == "yes";
                 }
                 "pubkeyauthentication" | "pubkey_auth" => {
@@ -1346,7 +1348,9 @@ impl ServerConfig {
                 | "trustedusercakeys" | "trusted_user_ca_keys"
                 | "unusedconnectiontimeout" | "unused_connection_timeout"
                 | "versionaddendum" | "version_addendum"
-                | "xauthlocation" | "xauth_location" => {
+                | "xauthlocation" | "xauth_location"
+                // Deprecated OpenSSH aliases: accepted and ignored.
+                | "rsaauthentication" | "rhostsrsaauthentication" => {
                     // Accepted; not enforced.
                 }
                 "requiredrsasize" | "required_rsa_size" => {
@@ -1644,6 +1648,18 @@ Match All
         // Regression: the accept list used to spell it `sshdssessionpath`,
         // so the real directive name was rejected as unknown.
         let c = ServerConfig::parse("SshdSessionPath /usr/lib/ssh/sshd-session\n").unwrap();
+        assert_eq!(c.port, default_port());
+    }
+
+    #[test]
+    fn legacy_authentication_aliases_are_accepted() {
+        let c = ServerConfig::parse("ChallengeResponseAuthentication no\n").unwrap();
+        assert!(!c.kbd_interactive_auth);
+        // Deprecated no-ops must not abort parsing.
+        let c = ServerConfig::parse(
+            "RSAAuthentication no\nRhostsRSAAuthentication no\n",
+        )
+        .unwrap();
         assert_eq!(c.port, default_port());
     }
 }

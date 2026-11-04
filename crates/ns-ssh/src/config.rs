@@ -787,7 +787,8 @@ impl SshConfig {
                 "passwordauthentication" | "password_authentication" => password_authentication = Some(yes(value)),
                 "pubkeyauthentication" | "pubkey_authentication" => pubkey_authentication = Some(yes(value)),
                 "kbdinteractiveauthentication" | "kbd_interactive_authentication"
-                    | "challenge-response-authentication" => kbd_interactive_authentication = Some(yes(value)),
+                    | "challengeresponseauthentication" | "challenge-response-authentication"
+                    => kbd_interactive_authentication = Some(yes(value)),
                 "preferredauthentications" | "preferred_authentications" => preferred_authentications = Some(value.to_string()),
                 "hostkeyalgorithms" | "host_key_algorithms" => host_key_algorithms = Some(value.to_string()),
                 "kexalgorithms" | "kex_algorithms" => kex_algorithms = Some(value.to_string()),
@@ -876,7 +877,10 @@ impl SshConfig {
                 | "forwardx11trusted" | "forward_x11_trusted"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
-                | "usekeychain" | "use_keychain" => {
+                | "usekeychain" | "use_keychain"
+                // Deprecated OpenSSH aliases: accepted and ignored, matching
+                // OpenSSH's "Deprecated option" behaviour.
+                | "rsaauthentication" | "rhostsrsaauthentication" => {
                     // Accepted; not enforced.
                 }
                 "requiredrsasize" | "required_rsa_size" => {
@@ -1591,5 +1595,25 @@ mod tests {
         let cfg = SshConfig::parse("Host foo\n  RequiredRSASize 3072\n").unwrap();
         let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
         assert_eq!(host.required_rsa_size, Some(3072));
+    }
+
+    #[test]
+    fn legacy_authentication_aliases_are_accepted() {
+        // ChallengeResponseAuthentication is OpenSSH's deprecated spelling of
+        // KbdInteractiveAuthentication and is still honored.
+        let cfg = SshConfig::parse(
+            "Host foo\n  ChallengeResponseAuthentication no\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.kbd_interactive_authentication, Some(false));
+
+        // RSAAuthentication / RhostsRSAAuthentication are deprecated no-ops
+        // but must not abort config parsing.
+        let cfg = SshConfig::parse(
+            "Host foo\n  RSAAuthentication no\n  RhostsRSAAuthentication no\n",
+        )
+        .unwrap();
+        assert!(cfg.hosts.iter().any(|h| h.host == "foo"));
     }
 

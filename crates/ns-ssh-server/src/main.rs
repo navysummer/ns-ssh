@@ -88,7 +88,8 @@ fn main() {
                 "passwordauthentication" | "password_auth" => {
                     config.password_auth = value == "yes";
                 }
-                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth" => {
+                "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
+                | "challengeresponseauthentication" | "challenge_response_authentication" => {
                     config.kbd_interactive_auth = value == "yes";
                 }
                 "pubkeyauthentication" | "pubkey_auth" => {

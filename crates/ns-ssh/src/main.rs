@@ -2157,7 +2157,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "batchmode" | "batch_mode" => resolved.batch_mode = value != "no",
         "passwordauthentication" | "password_authentication" => resolved.password_authentication = value != "no",
         "pubkeyauthentication" | "pubkey_authentication" => resolved.pubkey_authentication = value != "no",
-        "kbdinteractiveauthentication" | "kbd_interactive_authentication" => resolved.kbd_interactive_authentication = value != "no",
+        "kbdinteractiveauthentication" | "kbd_interactive_authentication"
+            | "challengeresponseauthentication" | "challenge_response_authentication" =>
+            resolved.kbd_interactive_authentication = value != "no",
         "preferredauthentications" | "preferred_authentications" => {
             resolved.preferred_authentications = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
         }
