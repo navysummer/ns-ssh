@@ -681,7 +681,7 @@ fn run_scp_mode() -> i32 {
 
     // Build config from ssh options (used for hostname/user via -o and ~/.ssh/config).
     let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
-    let mut base = ResolvedConfig::default_for_user(&default_user);
+    let base = ResolvedConfig::default_for_user(&default_user);
 
     // Decide direction. Standard scp semantics:
     //   scp local remote           → upload   (target is remote)
@@ -1129,7 +1129,13 @@ fn keygen_generate(key_type: &str, path: &str, bits: Option<u32>) -> i32 {
         "ecdsa" | "ecdsa-sha2-nistp256" => {
             let key = ssh_core::hostkey::EcdsaP256HostKey::generate().expect("generate");
             let secret = key.secret_bytes();
-            let content = ssh_core::keygen::format_openssh_ecdsa(&secret);
+            let content = match ssh_core::keygen::format_openssh_ecdsa(&secret) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ssh-keygen: {}", e);
+                    return 1;
+                }
+            };
             if let Err(e) = ssh_core::keygen::write_private_key(std::path::Path::new(path), &content) {
                 eprintln!("ssh-keygen: write {}: {}", path, e);
                 return 1;
@@ -1416,7 +1422,6 @@ fn fingerprint_kind(alg: &str) -> &'static str {
 
 /// `ssh-add` mode: add private keys to the SSH agent, list, or remove all.
 fn run_ssh_add_mode() -> i32 {
-    use ssh_core::hostkey::HostKeySigner;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut list_fingerprints = false;
     let mut list_keys = false;
@@ -1765,6 +1770,19 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(ref ia) = host_config.identity_agent {
                 resolved.identity_agent = if ia == "none" { None } else { Some(ia.clone()) };
             }
+            if let Some(ref af) = host_config.address_family {
+                match af.to_ascii_lowercase().as_str() {
+                    "inet" => { resolved.prefer_ipv4 = true; resolved.prefer_ipv6 = false; }
+                    "inet6" => { resolved.prefer_ipv6 = true; resolved.prefer_ipv4 = false; }
+                    _ => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = false; }
+                }
+            }
+            if let Some(ref ec) = host_config.escape_char {
+                resolved.escape_char = ec.clone();
+            }
+            if let Some(ref sub) = host_config.subsystem {
+                resolved.subsystem = Some(sub.clone());
+            }
             if let Some(ref paa) = host_config.pubkey_accepted_algorithms {
                 resolved.pubkey_accepted_algorithms = Some(config::resolve_pubkey_algorithms(paa));
             }
@@ -1846,6 +1864,37 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = host_config.no_host_authentication_for_localhost {
                 resolved.no_host_authentication_for_localhost = v;
+            }
+            if let Some(ref v) = host_config.control_master {
+                match v.to_ascii_lowercase().as_str() {
+                    "yes" => { resolved.control_master = true; resolved.control_master_auto = false; }
+                    "auto" => { resolved.control_master = true; resolved.control_master_auto = true; }
+                    _ => { resolved.control_master = false; resolved.control_master_auto = false; }
+                }
+            }
+            if let Some(ref p) = host_config.control_path {
+                resolved.control_path = Some(p.clone());
+            }
+            if let Some(ref p) = host_config.control_persist {
+                if p.to_ascii_lowercase() != "no" {
+                    if let Some(v) = config::parse_time_suffix(p) {
+                        resolved.control_persist = Some(v as u32);
+                    }
+                } else {
+                    resolved.control_persist = None;
+                }
+            }
+            if let Some(v) = host_config.gateway_ports {
+                resolved.gateway_ports = v;
+            }
+            if let Some(v) = host_config.clear_all_forwardings {
+                if v {
+                    resolved.local_forwards.clear();
+                    resolved.remote_forwards.clear();
+                    resolved.dynamic_forwards.clear();
+                    resolved.local_streamlocal.clear();
+                    resolved.remote_streamlocal.clear();
+                }
             }
         }
 
@@ -1947,6 +1996,19 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(ref ia) = mc.identity_agent {
                 resolved.identity_agent = if ia == "none" { None } else { Some(ia.clone()) };
+            }
+            if let Some(ref af) = mc.address_family {
+                match af.to_ascii_lowercase().as_str() {
+                    "inet" => { resolved.prefer_ipv4 = true; resolved.prefer_ipv6 = false; }
+                    "inet6" => { resolved.prefer_ipv6 = true; resolved.prefer_ipv4 = false; }
+                    _ => { resolved.prefer_ipv4 = false; resolved.prefer_ipv6 = false; }
+                }
+            }
+            if let Some(ref ec) = mc.escape_char {
+                resolved.escape_char = ec.clone();
+            }
+            if let Some(ref sub) = mc.subsystem {
+                resolved.subsystem = Some(sub.clone());
             }
             if let Some(ref paa) = mc.pubkey_accepted_algorithms {
                 resolved.pubkey_accepted_algorithms = Some(config::resolve_pubkey_algorithms(paa));

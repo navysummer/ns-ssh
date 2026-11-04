@@ -219,6 +219,26 @@ pub struct ServerConfig {
     #[serde(default)]
     pub authorized_keys_command_user: Option<String>,
 
+    /// AddressFamily: any/inet/inet6 (default any).
+    #[serde(default)]
+    pub address_family: Option<String>,
+
+    /// FingerprintHash: md5 or sha256 (default sha256).
+    #[serde(default)]
+    pub fingerprint_hash: Option<String>,
+
+    /// PermitTunnel: allow tun device forwarding (default no).
+    #[serde(default)]
+    pub permit_tunnel: bool,
+
+    /// IgnoreUserKnownHosts: skip user's known_hosts file (default no).
+    #[serde(default)]
+    pub ignore_user_known_hosts: bool,
+
+    /// DisableForwarding: disable all TCP/Unix/X11/agent forwarding (default no).
+    #[serde(default)]
+    pub disable_forwarding: bool,
+
     /// Match blocks from sshd_config, evaluated per-connection.
     #[serde(skip, default)]
     pub match_blocks: Vec<ServerMatch>,
@@ -728,6 +748,11 @@ impl Default for ServerConfig {
             print_motd: true,
             authorized_keys_command: None,
             authorized_keys_command_user: None,
+            address_family: None,
+            fingerprint_hash: None,
+            permit_tunnel: false,
+            ignore_user_known_hosts: false,
+            disable_forwarding: false,
             match_blocks: Vec::new(),
         }
     }
@@ -1114,6 +1139,25 @@ impl ServerConfig {
                 }
                 "usepam" | "use_pam" => {
                     // PAM authentication is not implemented; accept the directive silently.
+                }
+                "addressfamily" | "address_family" => {
+                    config.address_family = Some(value.to_string());
+                }
+                "fingerprinthash" | "fingerprint_hash" => {
+                    config.fingerprint_hash = Some(value.to_string());
+                }
+                "permittunnel" | "permit_tunnel" => {
+                    config.permit_tunnel = value == "yes";
+                }
+                "ignoreuserknownhosts" | "ignore_user_known_hosts" => {
+                    config.ignore_user_known_hosts = value == "yes";
+                }
+                "disableforwarding" | "disable_forwarding" => {
+                    config.disable_forwarding = value == "yes";
+                }
+                "logverbose" | "log_verbose" => {
+                    // OpenSSH: LogVerbose = LogLevel VERBOSE
+                    config.log_level = Some("VERBOSE".to_string());
                 }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",

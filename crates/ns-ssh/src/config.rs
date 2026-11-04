@@ -159,6 +159,18 @@ pub struct HostConfig {
     pub identity_agent: Option<String>,
     #[serde(default)]
     pub pubkey_accepted_algorithms: Option<String>,
+    #[serde(default)]
+    /// ControlMaster: "yes", "no", or "auto" (auto = only as master if no existing socket).
+    pub control_master: Option<String>,
+    #[serde(default)]
+    pub control_path: Option<String>,
+    #[serde(default)]
+    /// ControlPersist: "no" or seconds (OpenSSH also accepts time suffixes like "10m").
+    pub control_persist: Option<String>,
+    #[serde(default)]
+    pub gateway_ports: Option<bool>,
+    #[serde(default)]
+    pub clear_all_forwardings: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +574,11 @@ impl SshConfig {
         let mut rekey_limit = None;
         let mut identity_agent = None;
         let mut pubkey_accepted_algorithms = None;
+        let mut control_master = None;
+        let mut control_path = None;
+        let mut control_persist = None;
+        let mut gateway_ports = None;
+        let mut clear_all_forwardings = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -638,6 +655,11 @@ impl SshConfig {
                              rekey_limit: rekey_limit.take(),
                              identity_agent: identity_agent.take(),
                              pubkey_accepted_algorithms: pubkey_accepted_algorithms.take(),
+                             control_master: control_master.take(),
+                             control_path: control_path.take(),
+                             control_persist: control_persist.take(),
+                             gateway_ports: gateway_ports.take(),
+                             clear_all_forwardings: clear_all_forwardings.take(),
                          });
                     }
                     current_host = Some(value.to_string());
@@ -701,6 +723,11 @@ impl SshConfig {
                              rekey_limit: rekey_limit.take(),
                              identity_agent: identity_agent.take(),
                              pubkey_accepted_algorithms: pubkey_accepted_algorithms.take(),
+                             control_master: control_master.take(),
+                             control_path: control_path.take(),
+                             control_persist: control_persist.take(),
+                             gateway_ports: gateway_ports.take(),
+                             clear_all_forwardings: clear_all_forwardings.take(),
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
@@ -787,6 +814,11 @@ impl SshConfig {
                 "pubkeyacceptedalgorithms" | "pubkey_accepted_algorithms" | "pubkeyacceptedkeytypes" => {
                     pubkey_accepted_algorithms = Some(value.to_string());
                 }
+                "controlmaster" | "control_master" => control_master = Some(value.to_string()),
+                "controlpath" | "control_path" => control_path = Some(value.to_string()),
+                "controlpersist" | "control_persist" => control_persist = Some(value.to_string()),
+                "gatewayports" | "gateway_ports" => gateway_ports = Some(yes(value)),
+                "clearallforwardings" | "clear_all_forwardings" => clear_all_forwardings = Some(yes(value)),
                 "include" => { /* ignored */ }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",
@@ -853,6 +885,11 @@ impl SshConfig {
                 rekey_limit: rekey_limit.clone(),
                 identity_agent: identity_agent.clone(),
                 pubkey_accepted_algorithms: pubkey_accepted_algorithms.clone(),
+                control_master: control_master.clone(),
+                control_path: control_path.clone(),
+                control_persist: control_persist.clone(),
+                gateway_ports,
+                clear_all_forwardings,
             });
         }
 
@@ -916,6 +953,11 @@ impl SshConfig {
                     rekey_limit: rekey_limit.clone(),
                     identity_agent: identity_agent.clone(),
                     pubkey_accepted_algorithms: pubkey_accepted_algorithms.clone(),
+                    control_master: control_master.clone(),
+                    control_path: control_path.clone(),
+                    control_persist: control_persist.clone(),
+                    gateway_ports,
+                    clear_all_forwardings,
                 },
             });
         }
@@ -1120,7 +1162,7 @@ fn parse_size_suffix(tok: &str) -> Option<u64> {
     digits.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
 }
 
-fn parse_time_suffix(tok: &str) -> Option<u64> {
+pub fn parse_time_suffix(tok: &str) -> Option<u64> {
     let (digits, mult) = match tok.chars().last()? {
         // OpenSSH time suffixes are lowercase; 'M' is size/Mega, not minutes.
         's' => (&tok[..tok.len() - 1], 1u64),
