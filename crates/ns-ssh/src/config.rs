@@ -1184,7 +1184,7 @@ impl SshConfig {
                 "hostname" => hostname = Some(value.to_string()),
                 "user" => user = Some(value.to_string()),
                 "port" => port = value.parse().ok(),
-                "identityfile" | "identity_file" => identity_file = Some(value.to_string()),
+                "identityfile" | "identity_file" | "identityfile2" => identity_file = Some(value.to_string()),
                 "certificatefile" | "certificate_file" => {
                     certificate_file = Some(value.to_string())
                 }
@@ -1215,7 +1215,7 @@ impl SshConfig {
                 "connecttimeout" | "connect_timeout" => connect_timeout = parse_u32(value),
                 "serveraliveinterval" | "server_alive_interval" => server_alive_interval = parse_u32(value),
                 "serveralivecountmax" | "server_alive_count_max" => server_alive_count_max = parse_u32(value),
-                "tcpkeepalive" | "tcp_keep_alive" => tcp_keep_alive = Some(yes(value)),
+                "tcpkeepalive" | "tcp_keep_alive" | "keepalive" => tcp_keep_alive = Some(yes(value)),
                 "ipqos" | "ip_qos" => ip_qos = Some(value.to_string()),
                 "tag" => {
                     // OpenSSH: one tag per directive; repeated directives and
@@ -1224,9 +1224,10 @@ impl SshConfig {
                 }
                 "batchmode" | "batch_mode" => batch_mode = Some(yes(value)),
                 "passwordauthentication" | "password_authentication" => password_authentication = Some(yes(value)),
-                "pubkeyauthentication" | "pubkey_authentication" => pubkey_authentication = Some(yes(value)),
+                "pubkeyauthentication" | "pubkey_authentication" | "dsaauthentication" => pubkey_authentication = Some(yes(value)),
                 "kbdinteractiveauthentication" | "kbd_interactive_authentication"
                     | "challengeresponseauthentication" | "challenge-response-authentication"
+                    | "skeyauthentication" | "tisauthentication"
                     => kbd_interactive_authentication = Some(yes(value)),
                 "preferredauthentications" | "preferred_authentications" => preferred_authentications = Some(value.to_string()),
                 "hostkeyalgorithms" | "host_key_algorithms" => host_key_algorithms = Some(value.to_string()),
@@ -1311,7 +1312,7 @@ impl SshConfig {
                 "hostbasedauthentication" | "hostbased_authentication" => {
                     hostbased_authentication = Some(yes(value));
                 }
-                "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" => {
+                "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedkeytypes" => {
                     hostbased_accepted_algorithms = Some(value.to_string());
                 }
                 // Known OpenSSH directives that we accept but do not enforce.
@@ -1332,9 +1333,16 @@ impl SshConfig {
                 | "proxyusefdpass" | "proxy_use_fdpass"
                 | "tunneldevice" | "tunnel_device"
                 | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
-                // Deprecated OpenSSH aliases: accepted and ignored, matching
-                // OpenSSH's "Deprecated option" behaviour.
-                | "rsaauthentication" | "rhostsrsaauthentication" => {
+                // Deprecated/obsolete OpenSSH directive names: accepted and
+                // ignored, matching OpenSSH's oDeprecated/oUnsupported/oIgnore
+                // handling so old configs keep loading.
+                | "rsaauthentication" | "rhostsrsaauthentication"
+                | "protocol" | "cipher" | "fallbacktorsh"
+                | "globalknownhostsfile2" | "userknownhostsfile2"
+                | "rhostsauthentication" | "useroaming" | "usersh"
+                | "useprivilegedport" | "compressionlevel"
+                | "afstokenpassing" | "kerberosauthentication" | "kerberostgtpassing"
+                | "smartcarddevice" | "pkcs11provider" => {
                     // Accepted; not enforced.
                 }
                 // Explicitly unsupported (environment-dependent) features:
@@ -2248,10 +2256,37 @@ Match tagged !jump
         let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
         assert_eq!(host.kbd_interactive_authentication, Some(false));
 
-        // RSAAuthentication / RhostsRSAAuthentication are deprecated no-ops
-        // but must not abort config parsing.
+        // SKeyAuthentication / TISAuthentication are older aliases of
+        // KbdInteractiveAuthentication.
+        let cfg = SshConfig::parse(
+            "Host foo\n  SKeyAuthentication no\n  TISAuthentication no\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.kbd_interactive_authentication, Some(false));
+
+        // DSAAuthentication aliases PubkeyAuthentication; IdentityFile2,
+        // KeepAlive and HostbasedKeyTypes alias their modern names.
+        let cfg = SshConfig::parse(
+            "Host foo\n  DSAAuthentication no\n  IdentityFile2 /tmp/id2\n  KeepAlive no\n  HostbasedKeyTypes ssh-ed25519\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.pubkey_authentication, Some(false));
+        assert_eq!(host.identity_file.as_deref(), Some("/tmp/id2"));
+        assert_eq!(host.tcp_keep_alive, Some(false));
+        assert_eq!(host.hostbased_accepted_algorithms.as_deref(), Some("ssh-ed25519"));
+
+        // Deprecated no-ops must not abort config parsing.
         let cfg = SshConfig::parse(
             "Host foo\n  RSAAuthentication no\n  RhostsRSAAuthentication no\n",
+        )
+        .unwrap();
+        assert!(cfg.hosts.iter().any(|h| h.host == "foo"));
+
+        // The full set of accepted-and-ignored legacy names loads cleanly.
+        let cfg = SshConfig::parse(
+            "Host foo\n  Protocol 2\n  Cipher aes128-cbc\n  FallBackToRsh no\n  GlobalKnownHostsFile2 /etc/ssh/known_hosts2\n  UserKnownHostsFile2 ~/.ssh/known_hosts2\n  RhostsAuthentication no\n  UseRoaming no\n  UseRsh no\n  UsePrivilegedPort no\n  CompressionLevel 6\n  AFSTokenPassing no\n  KerberosAuthentication no\n  KerberosTgtPassing no\n  SmartcardDevice /dev/sc\n  PKCS11Provider /usr/lib/pkcs11.so\n",
         )
         .unwrap();
         assert!(cfg.hosts.iter().any(|h| h.host == "foo"));

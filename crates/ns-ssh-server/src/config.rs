@@ -527,9 +527,12 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "forcecommand" | "force_command" => o.force_command = Some(value.to_string()),
         "permitrootlogin" | "permit_root_login" => o.permit_root_login_mode = Some(value.to_lowercase()),
         "passwordauthentication" | "password_auth" => o.password_auth = Some(value == "yes"),
-        "pubkeyauthentication" | "pubkey_auth" => o.pubkey_auth = Some(value == "yes"),
+        "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
+            o.pubkey_auth = Some(value == "yes");
+        }
         "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
-        | "challengeresponseauthentication" | "challenge_response_authentication" => {
+        | "challengeresponseauthentication" | "challenge_response_authentication"
+        | "skeyauthentication" => {
             o.kbd_interactive_auth = Some(value == "yes");
         }
         "allowtcpforwarding" | "allow_tcp_forwarding" => {
@@ -659,7 +662,9 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         | "pubkeyauthoptions" | "pubkey_auth_options"
         | "requiredrsasize" | "required_rsa_size"
         | "disableforwarding" | "disable_forwarding"
-        | "permittunnel" | "permit_tunnel" => {
+        | "permittunnel" | "permit_tunnel"
+        // Deprecated aliases OpenSSH accepts in Match blocks.
+        | "rsaauthentication" | "rhostsrsaauthentication" => {
             // Accepted; not enforced.
         }
         "streamlocalbindmask" | "stream_local_bind_mask" => {
@@ -1400,7 +1405,7 @@ impl ServerConfig {
                 "listenaddress" | "listen_address" => {
                     config.listen_address = value.to_string();
                 }
-                "hostkey" | "host_key" => {
+                "hostkey" | "host_key" | "hostdsakey" => {
                     // The first HostKey directive replaces the default key list.
                     if !host_key_seen {
                         config.host_key_files.clear();
@@ -1424,10 +1429,11 @@ impl ServerConfig {
                     config.password_auth = value == "yes";
                 }
                 "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
-                | "challengeresponseauthentication" | "challenge_response_authentication" => {
+                | "challengeresponseauthentication" | "challenge_response_authentication"
+                | "skeyauthentication" => {
                     config.kbd_interactive_auth = value == "yes";
                 }
-                "pubkeyauthentication" | "pubkey_auth" => {
+                "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
                     config.pubkey_auth = value == "yes";
                 }
                 "permitrootlogin" | "permit_root_login" => {
@@ -1661,7 +1667,7 @@ impl ServerConfig {
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }
-                "tcpkeepalive" | "tcp_keep_alive" => {
+                "tcpkeepalive" | "tcp_keep_alive" | "keepalive" => {
                     config.tcp_keep_alive = value == "yes";
                 }
                 "ipqos" | "ip_qos" => {
@@ -1731,8 +1737,16 @@ impl ServerConfig {
                 | "sshdsessionpath" | "sshd_session_path"
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location"
-                // Deprecated OpenSSH aliases: accepted and ignored.
-                | "rsaauthentication" | "rhostsrsaauthentication" => {
+                // Deprecated/obsolete OpenSSH directive names: accepted and
+                // ignored, matching OpenSSH's sDeprecated/sUnsupported/sIgnore
+                // handling so old sshd_config files keep loading.
+                | "rsaauthentication" | "rhostsrsaauthentication"
+                | "pamauthenticationviakbdint" | "serverkeybits"
+                | "keyregenerationinterval" | "rhostsauthentication"
+                | "kerberostgtpassing" | "afstokenpassing"
+                | "checkmail" | "uselogin" | "protocol"
+                | "verifyreversemapping" | "reversemappingcheck"
+                | "authorizedkeysfile2" | "useprivilegeseparation" => {
                     // Accepted; not enforced.
                 }
                 "requiredrsasize" | "required_rsa_size" => {
@@ -2162,12 +2176,40 @@ Match All
     fn legacy_authentication_aliases_are_accepted() {
         let c = ServerConfig::parse("ChallengeResponseAuthentication no\n").unwrap();
         assert!(!c.kbd_interactive_auth);
+
+        // SKeyAuthentication aliases KbdInteractiveAuthentication;
+        // DSAAuthentication aliases PubkeyAuthentication; KeepAlive aliases
+        // TCPKeepAlive; HostDSAKey appends to the host key list.
+        let c = ServerConfig::parse(
+            "SKeyAuthentication no\nDSAAuthentication no\nKeepAlive no\nHostDSAKey /etc/ssh/ssh_host_dsa_key\n",
+        )
+        .unwrap();
+        assert!(!c.kbd_interactive_auth);
+        assert!(!c.pubkey_auth);
+        assert!(!c.tcp_keep_alive);
+        assert!(c.host_key_files.iter().any(|f| f == "/etc/ssh/ssh_host_dsa_key"));
+
         // Deprecated no-ops must not abort parsing.
         let c = ServerConfig::parse(
             "RSAAuthentication no\nRhostsRSAAuthentication no\n",
         )
         .unwrap();
         assert_eq!(c.port, default_port());
+
+        // The full set of accepted-and-ignored legacy names loads cleanly.
+        let c = ServerConfig::parse(
+            "PAMAuthenticationViaKbdInt no\nServerKeyBits 1024\nKeyRegenerationInterval 1h\nRhostsAuthentication no\nKerberosTgtPassing no\nAFSTokenPassing no\nCheckMail no\nUseLogin no\nProtocol 2\nVerifyReverseMapping no\nReverseMappingCheck no\nAuthorizedKeysFile2 .ssh/authorized_keys2\nUsePrivilegeSeparation yes\n",
+        )
+        .unwrap();
+        assert_eq!(c.port, default_port());
+
+        // Deprecated aliases inside Match blocks are accepted too.
+        let c = ServerConfig::parse(
+            "Match User alice\n    SKeyAuthentication no\n    DSAAuthentication no\n    RSAAuthentication no\n",
+        )
+        .unwrap();
+        assert_eq!(c.match_blocks[0].overrides.kbd_interactive_auth, Some(false));
+        assert_eq!(c.match_blocks[0].overrides.pubkey_auth, Some(false));
     }
 
     #[test]

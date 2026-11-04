@@ -2291,7 +2291,7 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "user" | "login_name" => resolved.user = value.to_string(),
         "hostname" => resolved.hostname = value.to_string(),
-        "identityfile" | "identity_file" => {
+        "identityfile" | "identity_file" | "identityfile2" => {
             resolved.identity_file = Some(std::path::PathBuf::from(value));
         }
         "certificatefile" | "certificate_file" => {
@@ -2319,9 +2319,10 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "batchmode" | "batch_mode" => resolved.batch_mode = value != "no",
         "passwordauthentication" | "password_authentication" => resolved.password_authentication = value != "no",
-        "pubkeyauthentication" | "pubkey_authentication" => resolved.pubkey_authentication = value != "no",
+        "pubkeyauthentication" | "pubkey_authentication" | "dsaauthentication" => resolved.pubkey_authentication = value != "no",
         "kbdinteractiveauthentication" | "kbd_interactive_authentication"
-            | "challengeresponseauthentication" | "challenge_response_authentication" =>
+            | "challengeresponseauthentication" | "challenge_response_authentication"
+            | "skeyauthentication" | "tisauthentication" =>
             resolved.kbd_interactive_authentication = value != "no",
         "hostbasedauthentication" | "hostbased_authentication" =>
             resolved.hostbased_authentication = value != "no",
@@ -2453,7 +2454,7 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "localcommand" | "local_command" => resolved.local_command = Some(value.to_string()),
         "permitlocalcommand" | "permit_local_command" => resolved.permit_local_command = value != "no",
         "gatewayports" | "gateway_ports" => resolved.gateway_ports = value != "no",
-        "tcpkeepalive" | "tcp_keep_alive" => resolved.tcp_keep_alive = value != "no",
+        "tcpkeepalive" | "tcp_keep_alive" | "keepalive" => resolved.tcp_keep_alive = value != "no",
         "ipqos" | "ip_qos" => {
             if let Some((i, b)) = config::parse_ipqos(value) {
                 resolved.ip_qos_interactive = i;

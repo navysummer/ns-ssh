@@ -70,7 +70,7 @@ fn main() {
                 "listenaddress" | "listen_address" => {
                     config.listen_address = value.to_string();
                 }
-                "hostkey" | "host_key" => {
+                "hostkey" | "host_key" | "hostdsakey" => {
                     config.host_key_files.push(value.to_string());
                 }
                 "hostkeyalgorithms" | "host_key_algorithms" => {
@@ -89,10 +89,11 @@ fn main() {
                     config.password_auth = value == "yes";
                 }
                 "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
-                | "challengeresponseauthentication" | "challenge_response_authentication" => {
+                | "challengeresponseauthentication" | "challenge_response_authentication"
+                | "skeyauthentication" => {
                     config.kbd_interactive_auth = value == "yes";
                 }
-                "pubkeyauthentication" | "pubkey_auth" => {
+                "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
                     config.pubkey_auth = value == "yes";
                 }
                 "permitrootlogin" | "permit_root_login" => {
@@ -195,7 +196,7 @@ fn main() {
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }
-                "tcpkeepalive" | "tcp_keep_alive" => {
+                "tcpkeepalive" | "tcp_keep_alive" | "keepalive" => {
                     config.tcp_keep_alive = value == "yes";
                 }
                 "ipqos" | "ip_qos" => {
