@@ -1824,6 +1824,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
                     push_remote_forward(&mut resolved, spec);
                 }
             }
+            if let Some(list) = &host_config.permit_remote_open {
+                resolved.permit_remote_open = list.clone();
+            }
             if let Some(list) = &host_config.dynamic_forward {
                 for spec in list {
                     if let Ok(port) = spec.parse::<u16>() {
@@ -2054,6 +2057,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
                     push_remote_forward(&mut resolved, spec);
                 }
             }
+            if let Some(list) = &mc.permit_remote_open {
+                resolved.permit_remote_open = list.clone();
+            }
             if let Some(list) = &mc.dynamic_forward {
                 for spec in list {
                     if let Ok(port) = spec.parse::<u16>() {
@@ -2214,6 +2220,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "verifyhostkeydns" | "verify_host_key_dns" => resolved.verify_host_key_dns = value.to_ascii_lowercase(),
         "requiredrsasize" | "required_rsa_size" => {
             if let Ok(v) = value.parse::<u32>() { resolved.required_rsa_size = v; }
+        }
+        "permitremoteopen" | "permit_remote_open" => {
+            resolved.permit_remote_open = config::parse_permit_remote_open(value);
         }
         "nohostauthenticationforlocalhost" | "no_host_authentication_for_localhost" => {
             resolved.no_host_authentication_for_localhost = value != "no";

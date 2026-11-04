@@ -173,6 +173,9 @@ pub struct HostConfig {
     pub clear_all_forwardings: Option<bool>,
     #[serde(default)]
     pub required_rsa_size: Option<u32>,
+    /// PermitRemoteOpen: whitelist of remote forwarding targets.
+    #[serde(default)]
+    pub permit_remote_open: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +308,8 @@ pub struct ResolvedConfig {
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
     /// RequiredRSASize: reject server host keys smaller than this (bits).
     pub required_rsa_size: u32,
+    /// PermitRemoteOpen entries; empty means unrestricted.
+    pub permit_remote_open: Vec<String>,
 }
 
 impl ResolvedConfig {
@@ -385,6 +390,7 @@ impl ResolvedConfig {
             identity_agent: None,
             pubkey_accepted_algorithms: None,
             required_rsa_size: 1024,
+            permit_remote_open: Vec::new(),
         }
     }
 }
@@ -589,6 +595,7 @@ impl SshConfig {
         let mut gateway_ports = None;
         let mut clear_all_forwardings = None;
         let mut required_rsa_size = None;
+        let mut permit_remote_open: Option<Vec<String>> = None;
 
         let yes = |v: &str| v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
         let parse_u32 = |v: &str| v.parse::<u32>().ok();
@@ -671,6 +678,7 @@ impl SshConfig {
                              gateway_ports: gateway_ports.take(),
                              clear_all_forwardings: clear_all_forwardings.take(),
                              required_rsa_size: required_rsa_size.take(),
+                             permit_remote_open: permit_remote_open.take(),
                          });
                     }
                     current_host = Some(value.to_string());
@@ -740,6 +748,7 @@ impl SshConfig {
                              gateway_ports: gateway_ports.take(),
                              clear_all_forwardings: clear_all_forwardings.take(),
                              required_rsa_size: required_rsa_size.take(),
+                             permit_remote_open: permit_remote_open.take(),
                           });
                     }
                     // Parse match conditions (comma-separated key=value pairs)
@@ -843,7 +852,6 @@ impl SshConfig {
                 | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
                 | "channeltimeout" | "channel_timeout"
-                | "permitremoteopen" | "permit_remote_open"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
                 | "streamlocalbindmask" | "stream_local_bind_mask"
@@ -875,6 +883,9 @@ impl SshConfig {
                     if let Ok(v) = value.parse() {
                         required_rsa_size = Some(v);
                     }
+                }
+                "permitremoteopen" | "permit_remote_open" => {
+                    permit_remote_open = Some(parse_permit_remote_open(value));
                 }
                 "ignoreunknown" | "ignore_unknown" => {
                     for tok in value.split(',') {
@@ -964,6 +975,7 @@ impl SshConfig {
                 gateway_ports,
                 clear_all_forwardings,
                 required_rsa_size,
+                permit_remote_open: permit_remote_open.clone(),
             });
         }
 
@@ -1033,6 +1045,7 @@ impl SshConfig {
                     gateway_ports,
                     clear_all_forwardings,
                     required_rsa_size,
+                    permit_remote_open: permit_remote_open.clone(),
                 },
             });
         }
@@ -1040,6 +1053,57 @@ impl SshConfig {
         Ok(SshConfig { hosts, match_blocks })
     }
 
+}
+
+/// Parse an OpenSSH `PermitRemoteOpen` value: whitespace- or comma-separated
+/// entries of `host:port`, or the special values `any` / `none`.
+pub fn parse_permit_remote_open(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Check a remote forwarding target against `PermitRemoteOpen`.
+/// Empty list = unrestricted; `any` clears restrictions; `none` denies all.
+/// Entries are `host:port`, where `*` matches any host or port, port `0`
+/// matches any port, and a bare host entry matches any port.
+pub fn permit_remote_open_allows(entries: &[String], host: &str, port: u16) -> bool {
+    if entries.is_empty() {
+        return true;
+    }
+    if entries.iter().any(|e| e == "any") {
+        return true;
+    }
+    if entries.iter().any(|e| e == "none") {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    let port = port.to_string();
+    for entry in entries {
+        // Bracketed IPv6 form: "[::1]:80".
+        let (h, p) = if let Some(rest) = entry.strip_prefix('[') {
+            match rest.split_once("]:") {
+                Some((h, p)) => (h, Some(p)),
+                None => continue,
+            }
+        } else if let Some((h, p)) = entry.rsplit_once(':') {
+            (h, Some(p))
+        } else {
+            (entry.as_str(), None)
+        };
+        let host_ok = glob_match(h, &host);
+        let port_ok = match p {
+            None => true,
+            Some("*") | Some("0") => true,
+            Some(p) => p == port,
+        };
+        if host_ok && port_ok {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn glob_match(pattern: &str, text: &str) -> bool {
@@ -1490,6 +1554,36 @@ mod tests {
         assert!(SshConfig::parse(
             "Host foo\n  ChannelTimeout 5m\n  SessionType none\n"
         ).is_ok());
+    }
+
+    #[test]
+    fn permit_remote_open_is_parsed_and_matched() {
+        let cfg = SshConfig::parse(
+            "Host foo\n  PermitRemoteOpen 10.0.0.5:80,db.internal:5432\n"
+        ).unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(
+            host.permit_remote_open,
+            Some(vec!["10.0.0.5:80".to_string(), "db.internal:5432".to_string()])
+        );
+
+        // Empty list: unrestricted.
+        assert!(permit_remote_open_allows(&[], "any.host", 22));
+        // Exact host and port.
+        let entries = parse_permit_remote_open("db.internal:5432");
+        assert!(permit_remote_open_allows(&entries, "db.internal", 5432));
+        assert!(!permit_remote_open_allows(&entries, "db.internal", 80));
+        assert!(!permit_remote_open_allows(&entries, "other.internal", 5432));
+        // Wildcards and port 0.
+        let entries = parse_permit_remote_open("*.internal:0");
+        assert!(permit_remote_open_allows(&entries, "DB.INTERNAL", 1234));
+        assert!(!permit_remote_open_allows(&entries, "db.example", 1234));
+        // Bracketed IPv6.
+        let entries = parse_permit_remote_open("[::1]:8080");
+        assert!(permit_remote_open_allows(&entries, "::1", 8080));
+        // Special values.
+        assert!(permit_remote_open_allows(&parse_permit_remote_open("any"), "x", 1));
+        assert!(!permit_remote_open_allows(&parse_permit_remote_open("none"), "x", 1));
     }
 
     #[test]

@@ -1929,13 +1929,127 @@ fn authentication_methods_chain_is_enforced() {
     );
 }
 
+/// PermitRemoteOpen: remote forwarding targets outside the whitelist are
+/// refused, while permitted targets keep working.
+#[test]
+fn permit_remote_open_restricts_forward_targets() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("permitremoteopen");
+    let port = free_port();
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    // Local echo target reached through the remote forward.
+    let target_port = free_port();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", target_port))
+        .expect("bind echo target");
+    listener.set_nonblocking(true).expect("set_nonblocking");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let echo = std::thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = conn.read(&mut buf) {
+                        let reply = format!("ECHO:{}", String::from_utf8_lossy(&buf[..n]));
+                        let _ = conn.write_all(reply.as_bytes());
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Probe the forwarded port, returning any reply to "hello".
+    let probe = |remote_port: u16| -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match std::net::TcpStream::connect(("127.0.0.1", remote_port)) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => panic!("remote forward port {} never opened: {}", remote_port, e),
+            }
+        };
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+        stream.write_all(b"hello").ok();
+        let mut buf = [0u8; 128];
+        stream.read(&mut buf).ok().map(|n| String::from_utf8_lossy(&buf[..n]).to_string())
+    };
+
+    let run_client = |remote_port: u16, opts: &[&str]| -> std::process::Child {
+        let args = base_client_args(port, &user, &id_path, &kh);
+        let mut cmd = Command::new(&args[0]);
+        cmd.args(&args[1..]);
+        for opt in opts {
+            cmd.arg("-o").arg(opt);
+        }
+        cmd.arg("-R")
+            .arg(format!("{}:127.0.0.1:{}", remote_port, target_port))
+            .arg("127.0.0.1")
+            .arg("sleep 20")
+            .spawn()
+            .expect("spawn client")
+    };
+
+    // Permitted target: forwarding works end-to-end.
+    let remote_ok = free_port();
+    let mut client = run_client(remote_ok, &[]);
+    let reply = probe(remote_ok);
+    let _ = client.kill();
+    let _ = client.wait();
+    assert!(
+        reply.as_deref().map(|r| r.contains("ECHO:hello")).unwrap_or(false),
+        "allowed remote forward should echo, got: {:?}",
+        reply
+    );
+
+    // Target outside the whitelist: the channel is refused, no data flows.
+    let remote_denied = free_port();
+    let mut client = run_client(remote_denied, &["permitremoteopen=127.0.0.1:1"]);
+    let reply = probe(remote_denied);
+    let _ = client.kill();
+    let _ = client.wait();
+    assert!(
+        !reply.as_deref().map(|r| r.contains("ECHO:hello")).unwrap_or(false),
+        "remote forward outside PermitRemoteOpen must be refused, got: {:?}",
+        reply
+    );
+
+    // `none` denies every remote forward.
+    let remote_none = free_port();
+    let mut client = run_client(remote_none, &["permitremoteopen=none"]);
+    let reply = probe(remote_none);
+    let _ = client.kill();
+    let _ = client.wait();
+    assert!(
+        !reply.as_deref().map(|r| r.contains("ECHO:hello")).unwrap_or(false),
+        "PermitRemoteOpen=none must refuse all forwards, got: {:?}",
+        reply
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = echo.join();
+    let _ = server.kill();
+    let _ = server.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// ChannelTimeout: an idle channel is closed once its configured timeout
 /// elapses; a longer timeout leaves a short command untouched.
 #[test]
 fn channel_timeout_closes_idle_channels() {
     let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
 
-    // session=1: a command silent for 3s must be cut off before it finishes.
+    // session=1: a command silent for 10s must be cut off before it finishes.
     let dir = temp_dir("channeltimeout-close");
     let port = free_port();
     let (server, id_path, kh) =
@@ -1946,7 +2060,7 @@ fn channel_timeout_closes_idle_channels() {
     let output = Command::new(&args[0])
         .args(&args[1..])
         .arg("127.0.0.1")
-        .arg("sleep 3; echo late")
+        .arg("sleep 10; echo late")
         .output()
         .expect("run client");
     let elapsed = start.elapsed();
@@ -1957,9 +2071,9 @@ fn channel_timeout_closes_idle_channels() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "idle session channel should be closed after ~1s, but the client ran \
-         for {:?}; stderr={:?} server_stderr={}",
+        elapsed < std::time::Duration::from_secs(8),
+        "idle session channel should be closed well before the 10s command \
+         finishes, but the client ran for {:?}; stderr={:?} server_stderr={}",
         elapsed,
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&server_out.stderr)

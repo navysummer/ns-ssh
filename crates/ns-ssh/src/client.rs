@@ -2146,6 +2146,21 @@ impl SshClient {
                                         let bind_port = p as u16;
                                         let local_target = remote_forward_map.get(&bind_port).cloned();
                                         if let Some((lh, lp)) = local_target {
+                                            // PermitRemoteOpen: refuse targets outside the
+                                            // configured whitelist before connecting.
+                                            if !crate::config::permit_remote_open_allows(
+                                                &self.config.permit_remote_open, &lh, lp,
+                                            ) {
+                                                tracing::warn!(
+                                                    "refusing remote forward to {}:{} (PermitRemoteOpen)",
+                                                    lh, lp,
+                                                );
+                                                let fail = build_channel_open_failure(
+                                                    sender_channel, 1, "remote open not permitted",
+                                                );
+                                                let _ = self.queue_send(&fail, &mut pending_write);
+                                                continue;
+                                            }
                                             let local_id = self.channel_manager.alloc_channel(msg::SSH_CHANNEL_TYPE_FORWARDED_TCPIP, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
                                             self.channel_manager.set_remote_id(local_id, sender_channel);
                                             let confirm = build_channel_open_confirmation(s, local_id, msg::CHANNEL_PACKET_WINDOW_SIZE, msg::CHANNEL_MAX_PACKET_SIZE);
