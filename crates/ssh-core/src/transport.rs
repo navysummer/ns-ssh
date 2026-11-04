@@ -14,18 +14,21 @@ pub const MAX_PACKET_SIZE: usize = 256 * 1024;
 pub const KEX_STRICT_CLIENT: &str = "kex-strict-c-v00@openssh.com";
 pub const KEX_STRICT_SERVER: &str = "kex-strict-s-v00@openssh.com";
 
+// Default algorithm lists follow OpenSSH 9.9p2's local KEXINIT proposal
+// as observed over the wire (ssh -vvv). Only algorithms we actually
+// implement appear here; sntrup/mlkem (KEX), umac (MAC), certificate/
+// sk-hostkey and ssh-rsa (host key), aes*-cbc/3des (cipher) remain
+// available via explicit config but are no longer advertised by default.
 const DEFAULT_KEX: &[&str] = &[
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
     "ecdh-sha2-nistp256",
     "ecdh-sha2-nistp384",
     "ecdh-sha2-nistp521",
+    "diffie-hellman-group-exchange-sha256",
     "diffie-hellman-group16-sha512",
     "diffie-hellman-group18-sha512",
     "diffie-hellman-group14-sha256",
-    "diffie-hellman-group14-sha1",
-    "diffie-hellman-group-exchange-sha256",
-    "diffie-hellman-group-exchange-sha1",
 ];
 
 const DEFAULT_HOST_KEYS: &[&str] = &[
@@ -35,20 +38,15 @@ const DEFAULT_HOST_KEYS: &[&str] = &[
     "ecdsa-sha2-nistp521",
     "rsa-sha2-512",
     "rsa-sha2-256",
-    "ssh-rsa",
 ];
 
 const DEFAULT_CIPHERS: &[&str] = &[
-    "aes256-ctr",
-    "aes192-ctr",
-    "aes128-ctr",
     "chacha20-poly1305@openssh.com",
-    "aes256-gcm@openssh.com",
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
     "aes128-gcm@openssh.com",
-    "aes256-cbc",
-    "aes192-cbc",
-    "aes128-cbc",
-    "3des-cbc",
+    "aes256-gcm@openssh.com",
 ];
 
 const DEFAULT_MACS: &[&str] = &[
