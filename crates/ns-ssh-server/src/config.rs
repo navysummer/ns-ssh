@@ -134,6 +134,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub authentication_methods: Vec<Vec<String>>,
 
+    /// ChannelTimeout: channel-type/timeout pairs, e.g. `session=5m,global=2h`.
+    /// A value of 0 disables the timeout for that type.
+    #[serde(default)]
+    pub channel_timeouts: Vec<(String, u64)>,
+
     #[serde(default = "default_true")]
     pub permit_tty: bool,
 
@@ -296,6 +301,7 @@ pub struct MatchOverrides {
     pub hostbased_auth: Option<bool>,
     pub ignore_rhosts: Option<bool>,
     pub authentication_methods: Option<Vec<Vec<String>>>,
+    pub channel_timeouts: Option<Vec<(String, u64)>>,
 }
 
 impl ServerMatch {
@@ -376,6 +382,7 @@ impl ServerMatch {
         if let Some(v) = o.hostbased_auth { cfg.hostbased_auth = v; }
         if let Some(v) = o.ignore_rhosts { cfg.ignore_rhosts = v; }
         if let Some(v) = &o.authentication_methods { cfg.authentication_methods = v.clone(); }
+        if let Some(v) = &o.channel_timeouts { cfg.channel_timeouts = v.clone(); }
     }
 }
 
@@ -468,10 +475,12 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "authenticationmethods" | "authentication_methods" => {
             o.authentication_methods = Some(parse_authentication_methods(value));
         }
+        "channeltimeout" | "channel_timeout" => {
+            o.channel_timeouts = Some(parse_channel_timeout(value));
+        }
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
         "authorizedprincipalsfile" | "authorized_principals_file"
         | "casignaturealgorithms" | "ca_signature_algorithms"
-        | "channeltimeout" | "channel_timeout"
         | "exposeauthinfo" | "expose_auth_info"
         | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
         | "hostcertificate" | "host_certificate"
@@ -612,6 +621,48 @@ pub fn parse_authentication_methods(value: &str) -> Vec<Vec<String>> {
         })
         .filter(|chain| !chain.is_empty())
         .collect()
+}
+
+/// Parse an OpenSSH `ChannelTimeout` value: comma-separated `type=time` pairs
+/// where time accepts s/m/h/d suffixes. `0` (or `none`) disables the timeout.
+pub fn parse_channel_timeout(value: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        let Some((kind, time)) = item.split_once('=') else { continue };
+        let kind = kind.trim().to_ascii_lowercase();
+        if kind.is_empty() {
+            continue;
+        }
+        let time = time.trim();
+        let secs = if time.eq_ignore_ascii_case("none") {
+            0
+        } else {
+            parse_time_suffix(time).unwrap_or(0)
+        };
+        out.push((kind, secs));
+    }
+    out
+}
+
+/// Resolve the idle timeout in seconds for a channel type. An explicit
+/// per-type entry wins over `global`; no entry (or 0) means disabled.
+pub fn channel_timeout_secs(config: &ServerConfig, channel_type: &str) -> u64 {
+    let kind = match channel_type {
+        "x11" => "x11-connection",
+        "auth-agent@openssh.com" => "agent-connection",
+        other => other,
+    };
+    let mut specific: Option<u64> = None;
+    let mut global: Option<u64> = None;
+    for (name, secs) in &config.channel_timeouts {
+        if name == kind {
+            specific = Some(*secs);
+        } else if name == "global" {
+            global = Some(*secs);
+        }
+    }
+    specific.or(global).unwrap_or(0)
 }
 
 /// OpenSSH default `PubkeyAcceptedAlgorithms` base list for sshd. Matches the
@@ -773,6 +824,7 @@ impl Default for ServerConfig {
             strict_modes: default_true(),
             required_rsa_size: default_required_rsa_size(),
             authentication_methods: Vec::new(),
+            channel_timeouts: Vec::new(),
             permit_tty: default_true(),
             permit_empty_passwords: false,
             ignore_rhosts: default_true(),
@@ -1217,7 +1269,6 @@ impl ServerConfig {
                 | "authorizedprincipalscommand" | "authorized_principals_command"
                 | "authorizedprincipalscommanduser" | "authorized_principals_command_user"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
-                | "channeltimeout" | "channel_timeout"
                 | "exposeauthinfo" | "expose_auth_info"
                 | "gssapiauthentication" | "gssapi_authentication"
                 | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
@@ -1257,6 +1308,9 @@ impl ServerConfig {
                 }
                 "authenticationmethods" | "authentication_methods" => {
                     config.authentication_methods = parse_authentication_methods(value);
+                }
+                "channeltimeout" | "channel_timeout" => {
+                    config.channel_timeouts = parse_channel_timeout(value);
                 }
                 _ => return Err(SshError::Config(format!(
                     "unknown directive: {}",
@@ -1475,6 +1529,32 @@ Match All
         );
         let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
         assert_eq!(r.authentication_methods, vec![vec!["publickey".to_string()]]);
+    }
+
+    #[test]
+    fn channel_timeout_is_parsed_and_resolved() {
+        let c = ServerConfig::parse("ChannelTimeout session=5m,direct-tcpip=10,global=0\n").unwrap();
+        assert_eq!(
+            c.channel_timeouts,
+            vec![
+                ("session".to_string(), 300),
+                ("direct-tcpip".to_string(), 10),
+                ("global".to_string(), 0),
+            ]
+        );
+        // A specific entry wins over `global`.
+        assert_eq!(channel_timeout_secs(&c, "session"), 300);
+        assert_eq!(channel_timeout_secs(&c, "direct-tcpip"), 10);
+        // Types without an entry fall back to `global` (0 = disabled).
+        assert_eq!(channel_timeout_secs(&c, "forwarded-tcpip"), 0);
+        // X11 and agent channels map to their OpenSSH directive names.
+        let c = ServerConfig::parse("ChannelTimeout x11-connection=2m,agent-connection=1m\n")
+            .unwrap();
+        assert_eq!(channel_timeout_secs(&c, "x11"), 120);
+        assert_eq!(channel_timeout_secs(&c, "auth-agent@openssh.com"), 60);
+        // Unset: every channel type is disabled.
+        let c = ServerConfig::parse("").unwrap();
+        assert_eq!(channel_timeout_secs(&c, "session"), 0);
     }
 
     #[test]

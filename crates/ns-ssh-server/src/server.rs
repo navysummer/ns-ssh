@@ -1415,6 +1415,11 @@ async fn handle_connection_service(
         Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(60)));
     let mut exit_poll: std::pin::Pin<Box<tokio::time::Sleep>> =
         Box::pin(tokio::time::sleep(tokio::time::Duration::from_millis(50)));
+    // ChannelTimeout: per-channel last-activity timestamps and a 1s watchdog.
+    let mut channel_last_activity: std::collections::HashMap<ChannelId, std::time::Instant> =
+        std::collections::HashMap::new();
+    let mut channel_timeout_poll: std::pin::Pin<Box<tokio::time::Sleep>> =
+        Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(1)));
 
     'conn: loop {
         tokio::task::yield_now().await;
@@ -1665,6 +1670,7 @@ async fn handle_connection_service(
                     msg::SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
                         if let Ok((recipient, sender, w, m)) = parse_channel_open_confirmation(&packet) {
                             if let Some(tx) = pending_open.remove(&recipient) {
+                                channel_last_activity.insert(recipient, std::time::Instant::now());
                                 channel_manager.set_remote_id(recipient, sender);
                                 channel_manager.set_peer_window(recipient, w);
                                 let _ = tx.send((sender, w, m));
@@ -1680,6 +1686,7 @@ async fn handle_connection_service(
                             pending_open.remove(&recipient);
                             pending_open_sockets.remove(&recipient);
                             channel_manager.close_channel(recipient);
+                            channel_last_activity.remove(&recipient);
                         }
                     }
                     msg::SSH_MSG_CHANNEL_OPEN => {
@@ -1702,6 +1709,7 @@ async fn handle_connection_service(
                                     msg::CHANNEL_PACKET_WINDOW_SIZE,
                                     msg::CHANNEL_MAX_PACKET_SIZE,
                                 );
+                                channel_last_activity.insert(local_channel, std::time::Instant::now());
                                 channel_manager.set_remote_id(local_channel, sender_channel);
                                 channel_manager.set_peer_window(local_channel, client_window);
                                 // Create a session up-front and associate it with this
@@ -1740,6 +1748,7 @@ async fn handle_connection_service(
                                             msg::CHANNEL_PACKET_WINDOW_SIZE,
                                             msg::CHANNEL_MAX_PACKET_SIZE,
                                         );
+                                        channel_last_activity.insert(local_channel, std::time::Instant::now());
                                         channel_manager.set_remote_id(local_channel, sender_channel);
                                         channel_manager.set_peer_window(local_channel, client_window);
                                         let confirmation = build_channel_open_confirmation(
@@ -1778,6 +1787,7 @@ async fn handle_connection_service(
                                             msg::CHANNEL_PACKET_WINDOW_SIZE,
                                             msg::CHANNEL_MAX_PACKET_SIZE,
                                         );
+                                        channel_last_activity.insert(local_channel, std::time::Instant::now());
                                         channel_manager.set_remote_id(local_channel, sender_channel);
                                         channel_manager.set_peer_window(local_channel, client_window);
                                         let confirmation = build_channel_open_confirmation(
@@ -1808,6 +1818,9 @@ async fn handle_connection_service(
                         let data_len = data.len() as u32;
                         let local_channel = channel_manager.get_channel(recipient)
                             .map(|c| c.local_id);
+                        if let Some(lc) = local_channel {
+                            channel_last_activity.insert(lc, std::time::Instant::now());
+                        }
                         let reply_channel = channel_manager.reply_recipient(recipient)
                             .unwrap_or(recipient);
                         if let Some(local_id) = local_channel {
@@ -1880,6 +1893,9 @@ async fn handle_connection_service(
 
                         let local_channel = channel_manager.get_channel(recipient)
                             .map(|c| c.local_id);
+                        if let Some(lc) = local_channel {
+                            channel_last_activity.insert(lc, std::time::Instant::now());
+                        }
 
                         if local_channel.is_some() {
                             let channel_id = channel_manager.reply_recipient(recipient)
@@ -2293,12 +2309,16 @@ async fn handle_connection_service(
                             // Drop the channel (and its data_tx) so the
                             // subsystem/forwarding task sees the stream end.
                             channel_manager.close_channel(recipient);
+                            channel_last_activity.remove(&recipient);
                         }
                     }
                     msg::SSH_MSG_CHANNEL_WINDOW_ADJUST => {
                         let mut r = &packet[1..];
-                        let _channel_id = u32::decode(&mut r)?;
+                        let channel_id = u32::decode(&mut r)?;
                         let _amount = u32::decode(&mut r)?;
+                        if let Some(lc) = channel_manager.get_channel(channel_id).map(|c| c.local_id) {
+                            channel_last_activity.insert(lc, std::time::Instant::now());
+                        }
                     }
                     msg::SSH_MSG_DISCONNECT => {
                         break 'conn;
@@ -2345,6 +2365,9 @@ async fn handle_connection_service(
                     match child_rx.try_recv() {
                         Ok(ChildOutputMsg::Stdout(sid, data)) => {
                             if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                            if let Some(lc) = channel_session.iter().find(|(_, s)| **s == sid).map(|(c, _)| *c) {
+                                channel_last_activity.insert(lc, std::time::Instant::now());
+                            }
                             let remote = session_remote.get(&sid).copied().unwrap_or(0);
                             let data_len = data.len();
                             let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
@@ -2356,6 +2379,9 @@ async fn handle_connection_service(
                         }
                         Ok(ChildOutputMsg::Stderr(sid, data)) => {
                             if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                            if let Some(lc) = channel_session.iter().find(|(_, s)| **s == sid).map(|(c, _)| *c) {
+                                channel_last_activity.insert(lc, std::time::Instant::now());
+                            }
                             let remote = session_remote.get(&sid).copied().unwrap_or(0);
                             let data_len = data.len();
                             let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
@@ -2412,8 +2438,64 @@ async fn handle_connection_service(
                 exit_poll.as_mut().reset(tokio::time::Instant::now() + tokio::time::Duration::from_millis(next_delay_ms));
             }
 
+            // ChannelTimeout: close channels that have been idle longer than
+            // their configured timeout. Activity is recorded for every
+            // inbound channel message and on channel open.
+            () = &mut channel_timeout_poll, if !server_rekey_kex_sent && !channel_last_activity.is_empty() => {
+                let now = std::time::Instant::now();
+                let expired: Vec<(ChannelId, u64)> = channel_last_activity
+                    .iter()
+                    .filter_map(|(id, last)| {
+                        let ch = channel_manager.get_channel(*id)?;
+                        let secs = crate::config::channel_timeout_secs(&config, &ch.channel_type);
+                        if secs == 0 {
+                            return None;
+                        }
+                        if now.duration_since(*last).as_secs() >= secs {
+                            Some((*id, secs))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for (local_id, secs) in expired {
+                    let remote = channel_manager.get_channel(local_id)
+                        .and_then(|c| c.remote_id)
+                        .unwrap_or(0);
+                    tracing::info!(
+                        "channel {} idle for {}s, closing (ChannelTimeout)",
+                        local_id, secs,
+                    );
+                    // Terminate the session's child so a timeout does not
+                    // leave an orphan process behind, and suppress late
+                    // child output for the closed channel.
+                    if let Some(sid) = channel_session.get(&local_id).copied() {
+                        if let Some(session) = session_manager.get_session_mut(sid) {
+                            if let Some(ref mut child) = session.child {
+                                if let Some(pid) = child.id() {
+                                    unsafe { libc::kill(-(pid as i32), libc::SIGHUP); }
+                                }
+                            }
+                        }
+                        session_exit_sent_map.insert(sid, true);
+                        session_readers_done.remove(&sid);
+                    }
+                    let close_msg = build_channel_close(remote);
+                    send_encrypted_packet_server(stream, &close_msg, transport, false, aead).await?;
+                    channel_manager.close_channel(local_id);
+                    sftp_channels.remove(&local_id);
+                    channel_last_activity.remove(&local_id);
+                }
+                channel_timeout_poll.as_mut().reset(
+                    tokio::time::Instant::now() + tokio::time::Duration::from_secs(1),
+                );
+            }
+
             to_client = to_client_rx.recv(), if !server_rekey_kex_sent => {
                 if let Some((remote_id, data)) = to_client {
+                    if let Some(local_id) = channel_manager.find_by_remote_id(remote_id).map(|c| c.local_id) {
+                        channel_last_activity.insert(local_id, std::time::Instant::now());
+                    }
                     let msg = build_channel_data(remote_id, &data);
                     let _ = send_encrypted_packet_server(stream, &msg, transport, false, aead).await;
                 }
@@ -2515,6 +2597,9 @@ async fn handle_connection_service(
                 match child_msg {
                     Some(ChildOutputMsg::Stdout(sid, data)) => {
                         if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                        if let Some(lc) = channel_session.iter().find(|(_, s)| **s == sid).map(|(c, _)| *c) {
+                            channel_last_activity.insert(lc, std::time::Instant::now());
+                        }
                         let remote = session_remote.get(&sid).copied().unwrap_or(0);
                         let mut channel_data = vec![msg::SSH_MSG_CHANNEL_DATA];
                         remote.encode(&mut channel_data)?;
@@ -2523,6 +2608,9 @@ async fn handle_connection_service(
                     }
                     Some(ChildOutputMsg::Stderr(sid, data)) => {
                         if session_exit_sent_map.get(&sid).copied().unwrap_or(false) { continue; }
+                        if let Some(lc) = channel_session.iter().find(|(_, s)| **s == sid).map(|(c, _)| *c) {
+                            channel_last_activity.insert(lc, std::time::Instant::now());
+                        }
                         let remote = session_remote.get(&sid).copied().unwrap_or(0);
                         let mut channel_data = vec![msg::SSH_MSG_CHANNEL_EXTENDED_DATA];
                         remote.encode(&mut channel_data)?;

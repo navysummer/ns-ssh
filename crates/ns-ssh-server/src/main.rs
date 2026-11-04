@@ -171,6 +171,9 @@ fn main() {
                 "authenticationmethods" | "authentication_methods" => {
                     config.authentication_methods = config::parse_authentication_methods(value);
                 }
+                "channeltimeout" | "channel_timeout" => {
+                    config.channel_timeouts = config::parse_channel_timeout(value);
+                }
                 "permittty" | "permit_tty" => {
                     config.permit_tty = value == "yes";
                 }

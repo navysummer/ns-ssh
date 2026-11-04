@@ -1928,3 +1928,79 @@ fn authentication_methods_chain_is_enforced() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+/// ChannelTimeout: an idle channel is closed once its configured timeout
+/// elapses; a longer timeout leaves a short command untouched.
+#[test]
+fn channel_timeout_closes_idle_channels() {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    // session=1: a command silent for 3s must be cut off before it finishes.
+    let dir = temp_dir("channeltimeout-close");
+    let port = free_port();
+    let (server, id_path, kh) =
+        launch_test_server_extra(&dir, port, &["-o", "channeltimeout=session=1"]);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let start = std::time::Instant::now();
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("sleep 3; echo late")
+        .output()
+        .expect("run client");
+    let elapsed = start.elapsed();
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "idle session channel should be closed after ~1s, but the client ran \
+         for {:?}; stderr={:?} server_stderr={}",
+        elapsed,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("late"),
+        "the remote command must be terminated before it prints 'late', got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // session=10: the same command completes normally.
+    let dir = temp_dir("channeltimeout-pass");
+    let port = free_port();
+    let (server, id_path, kh) =
+        launch_test_server_extra(&dir, port, &["-o", "channeltimeout=session=10"]);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("sleep 3; echo late")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "command shorter than the channel timeout must succeed: status={:?} \
+         stdout={:?} stderr={:?} server_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("late"),
+        "expected output from the completed command, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
