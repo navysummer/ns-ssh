@@ -637,6 +637,7 @@ fn next_auth_step(required: &[Vec<String>], done: &[String]) -> AuthStep {
 /// Methods this server has enabled, in the order OpenSSH advertises them.
 fn enabled_auth_methods(config: &ServerConfig) -> Vec<String> {
     let mut methods = Vec::new();
+    if config.hostbased_auth { methods.push("hostbased".to_string()); }
     if config.pubkey_auth { methods.push("publickey".to_string()); }
     if config.password_auth { methods.push("password".to_string()); }
     if config.kbd_interactive_auth { methods.push("keyboard-interactive".to_string()); }
@@ -1098,6 +1099,55 @@ async fn handle_authenticated_session(
                                 if config.auth_failure_delay > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                                 }
+                            }
+                        }
+                    }
+                    "hostbased" => {
+                        // RFC 4252 §8: key type, host key blob, client host
+                        // name, client user name, signature (no bool flag).
+                        let key_type = SshString::decode(&mut r)?.as_str()?.to_string();
+                        let public_key = SshBytes::decode(&mut r)?.0;
+                        let client_host = SshString::decode(&mut r)?.as_str()?.to_string();
+                        let client_user = SshString::decode(&mut r)?.as_str()?.to_string();
+                        let signature_blob = SshBytes::decode(&mut r)?.0;
+
+                        let algo_ok = config.hostbased_accepted_algorithms.as_ref()
+                            .map_or(true, |list| list.iter().any(|a| a == &key_type));
+                        let ok = config.hostbased_auth && algo_ok && {
+                            let auth = auth.lock().await;
+                            auth.verify_hostbased(
+                                &session_id, &username, &key_type, &public_key,
+                                &client_host, &client_user, &signature_blob,
+                                config.ignore_user_known_hosts,
+                            )
+                        };
+                        if ok {
+                            tracing::info!("Accepted hostbased for {} from {} (client host {})", username, match_addr, client_host);
+                            auth_info.push(format!("hostbased {} {}", key_type, client_host));
+                            if complete_auth_step(
+                                &mut stream,
+                                &mut transport,
+                                aead,
+                                &config,
+                                &mut completed_methods,
+                                "hostbased",
+                            ).await? {
+                                authenticated = true;
+                                break;
+                            }
+                        } else {
+                            let mut default_methods = Vec::new();
+                            if config.pubkey_auth { default_methods.push("publickey".to_string()); }
+                            if config.password_auth { default_methods.push("password".to_string()); }
+                            if config.kbd_interactive_auth { default_methods.push("keyboard-interactive".to_string()); }
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                default_methods,
+                            );
+                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                            if config.auth_failure_delay > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
                             }
                         }
                     }

@@ -151,6 +151,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub hostbased_auth: bool,
 
+    /// HostbasedAcceptedAlgorithms: client host key algorithms accepted for
+    /// hostbased authentication (None = default set).
+    #[serde(default)]
+    pub hostbased_accepted_algorithms: Option<Vec<String>>,
+
     #[serde(default = "default_true")]
     pub print_last_log: bool,
 
@@ -394,6 +399,7 @@ pub struct MatchOverrides {
     pub login_grace_time: Option<u32>,
     pub log_level: Option<String>,
     pub hostbased_auth: Option<bool>,
+    pub hostbased_accepted_algorithms: Option<Vec<String>>,
     pub ignore_rhosts: Option<bool>,
     pub authentication_methods: Option<Vec<Vec<String>>>,
     pub channel_timeouts: Option<Vec<(String, u64)>>,
@@ -500,6 +506,7 @@ impl ServerMatch {
         if let Some(v) = o.login_grace_time { cfg.login_grace_time = v; }
         if let Some(v) = &o.log_level { cfg.log_level = Some(v.clone()); }
         if let Some(v) = o.hostbased_auth { cfg.hostbased_auth = v; }
+        if let Some(v) = &o.hostbased_accepted_algorithms { cfg.hostbased_accepted_algorithms = Some(v.clone()); }
         if let Some(v) = o.ignore_rhosts { cfg.ignore_rhosts = v; }
         if let Some(v) = &o.authentication_methods { cfg.authentication_methods = v.clone(); }
         if let Some(v) = &o.channel_timeouts { cfg.channel_timeouts = v.clone(); }
@@ -604,6 +611,11 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         }
         "loglevel" | "log_level" => o.log_level = Some(value.to_string()),
         "hostbasedauthentication" | "hostbased_auth" => o.hostbased_auth = Some(value == "yes"),
+        "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedacceptedkeytypes" => {
+            o.hostbased_accepted_algorithms = Some(
+                value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+            );
+        }
         "ignorerhosts" | "ignore_rhosts" => o.ignore_rhosts = Some(value == "yes"),
         "authenticationmethods" | "authentication_methods" => {
             o.authentication_methods = Some(parse_authentication_methods(value));
@@ -643,7 +655,6 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         }
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
         "casignaturealgorithms" | "ca_signature_algorithms"
-        | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
         | "hostcertificate" | "host_certificate"
         | "pubkeyauthoptions" | "pubkey_auth_options"
         | "requiredrsasize" | "required_rsa_size"
@@ -1152,6 +1163,7 @@ impl Default for ServerConfig {
             permit_empty_passwords: false,
             ignore_rhosts: default_true(),
             hostbased_auth: false,
+            hostbased_accepted_algorithms: None,
             print_last_log: default_true(),
             tcp_keep_alive: default_true(),
             ip_qos_interactive: default_ip_qos_interactive(),
@@ -1641,6 +1653,11 @@ impl ServerConfig {
                 "hostbasedauthentication" | "hostbased_auth" => {
                     config.hostbased_auth = value == "yes";
                 }
+                "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedacceptedkeytypes" => {
+                    config.hostbased_accepted_algorithms = Some(
+                        value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+                    );
+                }
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }
@@ -1707,7 +1724,6 @@ impl ServerConfig {
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
                 "casignaturealgorithms" | "ca_signature_algorithms"
-                | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
                 | "modulifile" | "moduli_file"
                 | "pubkeyauthoptions" | "pubkey_auth_options"
@@ -1867,6 +1883,35 @@ Match User alice
         assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0xb8, 0xb8));
         let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
         assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0x00, 0x00));
+    }
+
+    #[test]
+    fn hostbased_accepted_algorithms_parsing() {
+        // Default: unset (all default algorithms accepted).
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.hostbased_accepted_algorithms.is_none());
+
+        let cfg = ServerConfig::parse(
+            "HostbasedAcceptedAlgorithms ssh-ed25519,rsa-sha2-256\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.hostbased_accepted_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string(), "rsa-sha2-256".to_string()][..])
+        );
+
+        // Match block override (with legacy HostbasedAcceptedKeyTypes alias).
+        let cfg = ServerConfig::parse(
+            "Match User alice\n    HostbasedAcceptedKeyTypes ssh-ed25519\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        assert_eq!(
+            r.hostbased_accepted_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string()][..])
+        );
+        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        assert!(r.hostbased_accepted_algorithms.is_none());
     }
 
     #[test]

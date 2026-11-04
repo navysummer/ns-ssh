@@ -187,6 +187,11 @@ fn main() {
                 "hostbasedauthentication" | "hostbased_auth" => {
                     config.hostbased_auth = value == "yes";
                 }
+                "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedacceptedkeytypes" => {
+                    config.hostbased_accepted_algorithms = Some(
+                        value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+                    );
+                }
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }

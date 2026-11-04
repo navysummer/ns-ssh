@@ -107,6 +107,13 @@ pub struct HostConfig {
     pub password_authentication: Option<bool>,
     #[serde(default)]
     pub pubkey_authentication: Option<bool>,
+    /// HostbasedAuthentication: authenticate via the local host's key
+    /// (OpenSSH default no).
+    #[serde(default)]
+    pub hostbased_authentication: Option<bool>,
+    /// HostbasedAcceptedAlgorithms (alias HostbasedKeyTypes).
+    #[serde(default)]
+    pub hostbased_accepted_algorithms: Option<String>,
     #[serde(default)]
     pub kbd_interactive_authentication: Option<bool>,
     #[serde(default)]
@@ -313,6 +320,10 @@ pub struct ResolvedConfig {
     pub batch_mode: bool,
     pub password_authentication: bool,
     pub pubkey_authentication: bool,
+    /// HostbasedAuthentication (OpenSSH default no).
+    pub hostbased_authentication: bool,
+    /// HostbasedAcceptedAlgorithms: allowed client host key algorithms.
+    pub hostbased_accepted_algorithms: Option<Vec<String>>,
     pub kbd_interactive_authentication: bool,
     pub preferred_authentications: Option<Vec<String>>,
     pub host_key_algorithms: Option<Vec<String>>,
@@ -436,6 +447,8 @@ impl ResolvedConfig {
             batch_mode: false,
             password_authentication: true,
             pubkey_authentication: true,
+            hostbased_authentication: false,
+            hostbased_accepted_algorithms: None,
             kbd_interactive_authentication: true,
             preferred_authentications: None,
             host_key_algorithms: None,
@@ -819,6 +832,8 @@ impl SshConfig {
         let mut batch_mode = None;
         let mut password_authentication = None;
         let mut pubkey_authentication = None;
+        let mut hostbased_authentication = None;
+        let mut hostbased_accepted_algorithms = None;
         let mut kbd_interactive_authentication = None;
         let mut preferred_authentications = None;
         let mut host_key_algorithms = None;
@@ -907,6 +922,8 @@ impl SshConfig {
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
+                            hostbased_authentication: hostbased_authentication.take(),
+                            hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
@@ -1012,6 +1029,8 @@ impl SshConfig {
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
+                            hostbased_authentication: hostbased_authentication.take(),
+                            hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
@@ -1097,6 +1116,8 @@ impl SshConfig {
                             batch_mode: batch_mode.take(),
                             password_authentication: password_authentication.take(),
                             pubkey_authentication: pubkey_authentication.take(),
+                            hostbased_authentication: hostbased_authentication.take(),
+                            hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
@@ -1287,6 +1308,12 @@ impl SshConfig {
                     });
                 }
                 "updatehostkeys" | "update_host_keys" => update_host_keys = Some(value.to_ascii_lowercase()),
+                "hostbasedauthentication" | "hostbased_authentication" => {
+                    hostbased_authentication = Some(yes(value));
+                }
+                "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" => {
+                    hostbased_accepted_algorithms = Some(value.to_string());
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
@@ -1294,8 +1321,6 @@ impl SshConfig {
                 | "kbdinteractivedevices" | "kbd_interactive_devices"
                 | "syslogfacility" | "syslog_facility"
                 | "xauthlocation" | "xauth_location"
-                | "hostbasedauthentication" | "hostbased_authentication"
-                | "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms"
                 | "casignaturealgorithms" | "ca_signature_algorithms"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
@@ -1390,6 +1415,8 @@ impl SshConfig {
                 batch_mode,
                 password_authentication,
                 pubkey_authentication,
+                hostbased_authentication,
+                hostbased_accepted_algorithms: hostbased_accepted_algorithms.clone(),
                 kbd_interactive_authentication,
                 preferred_authentications: preferred_authentications.clone(),
                 host_key_algorithms: host_key_algorithms.clone(),

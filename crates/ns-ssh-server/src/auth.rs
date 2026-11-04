@@ -719,6 +719,71 @@ impl ServerAuth {
         }
     }
 
+    /// Verify a hostbased authentication request (RFC 4252 §8): the claimed
+    /// client host key must appear in known_hosts (system files always; the
+    /// target user's files unless `ignore_user_known_hosts`), then the
+    /// signature over the hostbased sign data must verify.
+    ///
+    /// Unlike OpenSSH we never consult ~/.rhosts/~/.shosts (IgnoreRhosts is
+    /// effectively always yes); host key possession alone authenticates the
+    /// client host.
+    pub fn verify_hostbased(
+        &self,
+        session_id: &[u8],
+        username: &str,
+        key_type: &str,
+        public_key: &[u8],
+        client_host: &str,
+        client_user: &str,
+        signature_blob: &[u8],
+        ignore_user_known_hosts: bool,
+    ) -> bool {
+        let mut paths: Vec<std::path::PathBuf> = vec![
+            std::path::PathBuf::from("/etc/ssh/ssh_known_hosts"),
+            std::path::PathBuf::from("/etc/ssh/ssh_known_hosts2"),
+        ];
+        if !ignore_user_known_hosts {
+            if let Some(home) = Self::home_dir_for_user(username) {
+                paths.push(std::path::PathBuf::from(&home).join(".ssh/known_hosts"));
+                paths.push(std::path::PathBuf::from(&home).join(".ssh/known_hosts2"));
+            }
+        }
+        if !Self::host_key_in_known_hosts(&paths, client_host, key_type, public_key) {
+            tracing::debug!("hostbased: no known_hosts entry for client host {}", client_host);
+            return false;
+        }
+
+        let signer = match self.create_signer_for_key(key_type, public_key) {
+            Some(s) => s,
+            None => return false,
+        };
+        let data = ssh_core::auth::build_hostbased_sign_data(
+            username, "ssh-connection", key_type, public_key, client_host, client_user, session_id,
+        );
+        signer.verify(&data, signature_blob).unwrap_or(false)
+    }
+
+    /// Check the client host key against the given known_hosts files.
+    fn host_key_in_known_hosts(
+        paths: &[std::path::PathBuf],
+        client_host: &str,
+        key_type: &str,
+        public_key: &[u8],
+    ) -> bool {
+        use ssh_core::known_hosts::{HostKeyStatus, KnownHosts};
+        for path in paths {
+            if let Ok(content) = fs::read_to_string(path) {
+                let kh = KnownHosts::from_content(&content);
+                // Host keys are stored under the plain host name; port is
+                // only consulted for [host]:port entries.
+                if matches!(kh.check(client_host, 22, key_type, public_key), HostKeyStatus::Known) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn verify_signature(
         &self,
         session_id: &[u8],
@@ -1051,6 +1116,24 @@ mod tests {
         // World-writable: rejected.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(!ServerAuth::check_authorized_keys_permissions(&path, &me));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostbased_known_hosts_lookup() {
+        let dir = std::env::temp_dir().join(format!("ns-ssh-auth-hostbased-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = ssh_core::hostkey::Ed25519HostKey::generate().unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(&path, format!("client.example.com {}\n", pub_key_line(&key))).unwrap();
+        let blob = key.public_key_bytes();
+        let paths = vec![path];
+        // Matching host name + key is accepted.
+        assert!(ServerAuth::host_key_in_known_hosts(&paths, "client.example.com", "ssh-ed25519", &blob));
+        // Unknown host name or wrong key type is rejected.
+        assert!(!ServerAuth::host_key_in_known_hosts(&paths, "other.example.com", "ssh-ed25519", &blob));
+        assert!(!ServerAuth::host_key_in_known_hosts(&paths, "client.example.com", "ssh-rsa", &blob));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

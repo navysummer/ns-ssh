@@ -35,6 +35,13 @@ fn terminal_size() -> std::io::Result<(u32, u32)> {
     Ok((ws.ws_col as u32, ws.ws_row as u32))
 }
 
+/// Host key files tried for hostbased authentication, in OpenSSH's order.
+const HOST_KEY_CANDIDATES: &[&str] = &[
+    "/etc/ssh/ssh_host_ed25519_key",
+    "/etc/ssh/ssh_host_ecdsa_key",
+    "/etc/ssh/ssh_host_rsa_key",
+];
+
 /// Saves terminal state and puts it in raw mode. Restores on Drop.
 #[cfg(unix)]
 pub struct TerminalGuard {
@@ -1320,6 +1327,7 @@ impl SshClient {
             for m in pref {
                 let ok = match m.as_str() {
                     "publickey" => self.config.pubkey_authentication,
+                    "hostbased" => self.config.hostbased_authentication,
                     "keyboard-interactive" => self.config.kbd_interactive_authentication,
                     "password" => self.config.password_authentication,
                     _ => false,
@@ -1332,6 +1340,7 @@ impl SshClient {
                 return Err(SshError::AuthFailed("no authentication methods enabled".into()));
             }
         } else {
+            if self.config.hostbased_authentication { method_order.push("hostbased".into()); }
             if self.config.pubkey_authentication { method_order.push("publickey".into()); }
             if self.config.kbd_interactive_authentication { method_order.push("keyboard-interactive".into()); }
             if self.config.password_authentication { method_order.push("password".into()); }
@@ -1487,6 +1496,46 @@ impl SshClient {
                                     Err(_) => continue,
                                 }
                             }
+                        }
+                    }
+                    if auth_succeeded { break; }
+                }
+                "hostbased" => {
+                    // Sign with the local host's private key. Unlike OpenSSH
+                    // (which uses the setuid ssh-keysign helper), we read the
+                    // host key files directly, so this only works when they
+                    // are readable by the current user (e.g. root).
+                    let client_host = local_hostname();
+                    let client_user = std::env::var("USER").unwrap_or_else(|_| username.clone());
+                    for key_path in HOST_KEY_CANDIDATES {
+                        let signer = match crate::agent::load_private_key(std::path::Path::new(key_path)) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let alg = signer.algorithm_name().to_string();
+                        if let Some(ref accepted) = self.config.hostbased_accepted_algorithms {
+                            if !crate::config::pubkey_alg_accepted(&alg, accepted) {
+                                continue;
+                            }
+                        }
+                        let hostbased_msg = build_userauth_hostbased(
+                            &username,
+                            msg::SSH_SERVICE_NAME_CONNECTION,
+                            signer.as_ref(),
+                            &client_host,
+                            &client_user,
+                            &session_id,
+                        );
+                        send_encrypted_packet(stream, &hostbased_msg, &mut self.transport, false, aead).await?;
+                        let resp = read_auth_packet(stream, &mut self.transport, aead).await?;
+                        match resp.first() {
+                            Some(&msg::SSH_MSG_USERAUTH_SUCCESS) => {
+                                auth_succeeded = true;
+                                break;
+                            }
+                            Some(&msg::SSH_MSG_USERAUTH_FAILURE) => continue,
+                            Some(&msg::SSH_MSG_USERAUTH_BANNER) => continue,
+                            _ => continue,
                         }
                     }
                     if auth_succeeded { break; }

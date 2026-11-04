@@ -67,6 +67,61 @@ fn build_sign_data(username: &str, service: &str, signer: &(dyn HostKeySigner + 
     data
 }
 
+/// Build the signature payload for hostbased authentication (RFC 4252 §8).
+pub fn build_hostbased_sign_data(
+    username: &str,
+    service: &str,
+    key_alg: &str,
+    public_key: &[u8],
+    client_hostname: &str,
+    client_username: &str,
+    session_id: &[u8],
+) -> Vec<u8> {
+    let mut data = Vec::new();
+    SshBytes(session_id.to_vec()).encode(&mut data).unwrap();
+    data.push(msg::SSH_MSG_USERAUTH_REQUEST);
+    SshString::new(username).encode(&mut data).unwrap();
+    SshString::new(service).encode(&mut data).unwrap();
+    SshString::new("hostbased").encode(&mut data).unwrap();
+    SshString::new(key_alg).encode(&mut data).unwrap();
+    SshBytes(public_key.to_vec()).encode(&mut data).unwrap();
+    SshString::new(client_hostname).encode(&mut data).unwrap();
+    SshString::new(client_username).encode(&mut data).unwrap();
+    data
+}
+
+/// Build a signed hostbased SSH_MSG_USERAUTH_REQUEST (RFC 4252 §8).
+pub fn build_userauth_hostbased(
+    username: &str,
+    service: &str,
+    signer: &dyn HostKeySigner,
+    client_hostname: &str,
+    client_username: &str,
+    session_id: &[u8],
+) -> Vec<u8> {
+    let sign_data = build_hostbased_sign_data(
+        username,
+        service,
+        signer.algorithm_name(),
+        &signer.public_key_bytes(),
+        client_hostname,
+        client_username,
+        session_id,
+    );
+    let signature = signer.sign(&sign_data).unwrap_or_default();
+    let mut payload = Vec::new();
+    payload.push(msg::SSH_MSG_USERAUTH_REQUEST);
+    SshString::new(username).encode(&mut payload).unwrap();
+    SshString::new(service).encode(&mut payload).unwrap();
+    SshString::new("hostbased").encode(&mut payload).unwrap();
+    SshString::new(signer.algorithm_name()).encode(&mut payload).unwrap();
+    SshBytes(signer.public_key_bytes()).encode(&mut payload).unwrap();
+    SshString::new(client_hostname).encode(&mut payload).unwrap();
+    SshString::new(client_username).encode(&mut payload).unwrap();
+    SshBytes(signature).encode(&mut payload).unwrap();
+    payload
+}
+
 pub fn build_userauth_request_with_session(
     username: &str,
     service: &str,
@@ -220,5 +275,64 @@ pub fn build_userauth_info_response(answers: &[String]) -> Vec<u8> {
         SshString::new(a.as_str()).encode(&mut payload).unwrap();
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hostkey::Ed25519HostKey;
+
+    /// Hostbased request: wire fields match RFC 4252 §8 and the embedded
+    /// signature verifies against the reconstructed sign data (the exact
+    /// reconstruction the server performs).
+    #[test]
+    fn hostbased_request_roundtrip() {
+        let signer = Ed25519HostKey::generate().unwrap();
+        let session_id = b"session-id-0123456789";
+        let payload = build_userauth_hostbased(
+            "alice",
+            "ssh-connection",
+            &signer,
+            "client.example.com",
+            "alice-local",
+            session_id,
+        );
+
+        let mut r = &payload[..];
+        assert_eq!(u8::decode(&mut r).unwrap(), msg::SSH_MSG_USERAUTH_REQUEST);
+        assert_eq!(SshString::decode(&mut r).unwrap().as_str().unwrap(), "alice");
+        assert_eq!(SshString::decode(&mut r).unwrap().as_str().unwrap(), "ssh-connection");
+        assert_eq!(SshString::decode(&mut r).unwrap().as_str().unwrap(), "hostbased");
+        let key_type = SshString::decode(&mut r).unwrap().as_str().unwrap().to_string();
+        assert_eq!(key_type, "ssh-ed25519");
+        let public_key = SshBytes::decode(&mut r).unwrap().0;
+        assert_eq!(public_key, signer.public_key_bytes());
+        assert_eq!(SshString::decode(&mut r).unwrap().as_str().unwrap(), "client.example.com");
+        assert_eq!(SshString::decode(&mut r).unwrap().as_str().unwrap(), "alice-local");
+        let signature = SshBytes::decode(&mut r).unwrap().0;
+        assert!(r.is_empty());
+
+        let data = build_hostbased_sign_data(
+            "alice",
+            "ssh-connection",
+            &key_type,
+            &public_key,
+            "client.example.com",
+            "alice-local",
+            session_id,
+        );
+        assert!(signer.verify(&data, &signature).unwrap());
+        // Any field change must invalidate the signature.
+        let bad = build_hostbased_sign_data(
+            "alice",
+            "ssh-connection",
+            &key_type,
+            &public_key,
+            "other.example.com",
+            "alice-local",
+            session_id,
+        );
+        assert!(!signer.verify(&bad, &signature).unwrap_or(false));
+    }
 }
 

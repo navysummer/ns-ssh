@@ -1812,6 +1812,13 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = host_config.pubkey_authentication {
                 resolved.pubkey_authentication = v;
             }
+            if let Some(v) = host_config.hostbased_authentication {
+                resolved.hostbased_authentication = v;
+            }
+            if let Some(v) = &host_config.hostbased_accepted_algorithms {
+                resolved.hostbased_accepted_algorithms =
+                    Some(v.split(',').map(|s| s.trim().to_string()).collect());
+            }
             if let Some(v) = host_config.kbd_interactive_authentication {
                 resolved.kbd_interactive_authentication = v;
             }
@@ -2092,6 +2099,13 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = mc.pubkey_authentication {
                 resolved.pubkey_authentication = v;
             }
+            if let Some(v) = mc.hostbased_authentication {
+                resolved.hostbased_authentication = v;
+            }
+            if let Some(v) = &mc.hostbased_accepted_algorithms {
+                resolved.hostbased_accepted_algorithms =
+                    Some(v.split(',').map(|s| s.trim().to_string()).collect());
+            }
             if let Some(v) = mc.kbd_interactive_authentication {
                 resolved.kbd_interactive_authentication = v;
             }
@@ -2309,6 +2323,12 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "kbdinteractiveauthentication" | "kbd_interactive_authentication"
             | "challengeresponseauthentication" | "challenge_response_authentication" =>
             resolved.kbd_interactive_authentication = value != "no",
+        "hostbasedauthentication" | "hostbased_authentication" =>
+            resolved.hostbased_authentication = value != "no",
+        "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedkeytypes" => {
+            resolved.hostbased_accepted_algorithms =
+                Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
+        }
         "preferredauthentications" | "preferred_authentications" => {
             resolved.preferred_authentications = Some(value.split(',').map(str::trim).map(|s| s.to_string()).collect());
         }
