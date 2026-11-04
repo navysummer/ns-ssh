@@ -12,6 +12,12 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Apply the StreamLocalBindMask mode to a freshly created Unix socket.
+fn apply_socket_mask(path: &str, mask: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask));
+}
+
 trait StreamBox: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite + ?Sized> StreamBox for T {}
 type BoxStream = Box<dyn StreamBox + Send + Unpin>;
@@ -1589,9 +1595,12 @@ async fn handle_connection_service(
                                     }
                                     continue;
                                 }
-                                let _ = std::fs::remove_file(&path);
+                                if config.stream_local_bind_unlink {
+                                    let _ = std::fs::remove_file(&path);
+                                }
                                 match tokio::net::UnixListener::bind(&path) {
                                     Ok(listener) => {
+                                        apply_socket_mask(&path, config.stream_local_bind_mask);
                                         forwarded_streamlocal_paths.push(path.clone());
                                         let tx = streamlocal_tx.clone();
                                         let path2 = path.clone();

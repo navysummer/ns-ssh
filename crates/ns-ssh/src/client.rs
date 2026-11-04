@@ -1594,9 +1594,12 @@ impl SshClient {
         // StreamLocal `-L local_socket:remote_socket` forwards (Unix sockets).
         let mut local_streamlocal_meta: Vec<String> = Vec::new();
         for (i, (local_socket, remote_socket)) in self.config.local_streamlocal.clone().into_iter().enumerate() {
-            let _ = std::fs::remove_file(&local_socket);
+            if self.config.stream_local_bind_unlink {
+                let _ = std::fs::remove_file(&local_socket);
+            }
             match tokio::net::UnixListener::bind(&local_socket) {
                 Ok(listener) => {
+                    apply_socket_mask(&local_socket, self.config.stream_local_bind_mask);
                     tracing::info!("StreamLocal forwarding listening on {} -> {}", local_socket, remote_socket);
                     local_streamlocal_meta.push(remote_socket.clone());
                     let tx = accept_tx.clone();
@@ -3526,6 +3529,12 @@ async fn connect_agent_socket(override_path: Option<&str>) -> Result<tokio::net:
         std::env::var("SSH_AUTH_SOCK").map_err(|_| SshError::Protocol("SSH_AUTH_SOCK not set".into()))?
     };
     tokio::net::UnixStream::connect(path).await.map_err(SshError::Io)
+}
+
+/// Apply the StreamLocalBindMask mode to a freshly created Unix socket.
+fn apply_socket_mask(path: &str, mask: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask));
 }
 
 async fn connect_x11_display(display: &str) -> std::io::Result<tokio::net::TcpStream> {

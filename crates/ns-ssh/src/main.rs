@@ -1710,6 +1710,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(x) = host_config.forward_x11_timeout {
                 resolved.forward_x11_timeout = x;
             }
+            if let Some(x) = host_config.stream_local_bind_mask {
+                resolved.stream_local_bind_mask = x;
+            }
+            if let Some(x) = host_config.stream_local_bind_unlink {
+                resolved.stream_local_bind_unlink = x;
+            }
             if let Some(c) = host_config.compression {
                 resolved.compression = c;
             }
@@ -1951,6 +1957,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(x) = mc.forward_x11_timeout {
                 resolved.forward_x11_timeout = x;
+            }
+            if let Some(x) = mc.stream_local_bind_mask {
+                resolved.stream_local_bind_mask = x;
+            }
+            if let Some(x) = mc.stream_local_bind_unlink {
+                resolved.stream_local_bind_unlink = x;
             }
             if let Some(c) = mc.compression {
                 resolved.compression = c;
@@ -2203,6 +2215,14 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
             if let Some(v) = config::parse_time_suffix(value) {
                 resolved.forward_x11_timeout = v as u32;
             }
+        }
+        "streamlocalbindmask" | "stream_local_bind_mask" => {
+            if let Ok(v) = u32::from_str_radix(value.trim_start_matches("0o"), 8) {
+                resolved.stream_local_bind_mask = v;
+            }
+        }
+        "streamlocalbindunlink" | "stream_local_bind_unlink" => {
+            resolved.stream_local_bind_unlink = value != "no";
         }
         "compression" => resolved.compression = value != "no",
         "proxyjump" | "proxy_jump" => resolved.proxy_jump = Some(value.to_string()),

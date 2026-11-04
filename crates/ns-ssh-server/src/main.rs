@@ -210,6 +210,14 @@ fn main() {
                 "x11uselocalhost" | "x11_use_localhost" => {
                     config.x11_use_localhost = value == "yes";
                 }
+                "streamlocalbindmask" | "stream_local_bind_mask" => {
+                    if let Ok(v) = u32::from_str_radix(value.trim_start_matches("0o"), 8) {
+                        config.stream_local_bind_mask = v;
+                    }
+                }
+                "streamlocalbindunlink" | "stream_local_bind_unlink" => {
+                    config.stream_local_bind_unlink = value == "yes";
+                }
                 "forcecommand" | "force_command" => {
                     config.force_command = Some(value.to_string());
                 }

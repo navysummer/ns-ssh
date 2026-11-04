@@ -191,6 +191,14 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub x11_use_localhost: bool,
 
+    /// StreamLocalBindMask (octal) applied to created Unix sockets.
+    #[serde(default = "default_streamlocal_mask")]
+    pub stream_local_bind_mask: u32,
+
+    /// StreamLocalBindUnlink: remove an existing socket before binding.
+    #[serde(default)]
+    pub stream_local_bind_unlink: bool,
+
     /// AllowTcpForwarding value: yes/no/local/remote/all.
     #[serde(default = "default_forwarding_mode")]
     pub allow_tcp_forwarding_mode: String,
@@ -282,6 +290,8 @@ pub struct MatchOverrides {
     pub allow_tcp_forwarding_mode: Option<String>,
     pub x11_forwarding: Option<bool>,
     pub x11_use_localhost: Option<bool>,
+    pub stream_local_bind_mask: Option<u32>,
+    pub stream_local_bind_unlink: Option<bool>,
     pub allow_agent_forwarding: Option<bool>,
     pub allow_streamlocal_forwarding: Option<bool>,
     pub allow_users: Option<Vec<String>>,
@@ -364,6 +374,8 @@ impl ServerMatch {
         if let Some(v) = &o.allow_tcp_forwarding_mode { cfg.allow_tcp_forwarding_mode = v.clone(); }
         if let Some(v) = o.x11_forwarding { cfg.x11_forwarding = v; }
         if let Some(v) = o.x11_use_localhost { cfg.x11_use_localhost = v; }
+        if let Some(v) = o.stream_local_bind_mask { cfg.stream_local_bind_mask = v; }
+        if let Some(v) = o.stream_local_bind_unlink { cfg.stream_local_bind_unlink = v; }
         if let Some(v) = o.allow_agent_forwarding { cfg.allow_agent_forwarding = v; }
         if let Some(v) = o.allow_streamlocal_forwarding { cfg.allow_streamlocal_forwarding = v; }
         if let Some(v) = &o.allow_users { cfg.allow_users = v.clone(); }
@@ -497,12 +509,15 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         | "pubkeyauthoptions" | "pubkey_auth_options"
         | "requiredrsasize" | "required_rsa_size"
         | "revokedkeys" | "revoked_keys"
-        | "streamlocalbindmask" | "stream_local_bind_mask"
-        | "streamlocalbindunlink" | "stream_local_bind_unlink"
-        | "trustedusercakeys" | "trusted_user_ca_keys"
         | "disableforwarding" | "disable_forwarding"
         | "permittunnel" | "permit_tunnel" => {
             // Accepted; not enforced.
+        }
+        "streamlocalbindmask" | "stream_local_bind_mask" => {
+            o.stream_local_bind_mask = u32::from_str_radix(value.trim_start_matches("0o"), 8).ok();
+        }
+        "streamlocalbindunlink" | "stream_local_bind_unlink" => {
+            o.stream_local_bind_unlink = Some(value == "yes");
         }
         _ => return Err(SshError::Config(format!(
             "unknown directive '{}' in Match block",
@@ -785,6 +800,8 @@ fn default_accept_env() -> Vec<String> {
 
 fn default_x11_display_offset() -> u32 { 10 }
 
+fn default_streamlocal_mask() -> u32 { 0o177 }
+
 /// Local hostname, used for DISPLAY when X11UseLocalhost is disabled.
 fn local_hostname() -> String {
     let mut buf = [0u8; 256];
@@ -885,6 +902,8 @@ impl Default for ServerConfig {
             x11_forwarding: false,
             x11_display_offset: default_x11_display_offset(),
             x11_use_localhost: true,
+            stream_local_bind_mask: default_streamlocal_mask(),
+            stream_local_bind_unlink: false,
             allow_tcp_forwarding_mode: default_forwarding_mode(),
             permit_open: Vec::new(),
             permit_listen: Vec::new(),
@@ -1216,6 +1235,14 @@ impl ServerConfig {
                 "x11uselocalhost" | "x11_use_localhost" => {
                     config.x11_use_localhost = value == "yes";
                 }
+                "streamlocalbindmask" | "stream_local_bind_mask" => {
+                    if let Ok(v) = u32::from_str_radix(value.trim_start_matches("0o"), 8) {
+                        config.stream_local_bind_mask = v;
+                    }
+                }
+                "streamlocalbindunlink" | "stream_local_bind_unlink" => {
+                    config.stream_local_bind_unlink = value == "yes";
+                }
                 "allowagentforwarding" | "allow_agent_forwarding" => {
                     config.allow_agent_forwarding = value == "yes";
                 }
@@ -1343,8 +1370,6 @@ impl ServerConfig {
                 | "revokedkeys" | "revoked_keys"
                 | "securitykeyprovider" | "security_key_provider"
                 | "sshdsessionpath" | "sshd_session_path"
-                | "streamlocalbindmask" | "stream_local_bind_mask"
-                | "streamlocalbindunlink" | "stream_local_bind_unlink"
                 | "trustedusercakeys" | "trusted_user_ca_keys"
                 | "unusedconnectiontimeout" | "unused_connection_timeout"
                 | "versionaddendum" | "version_addendum"
@@ -1661,5 +1686,22 @@ Match All
         )
         .unwrap();
         assert_eq!(c.port, default_port());
+    }
+
+    #[test]
+    fn stream_local_bind_options_are_parsed() {
+        let c = ServerConfig::parse("").unwrap();
+        assert_eq!(c.stream_local_bind_mask, 0o177);
+        assert!(!c.stream_local_bind_unlink);
+
+        let c = ServerConfig::parse(
+            "StreamLocalBindMask 0777\nStreamLocalBindUnlink yes\n",
+        )
+        .unwrap();
+        assert_eq!(c.stream_local_bind_mask, 0o777);
+        assert!(c.stream_local_bind_unlink);
+
+        let c = ServerConfig::parse("Match User alice\n    StreamLocalBindUnlink yes\n").unwrap();
+        assert_eq!(c.match_blocks[0].overrides.stream_local_bind_unlink, Some(true));
     }
 }

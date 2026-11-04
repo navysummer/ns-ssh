@@ -69,6 +69,12 @@ pub struct HostConfig {
     pub forward_x11_trusted: Option<bool>,
     #[serde(default)]
     pub forward_x11_timeout: Option<u32>,
+    /// StreamLocalBindMask: octal permission mask for created Unix sockets.
+    #[serde(default)]
+    pub stream_local_bind_mask: Option<u32>,
+    /// StreamLocalBindUnlink: remove an existing socket before binding.
+    #[serde(default)]
+    pub stream_local_bind_unlink: Option<bool>,
     #[serde(default)]
     pub compression: Option<bool>,
     #[serde(default)]
@@ -232,6 +238,10 @@ pub struct ResolvedConfig {
     /// ForwardX11Timeout: seconds an untrusted X11 session may stay idle
     /// before the channel is closed (default 1200; 0 disables).
     pub forward_x11_timeout: u32,
+    /// StreamLocalBindMask (octal); default 0177.
+    pub stream_local_bind_mask: u32,
+    /// StreamLocalBindUnlink: unlink existing socket files before binding.
+    pub stream_local_bind_unlink: bool,
     pub compression: bool,
     pub strict_host_key_checking: HostKeyChecking,
     pub hash_known_hosts: bool,
@@ -339,6 +349,8 @@ impl ResolvedConfig {
             forward_x11: false,
             forward_x11_trusted: false,
             forward_x11_timeout: 1200,
+            stream_local_bind_mask: 0o177,
+            stream_local_bind_unlink: false,
             compression: false,
             strict_host_key_checking: HostKeyChecking::Yes,
             hash_known_hosts: false,
@@ -562,6 +574,8 @@ impl SshConfig {
         let mut forward_x11 = None;
         let mut forward_x11_trusted = None;
         let mut forward_x11_timeout: Option<u32> = None;
+        let mut stream_local_bind_mask: Option<u32> = None;
+        let mut stream_local_bind_unlink: Option<bool> = None;
         let mut compression = None;
         let mut strict_host_key_checking = None;
         let mut hash_known_hosts = None;
@@ -648,6 +662,8 @@ impl SshConfig {
                             forward_x11: forward_x11.take(),
                             forward_x11_trusted: forward_x11_trusted.take(),
                             forward_x11_timeout: forward_x11_timeout.take(),
+                            stream_local_bind_mask: stream_local_bind_mask.take(),
+                            stream_local_bind_unlink: stream_local_bind_unlink.take(),
                             compression: compression.take(),
                             strict_host_key_checking: strict_host_key_checking.take(),
                             hash_known_hosts: hash_known_hosts.take(),
@@ -721,6 +737,8 @@ impl SshConfig {
                             forward_x11: forward_x11.take(),
                             forward_x11_trusted: forward_x11_trusted.take(),
                             forward_x11_timeout: forward_x11_timeout.take(),
+                            stream_local_bind_mask: stream_local_bind_mask.take(),
+                            stream_local_bind_unlink: stream_local_bind_unlink.take(),
                             compression: compression.take(),
                             strict_host_key_checking: strict_host_key_checking.take(),
                             hash_known_hosts: hash_known_hosts.take(),
@@ -798,6 +816,12 @@ impl SshConfig {
                 "forwardx11trusted" | "forward_x11_trusted" => forward_x11_trusted = Some(yes(value)),
                 "forwardx11timeout" | "forward_x11_timeout" => {
                     forward_x11_timeout = parse_time_suffix(value).map(|v| v as u32);
+                }
+                "streamlocalbindmask" | "stream_local_bind_mask" => {
+                    stream_local_bind_mask = u32::from_str_radix(value.trim_start_matches("0o"), 8).ok();
+                }
+                "streamlocalbindunlink" | "stream_local_bind_unlink" => {
+                    stream_local_bind_unlink = Some(yes(value));
                 }
                 "compression" => compression = Some(yes(value)),
                 "stricthostkeychecking" | "strict_host_key_checking" => {
@@ -885,8 +909,6 @@ impl SshConfig {
                 | "casignaturealgorithms" | "ca_signature_algorithms"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
-                | "streamlocalbindmask" | "stream_local_bind_mask"
-                | "streamlocalbindunlink" | "stream_local_bind_unlink"
                 | "certificatefile" | "certificate_file"
                 | "revokedhostkeys" | "revoked_host_keys"
                 | "securitykeyprovider" | "security_key_provider"
@@ -960,6 +982,8 @@ impl SshConfig {
                 forward_x11,
                 forward_x11_trusted,
                 forward_x11_timeout,
+                stream_local_bind_mask,
+                stream_local_bind_unlink,
                 compression,
                 strict_host_key_checking: strict_host_key_checking.clone(),
                 hash_known_hosts,
@@ -1033,6 +1057,8 @@ impl SshConfig {
                     forward_x11,
                     forward_x11_trusted,
                     forward_x11_timeout,
+                    stream_local_bind_mask,
+                    stream_local_bind_unlink,
                     compression,
                     strict_host_key_checking: strict_host_key_checking.clone(),
                     hash_known_hosts,
@@ -1730,5 +1756,21 @@ mod tests {
         let r = ResolvedConfig::default_for_user("nobody");
         assert!(!r.forward_x11_trusted);
         assert_eq!(r.forward_x11_timeout, 1200);
+    }
+
+    #[test]
+    fn stream_local_bind_options_are_parsed() {
+        let cfg = SshConfig::parse(
+            "Host foo\n  StreamLocalBindMask 0111\n  StreamLocalBindUnlink yes\n",
+        )
+        .unwrap();
+        let host = cfg.hosts.iter().find(|h| h.host == "foo").unwrap();
+        assert_eq!(host.stream_local_bind_mask, Some(0o111));
+        assert_eq!(host.stream_local_bind_unlink, Some(true));
+
+        // OpenSSH default mask is 0177.
+        let r = ResolvedConfig::default_for_user("nobody");
+        assert_eq!(r.stream_local_bind_mask, 0o177);
+        assert!(!r.stream_local_bind_unlink);
     }
 

@@ -2159,3 +2159,68 @@ fn client_channel_timeout_closes_idle_session() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn client_streamlocal_bind_mask_and_unlink() {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("client-streamlocal");
+    let port = free_port();
+    let (server, id_path, kh) = launch_test_server_extra(&dir, port, &[]);
+
+    let local_sock = dir.join("local.sock");
+    let remote_sock = dir.join("remote.sock");
+    // A stale file that only gets replaced when StreamLocalBindUnlink is on.
+    std::fs::write(&local_sock, b"stale").unwrap();
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let spec = format!("{}:{}", local_sock.display(), remote_sock.display());
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("StreamLocalBindMask=0000")
+        .arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg("-L")
+        .arg(&spec)
+        .arg("127.0.0.1")
+        .arg("sleep 30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn client");
+
+    let mut created = false;
+    for _ in 0..120 {
+        // The pre-existing stale file must be replaced by a real socket.
+        if std::fs::metadata(&local_sock)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false)
+        {
+            created = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mode = std::fs::metadata(&local_sock)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777);
+
+    let _ = child.kill();
+    let client_out = child.wait_with_output().expect("wait client");
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(created, "local StreamLocal socket was not created");
+    assert_eq!(
+        mode,
+        Some(0o777),
+        "StreamLocalBindMask=0000 should create a 0777 socket; client stderr: {}",
+        String::from_utf8_lossy(&client_out.stderr)
+    );
+}
