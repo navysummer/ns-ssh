@@ -1,9 +1,8 @@
-use crate::error::{Result, SshError};
+use crate::error::Result;
 use crate::encoding::*;
 use crate::msg;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 pub type ChannelId = u32;
 
@@ -102,6 +101,14 @@ impl ChannelManager {
 
     pub fn find_by_remote_id(&self, remote_id: ChannelId) -> Option<&Channel> {
         self.channels.values().find(|c| c.remote_id == Some(remote_id))
+    }
+
+    /// Resolve the channel id to put in a *reply* to an inbound channel
+    /// message. RFC 4254 §5.2: the inbound `recipient` field is a local id
+    /// (it never identifies a peer channel), so replies must use the peer's
+    /// id recorded for that channel. Returns `None` for an unknown channel.
+    pub fn reply_recipient(&self, inbound_recipient: ChannelId) -> Option<ChannelId> {
+        self.channels.get(&inbound_recipient).and_then(|c| c.remote_id)
     }
 
     /// Apply an SSH_MSG_CHANNEL_WINDOW_ADJUST to a channel's peer window.
@@ -590,11 +597,11 @@ pub fn build_request_failure() -> Vec<u8> {
     vec![msg::SSH_MSG_REQUEST_FAILURE]
 }
 
-pub fn build_unimplemented(sequence: u32) -> Vec<u8> {
+pub fn build_unimplemented(sequence: u32) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(5);
     payload.push(msg::SSH_MSG_UNIMPLEMENTED);
-    sequence.encode(&mut payload);
-    payload
+    sequence.encode(&mut payload)?;
+    Ok(payload)
 }
 
 pub fn build_x11_request(
@@ -655,4 +662,33 @@ pub fn parse_ext_info(payload: &[u8]) -> Result<Vec<(String, String)>> {
         entries.push((k, v));
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the recipient-channel mix-up: inbound `recipient` fields
+    /// are local ids, not peer ids. The first channel (local 0, remote 9) and
+    /// a second channel (local 1, remote 0) must not be confused even though
+    /// one channel's local id equals another channel's remote id.
+    #[test]
+    fn reply_recipient_maps_local_to_peer_id() {
+        let mut m = ChannelManager::new();
+        let first = m.alloc_channel(msg::SSH_CHANNEL_TYPE_SESSION, 1 << 20, 4096);
+        let second = m.alloc_channel(msg::SSH_CHANNEL_TYPE_SESSION, 1 << 20, 4096);
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        m.set_remote_id(first, 9);
+        m.set_remote_id(second, 0);
+
+        // Inbound recipient 0 belongs to `first`; the reply must go to 9.
+        assert_eq!(m.get_channel(0).unwrap().remote_id, Some(9));
+        assert_eq!(m.reply_recipient(0), Some(9));
+        assert_eq!(m.reply_recipient(1), Some(0));
+        // The trap the old code fell into: treating 0 as a remote id picks
+        // `second` instead of `first`.
+        assert_eq!(m.find_by_remote_id(0).map(|c| c.local_id), Some(1));
+        assert_eq!(m.reply_recipient(7), None);
+    }
 }
