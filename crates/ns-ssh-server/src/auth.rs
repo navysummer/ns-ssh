@@ -1133,6 +1133,45 @@ mod tests {
         assert!(!check_user_authorized("alice", "host", &allow, &deny));
     }
 
+    /// `create_signer_for_key` must accept an SK public key and verify an SK
+    /// signature produced by the underlying software key (no FIDO2 hardware:
+    /// only the verification half is wired up).
+    #[test]
+    fn create_signer_accepts_sk_key_and_verifies() {
+        use ssh_core::encoding::*;
+        use ssh_core::hostkey::{Ed25519HostKey, HostKeySigner};
+
+        let base = Ed25519HostKey::generate().unwrap();
+        let pk_blob = HostKeySigner::public_key_bytes(&base);
+        let mut r: &[u8] = &pk_blob;
+        let _ty = SshString::decode(&mut r).unwrap();
+        let raw_pk = SshBytes::decode(&mut r).unwrap().0;
+
+        let mut sk_blob = Vec::new();
+        SshString::new("sk-ssh-ed25519@openssh.com").encode(&mut sk_blob).unwrap();
+        SshString::new("ssh-ed25519").encode(&mut sk_blob).unwrap();
+        SshBytes(raw_pk).encode(&mut sk_blob).unwrap();
+        SshString::new("ssh:").encode(&mut sk_blob).unwrap();
+
+        let auth = ServerAuth::new();
+        let signer = auth
+            .create_signer_for_key("sk-ssh-ed25519@openssh.com", &sk_blob)
+            .expect("SK signer should be created");
+
+        let data = b"publickey auth sign data";
+        let plain_sig = base.sign(data).unwrap();
+        let mut r: &[u8] = &plain_sig;
+        let _ty = SshString::decode(&mut r).unwrap();
+        let raw_sig = SshBytes::decode(&mut r).unwrap().0;
+        let mut sk_sig = Vec::new();
+        SshString::new("sk-ssh-ed25519@openssh.com").encode(&mut sk_sig).unwrap();
+        SshBytes(raw_sig).encode(&mut sk_sig).unwrap();
+
+        assert!(signer.verify(data, &sk_sig).unwrap());
+        // The signer must refuse to produce a signature without a FIDO2 device.
+        assert!(signer.sign(data).is_err());
+    }
+
     #[test]
     fn strict_modes_rejects_world_writable() {
         use std::os::unix::fs::PermissionsExt;

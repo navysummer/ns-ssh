@@ -1113,9 +1113,9 @@ async fn handle_authenticated_session(
 
                         // PubkeyAuthOptions: touch-required/verify-required
                         // restrict pubkey authentication to FIDO security keys.
-                        // (ns-ssh has no sk-* signature verification, so an
-                        // accepted security key still fails later at verify;
-                        // the gate's purpose is rejecting non-SK keys.)
+                        // SK signature verification is implemented (SkHostKey),
+                        // but hardware signing/attestation requires a FIDO2
+                        // authenticator; the gate here rejects non-SK keys.
                         if !config.pubkey_auth_options.is_empty()
                             && !ssh_core::cert::base_key_type_for(&key_type)
                                 .unwrap_or(&key_type)
