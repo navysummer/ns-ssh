@@ -241,10 +241,12 @@ async fn handle_connection(
 ) -> Result<()> {
     let base_config = config;
 
-    // Evaluate `Match` blocks: Host/Address/All are known at connection time;
-    // User/Group are re-evaluated once the username is known (after auth request).
+    // Evaluate `Match` blocks: Host/Address/LocalAddress/LocalPort/RDomain/All
+    // are known at connection time; User/Group/Invalid-User are re-evaluated
+    // once the username is known (after auth request).
     let peer_ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let local_ip = stream.local_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
     let host_name = std::process::Command::new("hostname")
         .output()
         .ok()
@@ -254,8 +256,26 @@ async fn handle_connection(
         .unwrap_or_else(|| local_ip.clone());
     let match_host = host_name;
     let match_addr = peer_ip.clone();
+    // RDomain requires a reverse lookup; only do it when a Match block asks.
+    let match_rdomain = if base_config.match_blocks.iter().any(|m| {
+        m.conditions.iter().any(|(k, _)| k == "rdomain")
+    }) {
+        stream.peer_addr().ok().and_then(|a| reverse_dns(a.ip())).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
-    let config = base_config.resolve_for_match("", &[], &match_host, &match_addr);
+    let match_ctx = crate::config::ServerMatchContext {
+        username: None,
+        groups: &[],
+        host: &match_host,
+        addr: &match_addr,
+        local_addr: &local_ip,
+        local_port,
+        rdomain: &match_rdomain,
+        user_valid: None,
+    };
+    let config = base_config.resolve_for_match(&match_ctx);
 
     let mut transport = SshTransport::new();
     // Apply RekeyLimit so server-initiated rekeying follows the configured thresholds.
@@ -584,6 +604,9 @@ async fn handle_connection(
         base_config,
         match_host,
         match_addr,
+        local_ip,
+        local_port,
+        match_rdomain,
         host_keys.clone(),
         auth.clone(),
         &exchange_hash,
@@ -714,6 +737,9 @@ async fn handle_authenticated_session(
     base_config: ServerConfig,
     match_host: String,
     match_addr: String,
+    local_ip: String,
+    local_port: u16,
+    match_rdomain: String,
     host_keys: Arc<Mutex<HostKeyManager>>,
     auth: Arc<Mutex<ServerAuth>>,
     session_id: &[u8],
@@ -863,7 +889,18 @@ async fn handle_authenticated_session(
 
                 // Re-evaluate `Match` blocks now that the username is known.
                 let groups = crate::auth::get_user_groups(&username).unwrap_or_default();
-                config = base_config.resolve_for_match(&username, &groups, &match_host, &match_addr);
+                let user_known = crate::auth::user_exists(&username);
+                let match_ctx = crate::config::ServerMatchContext {
+                    username: Some(&username),
+                    groups: &groups,
+                    host: &match_host,
+                    addr: &match_addr,
+                    local_addr: &local_ip,
+                    local_port,
+                    rdomain: &match_rdomain,
+                    user_valid: Some(user_known),
+                };
+                config = base_config.resolve_for_match(&match_ctx);
 
                 if refuse_connection_if_configured(&mut stream, &mut transport, aead, &config).await? {
                     return Ok(());

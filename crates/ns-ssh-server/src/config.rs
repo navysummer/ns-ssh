@@ -405,39 +405,81 @@ pub struct MatchOverrides {
     pub channel_timeouts: Option<Vec<(String, u64)>>,
 }
 
+/// Context in which server `Match` conditions are evaluated.
+pub struct ServerMatchContext<'a> {
+    /// Login username — `None` before the auth request is seen; User/Group
+    /// conditions never match at that stage (same as OpenSSH's first pass).
+    pub username: Option<&'a str>,
+    pub groups: &'a [String],
+    /// Server host name.
+    pub host: &'a str,
+    /// Remote (client) address.
+    pub addr: &'a str,
+    /// Local address the connection was received on.
+    pub local_addr: &'a str,
+    /// Local port the connection was received on.
+    pub local_port: u16,
+    /// Reverse-DNS name of the remote address (empty when unknown).
+    pub rdomain: &'a str,
+    /// Whether the requested user exists — `None` when the username is not
+    /// yet known.
+    pub user_valid: Option<bool>,
+}
+
 impl ServerMatch {
     fn new(condition_str: &str) -> Self {
-        let conditions: Vec<(String, String)> = condition_str
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .chunks(2)
-            .filter_map(|pair| {
-                if pair.len() == 2 {
-                    Some((pair[0].to_lowercase(), pair[1].to_string()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Keywords that take no argument (like OpenSSH's `all`/`invalid-user`).
+        const BARE: &[&str] = &["all", "invalid-user"];
+        let tokens: Vec<&str> = condition_str.split_whitespace().collect();
+        let mut conditions = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let key = tokens[i].to_lowercase();
+            if BARE.contains(&key.as_str()) {
+                conditions.push((key, String::new()));
+                i += 1;
+            } else if i + 1 < tokens.len() {
+                conditions.push((key, tokens[i + 1].to_string()));
+                i += 2;
+            } else {
+                // A trailing keyword with no argument is dropped.
+                i += 1;
+            }
+        }
         ServerMatch { conditions, overrides: MatchOverrides::default() }
     }
 
     /// Evaluate whether this block applies given the connection context.
-    fn matches(&self, username: &str, groups: &[String], host: &str, addr: &str) -> bool {
+    fn matches(&self, ctx: &ServerMatchContext<'_>) -> bool {
         for (key, value) in &self.conditions {
             match key.as_str() {
                 "all" => {}
                 "user" => {
+                    let Some(username) = ctx.username else { return false };
                     if !glob_any(value, username) { return false; }
                 }
                 "group" => {
-                    if !groups.iter().any(|g| glob_any(value, g)) { return false; }
+                    if ctx.username.is_none() { return false; }
+                    if !ctx.groups.iter().any(|g| glob_any(value, g)) { return false; }
                 }
                 "host" => {
-                    if !glob_any(value, host) { return false; }
+                    if !glob_any(value, ctx.host) { return false; }
                 }
                 "address" => {
-                    if !addr_match(value, addr) { return false; }
+                    if !addr_match(value, ctx.addr) { return false; }
+                }
+                "localaddress" => {
+                    if !addr_match(value, ctx.local_addr) { return false; }
+                }
+                "localport" => {
+                    if !glob_any(value, &ctx.local_port.to_string()) { return false; }
+                }
+                "rdomain" => {
+                    if !glob_any(value, ctx.rdomain) { return false; }
+                }
+                "invalid-user" => {
+                    // Matches only once the requested user is known to be invalid.
+                    if ctx.user_valid != Some(false) { return false; }
                 }
                 _ => return false, // unknown condition never matches
             }
@@ -1222,10 +1264,10 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Resolve `Match` blocks against the given connection context, returning a
     /// new config with matching blocks' overrides applied on top of `self`.
-    pub fn resolve_for_match(&self, username: &str, groups: &[String], host: &str, addr: &str) -> ServerConfig {
+    pub fn resolve_for_match(&self, ctx: &ServerMatchContext<'_>) -> ServerConfig {
         let mut cfg = self.clone();
         for m in &self.match_blocks {
-            if m.matches(username, groups, host, addr) {
+            if m.matches(ctx) {
                 m.apply_to(&mut cfg);
             }
         }
@@ -1803,6 +1845,21 @@ impl ServerConfig {
 mod tests {
     use super::*;
 
+    /// Build a match context for tests: user known & valid, port 22,
+    /// loopback local address, no rdomain.
+    fn test_ctx<'a>(username: &'a str, groups: &'a [String], host: &'a str, addr: &'a str) -> ServerMatchContext<'a> {
+        ServerMatchContext {
+            username: if username.is_empty() { None } else { Some(username) },
+            groups,
+            host,
+            addr,
+            local_addr: "127.0.0.1",
+            local_port: 22,
+            rdomain: "",
+            user_valid: Some(true),
+        }
+    }
+
     #[test]
     fn pubkey_accepted_algorithms_server_parsing() {
         // Bare list replaces the base.
@@ -1862,10 +1919,10 @@ Match User alice
         )
         .unwrap();
         // Global directive applies to everyone.
-        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert_eq!(r.set_env, vec![("GLOBAL".to_string(), "1".to_string())]);
         // A matching Match block appends its SetEnv entries.
-        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
         assert_eq!(
             r.set_env,
             vec![
@@ -1893,9 +1950,9 @@ Match User alice
 
         // Match blocks may override IPQoS.
         let cfg = ServerConfig::parse("IPQoS cs0\nMatch User alice\n    IPQoS ef\n").unwrap();
-        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
         assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0xb8, 0xb8));
-        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert_eq!((r.ip_qos_interactive, r.ip_qos_bulk), (0x00, 0x00));
     }
 
@@ -1919,12 +1976,12 @@ Match User alice
             "Match User alice\n    HostbasedAcceptedKeyTypes ssh-ed25519\n",
         )
         .unwrap();
-        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
         assert_eq!(
             r.hostbased_accepted_algorithms.as_deref(),
             Some(&["ssh-ed25519".to_string()][..])
         );
-        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.hostbased_accepted_algorithms.is_none());
     }
 
@@ -1989,19 +2046,19 @@ Match All
     Banner /etc/banner
 ").unwrap();
         // User alice matches; group/staff not; address not.
-        let r = cfg.resolve_for_match("alice", &["staff".to_string()], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("alice", &["staff".to_string()], "srv", "10.0.0.5"));
         assert_eq!(r.force_command.as_deref(), Some("echo A"));
 
         // Group admin matches.
-        let r = cfg.resolve_for_match("bob", &["admin".to_string()], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &["admin".to_string()], "srv", "10.0.0.5"));
         assert_eq!(r.force_command.as_deref(), Some("echo G"));
 
         // Address 192.168.1.50 matches.
-        let r = cfg.resolve_for_match("bob", &[], "srv", "192.168.1.50");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "192.168.1.50"));
         assert_eq!(r.force_command.as_deref(), Some("echo N"));
 
         // Match All always applies (banner set).
-        let r = cfg.resolve_for_match("carol", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("carol", &[], "srv", "10.0.0.5"));
         assert_eq!(r.banner.as_deref(), Some("/etc/banner"));
     }
 
@@ -2012,6 +2069,47 @@ Match All
         assert!(addr_match("192.168.*", "192.168.5.9"));
         assert!(addr_match("127.0.0.1", "127.0.0.1"));
         assert!(!addr_match("127.0.0.1", "127.0.0.2"));
+    }
+
+    #[test]
+    fn match_extended_conditions() {
+        let cfg = ServerConfig::parse("\
+Match LocalAddress 10.0.0.1
+    ForceCommand echo LA
+Match LocalPort 2222
+    ForceCommand echo LP
+Match RDomain *.example.com
+    ForceCommand echo RD
+Match Invalid-User
+    ForceCommand echo IU
+").unwrap();
+
+        let mut ctx = test_ctx("alice", &[], "srv", "10.0.0.5");
+
+        // LocalAddress matches only the configured local address.
+        ctx.local_addr = "10.0.0.1";
+        assert_eq!(cfg.resolve_for_match(&ctx).force_command.as_deref(), Some("echo LA"));
+        ctx.local_addr = "10.0.0.2";
+        assert!(cfg.match_blocks[0].matches(&ctx) == false);
+
+        // LocalPort matches the port the connection arrived on.
+        ctx.local_port = 2222;
+        assert_eq!(cfg.resolve_for_match(&ctx).force_command.as_deref(), Some("echo LP"));
+        ctx.local_port = 22;
+
+        // RDomain matches the peer's reverse-DNS name.
+        ctx.rdomain = "host1.example.com";
+        assert_eq!(cfg.resolve_for_match(&ctx).force_command.as_deref(), Some("echo RD"));
+        ctx.rdomain = "";
+
+        // Invalid-User matches only once the user is known to be invalid.
+        ctx.user_valid = Some(false);
+        assert_eq!(cfg.resolve_for_match(&ctx).force_command.as_deref(), Some("echo IU"));
+        ctx.user_valid = Some(true);
+        assert!(!cfg.match_blocks[3].matches(&ctx));
+        // Before the username is known nothing about validity is decided.
+        ctx.user_valid = None;
+        assert!(!cfg.match_blocks[3].matches(&ctx));
     }
 
     #[test]
@@ -2095,12 +2193,12 @@ Match All
             "AuthenticationMethods publickey\n\
              Match User alice\n    AuthenticationMethods publickey,password\n",
         ).unwrap();
-        let r = cfg.resolve_for_match("alice", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
         assert_eq!(
             r.authentication_methods,
             vec![vec!["publickey".to_string(), "password".to_string()]]
         );
-        let r = cfg.resolve_for_match("bob", &[], "srv", "10.0.0.5");
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert_eq!(r.authentication_methods, vec![vec!["publickey".to_string()]]);
     }
 

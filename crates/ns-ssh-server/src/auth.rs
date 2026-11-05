@@ -1354,3 +1354,16 @@ pub fn get_user_groups(username: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 }
+
+/// Whether a login name exists in the system account database (getpwnam).
+/// Used for the sshd_config `Match Invalid-User` condition.
+#[cfg(unix)]
+pub fn user_exists(username: &str) -> bool {
+    let Ok(cname) = std::ffi::CString::new(username) else { return false };
+    unsafe { !libc::getpwnam(cname.as_ptr()).is_null() }
+}
+
+#[cfg(not(unix))]
+pub fn user_exists(_username: &str) -> bool {
+    true
+}
