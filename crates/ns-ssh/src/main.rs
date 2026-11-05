@@ -458,20 +458,95 @@ fn init_logging(cfg: &ResolvedConfig) {
     };
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    let mut syslog_mode = false;
     let writer: tracing_subscriber::fmt::writer::BoxMakeWriter = if let Some(ref lf) = cfg.log_file {
         // -E log_file: write diagnostics to a file (append).
         match std::fs::OpenOptions::new().create(true).append(true).open(lf) {
             Ok(f) => tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(f)),
             Err(_) => tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
         }
+    } else if let Some(ref facility) = cfg.syslog_facility {
+        #[cfg(unix)]
+        {
+            let facility = syslog_facility_code(facility);
+            if let Ok(ident) = std::ffi::CString::new("ns-ssh") {
+                unsafe { libc::openlog(ident.as_ptr(), libc::LOG_PID, facility); }
+            }
+            syslog_mode = true;
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::sync::Mutex::new(
+                SyslogWriter { facility },
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = facility;
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+        }
     } else {
         tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
     };
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer)
+        .with_ansi(!syslog_mode)
         .with_env_filter(env_filter)
         .finish();
     tracing::subscriber::set_global_default(subscriber).ok();
+}
+
+/// Map a `SyslogFacility` name to its libc facility code.
+#[cfg(unix)]
+fn syslog_facility_code(name: &str) -> libc::c_int {
+    match name.to_ascii_uppercase().as_str() {
+        "DAEMON" => libc::LOG_DAEMON,
+        "AUTH" => libc::LOG_AUTH,
+        "AUTHPRIV" => libc::LOG_AUTHPRIV,
+        "LOCAL0" => libc::LOG_LOCAL0,
+        "LOCAL1" => libc::LOG_LOCAL1,
+        "LOCAL2" => libc::LOG_LOCAL2,
+        "LOCAL3" => libc::LOG_LOCAL3,
+        "LOCAL4" => libc::LOG_LOCAL4,
+        "LOCAL5" => libc::LOG_LOCAL5,
+        "LOCAL6" => libc::LOG_LOCAL6,
+        "LOCAL7" => libc::LOG_LOCAL7,
+        _ => libc::LOG_USER,
+    }
+}
+
+/// Writes tracing output to syslog at the configured facility.
+#[cfg(unix)]
+struct SyslogWriter {
+    facility: libc::c_int,
+}
+
+#[cfg(unix)]
+impl std::io::Write for SyslogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let priority = if trimmed.contains("ERROR") {
+                libc::LOG_ERR
+            } else if trimmed.contains("WARN") {
+                libc::LOG_WARNING
+            } else {
+                libc::LOG_INFO
+            };
+            if let Ok(msg) = std::ffi::CString::new(trimmed) {
+                unsafe {
+                    libc::syslog(
+                        priority | self.facility,
+                        b"%s\0".as_ptr() as *const libc::c_char,
+                        msg.as_ptr(),
+                    );
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn print_effective_config(cfg: &ResolvedConfig) {
@@ -1618,6 +1693,12 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(v) = &h.tunnel_device {
             resolved.tunnel_device = Some(v.clone());
         }
+        if let Some(v) = &h.xauth_location {
+            resolved.xauth_location = Some(v.clone());
+        }
+        if let Some(v) = &h.syslog_facility {
+            resolved.syslog_facility = Some(v.clone());
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1818,6 +1899,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = &host_config.tunnel_device {
                 resolved.tunnel_device = Some(v.clone());
+            }
+            if let Some(v) = &host_config.xauth_location {
+                resolved.xauth_location = Some(v.clone());
+            }
+            if let Some(v) = &host_config.syslog_facility {
+                resolved.syslog_facility = Some(v.clone());
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2130,6 +2217,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &mc.tunnel_device {
                 resolved.tunnel_device = Some(v.clone());
             }
+            if let Some(v) = &mc.xauth_location {
+                resolved.xauth_location = Some(v.clone());
+            }
+            if let Some(v) = &mc.syslog_facility {
+                resolved.syslog_facility = Some(v.clone());
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2390,6 +2483,12 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "tunneldevice" | "tunnel_device" => {
             if crate::config::parse_tunnel_device(value).is_some() {
                 resolved.tunnel_device = Some(value.to_string());
+            }
+        }
+        "xauthlocation" | "xauth_location" => resolved.xauth_location = Some(value.to_string()),
+        "syslogfacility" | "syslog_facility" => {
+            if let Ok(v) = crate::config::parse_syslog_facility(value) {
+                resolved.syslog_facility = Some(v);
             }
         }
         "connecttimeout" | "connect_timeout" => {

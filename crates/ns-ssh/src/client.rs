@@ -1765,6 +1765,9 @@ impl SshClient {
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
             self.send_packet(&x11_msg, false).await?;
             let _resp = self.recv_packet().await?;
+            if let Some(ref xauth) = self.config.xauth_location {
+                register_x11_cookie(xauth, &cookie_hex).await;
+            }
         }
 
         for (name, value) in &self.config.set_env.clone() {
@@ -3233,6 +3236,9 @@ impl SshClient {
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             send_encrypted_packet(stream, &x11_msg, &mut self.transport, false, aead).await?;
             let _ = self.await_request_reply().await;
+            if let Some(ref xauth) = self.config.xauth_location {
+                register_x11_cookie(xauth, &cookie_hex).await;
+            }
         }
 
         // Environment variables.
@@ -3966,6 +3972,23 @@ async fn connect_agent_socket(override_path: Option<&str>) -> Result<tokio::net:
 fn apply_socket_mask(path: &str, mask: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask));
+}
+
+/// Register the fake X11 cookie with the local X server through
+/// `XAuthLocation` (`xauth add <DISPLAY> MIT-MAGIC-COOKIE-1 <cookie>`).
+async fn register_x11_cookie(xauth: &str, cookie_hex: &str) {
+    let Ok(display) = std::env::var("DISPLAY") else { return };
+    if display.is_empty() {
+        return;
+    }
+    let mut cmd = tokio::process::Command::new(xauth);
+    if let Ok(authfile) = std::env::var("XAUTHORITY") {
+        cmd.arg("-f").arg(authfile);
+    }
+    cmd.arg("add").arg(&display).arg("MIT-MAGIC-COOKIE-1").arg(cookie_hex);
+    if let Err(e) = cmd.status().await {
+        tracing::debug!("xauth add failed: {}", e);
+    }
 }
 
 async fn connect_x11_display(display: &str) -> std::io::Result<tokio::net::TcpStream> {

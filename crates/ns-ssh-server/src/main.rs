@@ -242,6 +242,16 @@ fn main() {
                 "x11uselocalhost" | "x11_use_localhost" => {
                     config.x11_use_localhost = value == "yes";
                 }
+                "xauthlocation" | "xauth_location" => {
+                    config.xauth_location = Some(value.to_string());
+                }
+                "versionaddendum" | "version_addendum" => {
+                    config.version_addendum = Some(if value.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    });
+                }
                 "streamlocalbindmask" | "stream_local_bind_mask" => {
                     if let Ok(v) = u32::from_str_radix(value.trim_start_matches("0o"), 8) {
                         config.stream_local_bind_mask = v;

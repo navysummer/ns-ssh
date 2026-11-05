@@ -102,6 +102,13 @@ pub struct HostConfig {
     /// TunnelDevice: `local:remote` tun unit numbers (each `any` or an int).
     #[serde(default)]
     pub tunnel_device: Option<String>,
+    /// XAuthLocation: path to the xauth binary used for X11 cookie setup.
+    #[serde(default)]
+    pub xauth_location: Option<String>,
+    /// SyslogFacility: syslog facility for client diagnostics (DAEMON/USER/
+    /// AUTH/LOCAL0..LOCAL7); `None` keeps stderr/file logging.
+    #[serde(default)]
+    pub syslog_facility: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -450,6 +457,10 @@ pub struct ResolvedConfig {
     pub tunnel: Option<String>,
     /// TunnelDevice: raw `local:remote` specification.
     pub tunnel_device: Option<String>,
+    /// XAuthLocation: xauth binary for registering the X11 cookie.
+    pub xauth_location: Option<String>,
+    /// SyslogFacility: syslog facility for client diagnostics.
+    pub syslog_facility: Option<String>,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -585,6 +596,8 @@ impl ResolvedConfig {
             bind_interface: None,
             tunnel: None,
             tunnel_device: None,
+            xauth_location: None,
+            syslog_facility: None,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -975,6 +988,8 @@ impl SshConfig {
         let mut bind_interface = None;
         let mut tunnel = None;
         let mut tunnel_device = None;
+        let mut xauth_location = None;
+        let mut syslog_facility = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1070,6 +1085,8 @@ impl SshConfig {
                             bind_interface: bind_interface.take(),
                             tunnel: tunnel.take(),
                             tunnel_device: tunnel_device.take(),
+                            xauth_location: xauth_location.take(),
+                            syslog_facility: syslog_facility.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1182,6 +1199,8 @@ impl SshConfig {
                             bind_interface: bind_interface.take(),
                             tunnel: tunnel.take(),
                             tunnel_device: tunnel_device.take(),
+                            xauth_location: xauth_location.take(),
+                            syslog_facility: syslog_facility.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1274,6 +1293,8 @@ impl SshConfig {
                             bind_interface: bind_interface.take(),
                             tunnel: tunnel.take(),
                             tunnel_device: tunnel_device.take(),
+                            xauth_location: xauth_location.take(),
+                            syslog_facility: syslog_facility.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1534,12 +1555,16 @@ impl SshConfig {
                     }
                     tunnel_device = Some(value.to_string());
                 }
+                "xauthlocation" | "xauth_location" => {
+                    xauth_location = Some(value.to_string());
+                }
+                "syslogfacility" | "syslog_facility" => {
+                    syslog_facility = Some(parse_syslog_facility(value)?);
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
                 "kbdinteractivedevices" | "kbd_interactive_devices"
-                | "syslogfacility" | "syslog_facility"
-                | "xauthlocation" | "xauth_location"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
                 | "enableescapecommandline" | "enable_escape_commandline"
@@ -1634,6 +1659,8 @@ impl SshConfig {
                 bind_interface: bind_interface.clone(),
                 tunnel: tunnel.clone(),
                 tunnel_device: tunnel_device.clone(),
+                xauth_location: xauth_location.clone(),
+                syslog_facility: syslog_facility.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
@@ -1935,6 +1962,22 @@ pub fn parse_streamlocal_forward(spec: &str) -> Option<(String, String)> {
         return None;
     }
     Some((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Validate and normalize a `SyslogFacility` value. OpenSSH accepts
+/// DAEMON/USER/AUTH/AUTHPRIV/LOCAL0..LOCAL7 (case-insensitive).
+pub fn parse_syslog_facility(value: &str) -> std::result::Result<String, SshError> {
+    let v = value.trim().to_ascii_uppercase();
+    let ok = matches!(
+        v.as_str(),
+        "DAEMON" | "USER" | "AUTH" | "AUTHPRIV" | "LOCAL0" | "LOCAL1" | "LOCAL2"
+            | "LOCAL3" | "LOCAL4" | "LOCAL5" | "LOCAL6" | "LOCAL7"
+    );
+    if ok {
+        Ok(v)
+    } else {
+        Err(SshError::Config(format!("unsupported SyslogFacility: {}", value)))
+    }
 }
 
 /// Parse `TunnelDevice local:remote`, where each part is `any` or a tun unit
@@ -2426,6 +2469,22 @@ Match tagged !jump
         assert_eq!(parse_tunnel_device("16777215"), Some(("16777215".to_string(), "16777215".to_string())));
         assert_eq!(parse_tunnel_device("16777216"), None);
         assert_eq!(parse_tunnel_device("1:y"), None);
+    }
+
+    #[test]
+    fn xauth_and_syslog_directives() {
+        let cfg = SshConfig::parse(
+            "Host example\n  XAuthLocation /opt/X11/bin/xauth\n  SyslogFacility local3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.hosts[0].xauth_location.as_deref(),
+            Some("/opt/X11/bin/xauth")
+        );
+        assert_eq!(cfg.hosts[0].syslog_facility.as_deref(), Some("LOCAL3"));
+
+        // Only OpenSSH's documented facilities are accepted.
+        assert!(SshConfig::parse("Host example\n  SyslogFacility bogus\n").is_err());
     }
 
     #[test]

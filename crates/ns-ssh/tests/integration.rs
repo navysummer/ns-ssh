@@ -652,6 +652,40 @@ fn tunnel_mode_is_rejected_with_clear_error() {
 }
 
 #[test]
+fn server_version_addendum_appears_in_banner() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let dir = temp_dir("version-addendum");
+    let port = free_port();
+    let (mut server, _id_path, _kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &["-o", "VersionAddendum=test-banner"],
+    );
+
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set timeout");
+    // The server reads the client identification line first, then sends its
+    // own banner.
+    (&stream)
+        .write_all(b"SSH-2.0-test-client\r\n")
+        .expect("send client banner");
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .expect("read server banner");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(line.starts_with("SSH-2.0-"), "banner: {}", line);
+    assert!(line.contains("test-banner"), "banner: {}", line);
+}
+
+#[test]
 fn exec_round_trip_authorized_keys_command() {
     let server_bin = workspace_target_dir();
     if !server_bin.exists() {

@@ -15,6 +15,19 @@ use std::collections::HashMap;
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Register the X11 cookie in the user's authority file with `XAuthLocation`,
+/// so remote X clients can authenticate through the forwarded channel.
+async fn register_x11_cookie(xauth: &str, display: &str, proto: &str, cookie: &str) {
+    let mut cmd = tokio::process::Command::new(xauth);
+    if let Ok(authfile) = std::env::var("XAUTHORITY") {
+        cmd.arg("-f").arg(authfile);
+    }
+    cmd.arg("add").arg(display).arg(proto).arg(cookie);
+    if let Err(e) = cmd.status().await {
+        tracing::debug!("xauth add failed: {}", e);
+    }
+}
+
 /// Apply the StreamLocalBindMask mode to a freshly created Unix socket.
 fn apply_socket_mask(path: &str, mask: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -338,8 +351,15 @@ async fn handle_connection(
         }
     }
 
-    send_version_string(&mut stream, msg::SSH_SERVER_VERSION.as_bytes()).await?;
-    transport.server_version = msg::SSH_SERVER_VERSION.as_bytes().to_vec();
+    let mut server_version = msg::SSH_SERVER_VERSION.to_string();
+    if let Some(ref addendum) = config.version_addendum {
+        if !addendum.is_empty() {
+            server_version.push(' ');
+            server_version.push_str(addendum);
+        }
+    }
+    send_version_string(&mut stream, server_version.as_bytes()).await?;
+    transport.server_version = server_version.into_bytes();
 
     let client_kex = receive_raw_packet(&mut stream).await?;
     transport.incoming_seq += 1;
@@ -2502,8 +2522,8 @@ async fn handle_connection_service(
                                         r = &r[1..];
                                         byte[0] != 0
                                     };
-                                    let _auth_proto = SshString::decode(&mut r)?.as_str()?.to_string();
-                                    let _auth_cookie = SshString::decode(&mut r)?.as_str()?.to_string();
+                                    let auth_proto = SshString::decode(&mut r)?.as_str()?.to_string();
+                                    let auth_cookie = SshString::decode(&mut r)?.as_str()?.to_string();
                                     let _screen = u32::decode(&mut r)?;
 
                                     // Enforce authorized_keys `no-x11-forwarding`.
@@ -2516,9 +2536,17 @@ async fn handle_connection_service(
                                     }
 
                                     if config.x11_forwarding {
+                                        let display = x11_display_name(config);
                                         if let Some(sid) = local_channel.and_then(|lc| channel_session.get(&lc).copied()) {
-                                            let display = x11_display_name(config);
-                                            session_manager.set_env_var(sid, "DISPLAY".to_string(), display);
+                                            session_manager.set_env_var(sid, "DISPLAY".to_string(), display.clone());
+                                        }
+                                        if let Some(ref xauth) = config.xauth_location {
+                                            register_x11_cookie(
+                                                xauth,
+                                                &display,
+                                                &auth_proto,
+                                                &auth_cookie,
+                                            ).await;
                                         }
                                         if !x11_enabled {
                                             let bind_addr = x11_listen_addr(config);

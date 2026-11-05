@@ -213,6 +213,16 @@ pub struct ServerConfig {
     #[serde(default = "default_true")]
     pub x11_use_localhost: bool,
 
+    /// XAuthLocation: xauth binary used to register the X11 cookie in the
+    /// user's authority file. `None` leaves cookie registration to the client.
+    #[serde(default)]
+    pub xauth_location: Option<String>,
+
+    /// VersionAddendum: text appended to the SSH identification string.
+    /// `Some("")` (from `none`) means no addendum.
+    #[serde(default)]
+    pub version_addendum: Option<String>,
+
     /// StreamLocalBindMask (octal) applied to created Unix sockets.
     #[serde(default = "default_streamlocal_mask")]
     pub stream_local_bind_mask: u32,
@@ -1310,6 +1320,8 @@ impl Default for ServerConfig {
             x11_forwarding: false,
             x11_display_offset: default_x11_display_offset(),
             x11_use_localhost: true,
+            xauth_location: None,
+            version_addendum: None,
             stream_local_bind_mask: default_streamlocal_mask(),
             stream_local_bind_unlink: false,
             unused_connection_timeout: 0,
@@ -1672,6 +1684,16 @@ impl ServerConfig {
                 "x11uselocalhost" | "x11_use_localhost" => {
                     config.x11_use_localhost = value == "yes";
                 }
+                "xauthlocation" | "xauth_location" => {
+                    config.xauth_location = Some(value.to_string());
+                }
+                "versionaddendum" | "version_addendum" => {
+                    config.version_addendum = Some(if value.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        value.to_string()
+                    });
+                }
                 "streamlocalbindmask" | "stream_local_bind_mask" => {
                     if let Ok(v) = u32::from_str_radix(value.trim_start_matches("0o"), 8) {
                         config.stream_local_bind_mask = v;
@@ -1874,8 +1896,6 @@ impl ServerConfig {
                 // is tracked in docs/openssh-gap-audit.md.
                 "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
                 | "sshdsessionpath" | "sshd_session_path"
-                | "versionaddendum" | "version_addendum"
-                | "xauthlocation" | "xauth_location"
                 // Deprecated/obsolete OpenSSH directive names: accepted and
                 // ignored, matching OpenSSH's sDeprecated/sUnsupported/sIgnore
                 // handling so old sshd_config files keep loading.
@@ -2137,6 +2157,24 @@ Match User alice
         assert_eq!(r.ca_signature_algorithms, vec!["ssh-ed25519".to_string()]);
         let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.ca_signature_algorithms.is_empty());
+    }
+
+    #[test]
+    fn xauth_location_and_version_addendum_parsing() {
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.xauth_location.is_none());
+        assert!(cfg.version_addendum.is_none());
+
+        let cfg = ServerConfig::parse(
+            "XAuthLocation /usr/bin/xauth\nVersionAddendum test-1.0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.xauth_location.as_deref(), Some("/usr/bin/xauth"));
+        assert_eq!(cfg.version_addendum.as_deref(), Some("test-1.0"));
+
+        // `none` means an empty addendum.
+        let cfg = ServerConfig::parse("VersionAddendum none\n").unwrap();
+        assert_eq!(cfg.version_addendum.as_deref(), Some(""));
     }
 
     #[test]
