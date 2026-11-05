@@ -1,0 +1,15 @@
+[package]
+name = "ns-ssl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TLS client/server - pure Rust (rustls) replacement for openssl s_client/s_server"
+
+[[bin]]
+name = "ns-ssl"
+path = "src/main.rs"
+
+[dependencies]
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"

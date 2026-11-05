@@ -33,6 +33,15 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Automatic rekeying (RekeyLimit)
 - SFTP subsystem (`internal-sftp`), including the OpenSSH extensions `posix-rename`, `statvfs`, `hardlink`, `fsync`, `limits`, `copy-data`, `expand-path`, `check-file`, `lsetstat`, `home-directory` and `users-groups-by-id`
 
+### ns-ssl (TLS client/server)
+
+- Pure-Rust TLS built on `rustls` (no OpenSSL/OpenSSH dependency)
+- TLS 1.2 and TLS 1.3, client and server
+- Certificate verification against `webpki-roots` or a custom `-CAfile`
+- ALPN negotiation, mutual TLS (client certs)
+- `openssl s_client` / `openssl s_server`-style CLI (`s_client`/`s_server`)
+- Interoperates with real `openssl` (verified in both directions)
+
 ## Building
 
 ```bash
@@ -42,6 +51,7 @@ cargo build --release
 # Binaries will be in:
 # target/release/ns-ssh
 # target/release/ns-ssh-server
+# target/release/ns-ssl
 ```
 
 ## Cross-compilation for Linux

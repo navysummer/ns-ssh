@@ -3,6 +3,7 @@ members = [
     "crates/ssh-core",
     "crates/ns-ssh",
     "crates/ns-ssh-server",
+    "crates/ns-ssl",
 ]
 resolver = "2"
 
