@@ -481,32 +481,92 @@ fn prompt_accept_host_key(hostname: &str, key_type: &str, key_blob: &[u8], finge
     answer == "yes" || answer == "y"
 }
 
+/// Events delivered by the per-listener accept tasks to the main loop.
+enum AcceptEvent {
+    Local(usize, tokio::net::TcpStream),
+    Dynamic(tokio::net::TcpStream),
+    StreamLocal(usize, tokio::net::UnixStream),
+}
+
+/// Result of handing a stdin chunk to the escape-sequence processor.
+enum EscapeAction {
+    None,
+    /// `~.`: terminate the connection.
+    Exit,
+    /// `~C` command line completed (carries the typed command).
+    Command(String),
+}
+
 /// OpenSSH escape-sequence state for interactive sessions (`~.`, `~C`, ...).
 #[derive(Default)]
 struct EscapeState {
     at_line_start: bool,
     escape_pending: bool,
+    /// When `Some`, the `~C` escape command line is being typed.
+    command_line: Option<String>,
 }
 
 impl EscapeState {
     fn new() -> Self {
-        EscapeState { at_line_start: true, escape_pending: false }
+        EscapeState { at_line_start: true, escape_pending: false, command_line: None }
     }
 
     /// Process a chunk of stdin bytes. `escape_char` is the configured escape
-    /// character (default '~'). Returns bytes to forward and whether to exit.
-    fn process(&mut self, data: &[u8], escape_char: char) -> (Vec<u8>, bool) {
+    /// character (default '~'). `commandline_enabled` reflects
+    /// `EnableEscapeCommandline`. Returns bytes to forward and the escape
+    /// action (if any).
+    fn process(
+        &mut self,
+        data: &[u8],
+        escape_char: char,
+        commandline_enabled: bool,
+    ) -> (Vec<u8>, EscapeAction) {
         let esc = escape_char as u8;
         let mut out = Vec::with_capacity(data.len());
+        // While the `~C` command line is open, stdin bytes build the command
+        // instead of being forwarded to the session.
+        if self.command_line.is_some() {
+            for &b in data {
+                match b {
+                    b'\r' | b'\n' => {
+                        let cmd = self.command_line.take().unwrap_or_default();
+                        return (out, EscapeAction::Command(cmd));
+                    }
+                    0x7f | 0x08 => {
+                        if let Some(line) = self.command_line.as_mut() {
+                            line.pop();
+                        }
+                    }
+                    b if b >= 0x20 => {
+                        if let Some(line) = self.command_line.as_mut() {
+                            line.push(b as char);
+                        }
+                        // Raw mode disables ECHO, so echo the typed command.
+                        eprint!("{}", b as char);
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                    }
+                    _ => {}
+                }
+            }
+            return (out, EscapeAction::None);
+        }
         for &b in data {
             if self.escape_pending {
                 self.escape_pending = false;
                 match b {
                     // `~.` terminates the connection.
-                    b'.' => return (out, true),
-                    // `~C` opens the OpenSSH command line (unsupported here).
+                    b'.' => return (out, EscapeAction::Exit),
+                    // `~C` opens the OpenSSH command line when enabled.
                     b'C' => {
-                        eprintln!("(escape command line not supported by ns-ssh)");
+                        if commandline_enabled {
+                            eprint!("ssh> ");
+                            use std::io::Write;
+                            let _ = std::io::stderr().flush();
+                            self.command_line = Some(String::new());
+                        } else {
+                            eprintln!("(escape command line disabled)");
+                        }
                         self.at_line_start = true;
                         continue;
                     }
@@ -535,7 +595,7 @@ impl EscapeState {
             }
             out.push(b);
         }
-        (out, false)
+        (out, EscapeAction::None)
     }
 }
 
@@ -703,7 +763,8 @@ impl SshClient {
 
         if let Some(ref pc) = self.config.proxy_command.clone() {
             if !pc.is_empty() && pc != "none" {
-                let stream = connect_proxy_command(&self.config, pc, &target_host, target_port)?;
+                let stream =
+                    connect_proxy_command(&self.config, pc, &target_host, target_port).await?;
                 self.stream = Some(stream);
                 return Ok(());
             }
@@ -1555,6 +1616,13 @@ impl SshClient {
                     // (which uses the setuid ssh-keysign helper), we read the
                     // host key files directly, so this only works when they
                     // are readable by the current user (e.g. root).
+                    if self.config.enable_ssh_keysign {
+                        tracing::warn!(
+                            "EnableSSHKeysign is set, but ns-ssh signs hostbased \
+                             requests directly with readable host keys; the setuid \
+                             ssh-keysign helper is not used"
+                        );
+                    }
                     let client_host = local_hostname();
                     let client_user = std::env::var("USER").unwrap_or_else(|_| username.clone());
                     for key_path in HOST_KEY_CANDIDATES {
@@ -1896,11 +1964,6 @@ impl SshClient {
 
         let (to_ssh_tx, mut to_ssh_rx) = mpsc::unbounded_channel::<(ChannelId, Vec<u8>)>();
 
-        enum AcceptEvent {
-            Local(usize, tokio::net::TcpStream),
-            Dynamic(tokio::net::TcpStream),
-            StreamLocal(usize, tokio::net::UnixStream),
-        }
         let (accept_tx, mut accept_rx) = mpsc::unbounded_channel::<AcceptEvent>();
 
         // Bind all local forwards to a hostname honoring `-g`/GatewayPorts and
@@ -1993,6 +2056,8 @@ impl SshClient {
                 }
             }
         }
+        // Keep a sender alive so the `~C` command line can add listeners later.
+        let accept_tx_keep = accept_tx.clone();
         drop(accept_tx);
 
         // `ExitOnForwardFailure yes`: exit with an error if a forward could not
@@ -2328,15 +2393,42 @@ impl SshClient {
                             if let Some(cid) = stdio_forward_channel_id {
                                 channel_last_activity.insert(cid, std::time::Instant::now());
                             }
-                            let (forward_data, exit_now) = if escape_enabled {
-                                escape_state.process(&data, escape_char)
+                            let (forward_data, escape_action) = if escape_enabled {
+                                escape_state.process(
+                                    &data,
+                                    escape_char,
+                                    self.config.enable_escape_commandline,
+                                )
                             } else {
-                                (data, false)
+                                (data, EscapeAction::None)
                             };
+                            let mut exit_now = false;
+                            match escape_action {
+                                EscapeAction::Exit => exit_now = true,
+                                EscapeAction::Command(cmd) => {
+                                    self.run_escape_command(
+                                        cmd.trim(),
+                                        &mut local_meta,
+                                        &mut remote_forward_map,
+                                        &accept_tx_keep,
+                                        aead,
+                                        &local_bind_host,
+                                    ).await;
+                                }
+                                EscapeAction::None => {}
+                            }
                             if exit_now {
                                 eprintln!("Connection to {} closed.", self.config.hostname);
                                 should_exit = true;
                             } else if !forward_data.is_empty() {
+                                // ObscureKeystrokeTiming: inject chaff packets and
+                                // a random delay before forwarding interactive
+                                // keystrokes so an observer cannot time them.
+                                if self.config.obscure_keystroke_timing_interval > 0
+                                    && atty::is(atty::Stream::Stdin)
+                                {
+                                    let _ = self.send_obscure_chaff().await;
+                                }
                                 if let Some(rid) = stdio_forward_remote_id {
                                     self.send_channel_data_gated(rid, forward_data, &mut pending_window_data, &mut pending_write, aead).await;
                                 } else if self.config.stdio_forward.is_some() {
@@ -3486,6 +3578,144 @@ impl SshClient {
         Ok(local_id)
     }
 
+    /// Handle a command typed at the `~C` escape command line (OpenSSH's
+    /// interactive forward-request interface).
+    async fn run_escape_command(
+        &mut self,
+        line: &str,
+        local_meta: &mut Vec<(String, u16, u16)>,
+        remote_forward_map: &mut HashMap<u16, (String, u16)>,
+        accept_tx: &mpsc::UnboundedSender<AcceptEvent>,
+        aead: bool,
+        local_bind_host: &str,
+    ) {
+        if line.is_empty() || line == "?" || line == "h" || line == "help" {
+            eprintln!("Supported commands:");
+            eprintln!("      -L[bind_address:]port:host:hostport    Request local forward");
+            eprintln!("      -R[bind_address:]port:host:hostport    Request remote forward");
+            eprintln!("      -D[bind_address:]port                  Request dynamic forward");
+            eprintln!("      ?                                      Display this help");
+            return;
+        }
+        if let Some(spec) = line.strip_prefix("-L") {
+            match crate::config::parse_forward_spec(spec.trim()) {
+                Some((bind_addr, bind_port, host, connect_port)) => {
+                    let bind_host = if bind_addr.is_empty() {
+                        local_bind_host.to_string()
+                    } else {
+                        bind_addr
+                    };
+                    let addr = format!("{}:{}", bind_host, bind_port);
+                    match tokio::net::TcpListener::bind(&addr).await {
+                        Ok(listener) => {
+                            let idx = local_meta.len();
+                            local_meta.push((host.clone(), connect_port, bind_port));
+                            self.config.local_forwards.push((
+                                bind_host.clone(),
+                                bind_port,
+                                host,
+                                connect_port,
+                            ));
+                            let tx = accept_tx.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match listener.accept().await {
+                                        Ok((s, _)) => {
+                                            if tx.send(AcceptEvent::Local(idx, s)).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                            eprintln!("Local forwarding listening on {}.", addr);
+                        }
+                        Err(e) => eprintln!("ns-ssh: cannot listen on {}: {}", addr, e),
+                    }
+                }
+                None => eprintln!("ns-ssh: invalid forward specification: {}", spec.trim()),
+            }
+            return;
+        }
+        if let Some(spec) = line.strip_prefix("-D") {
+            let spec = spec.trim();
+            let (bind_host, port_str) = match spec.rsplit_once(':') {
+                Some((b, p)) if !b.is_empty() => (b.to_string(), p),
+                _ => (local_bind_host.to_string(), spec),
+            };
+            let port: u16 = match port_str.parse() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("ns-ssh: invalid dynamic forward: {}", spec);
+                    return;
+                }
+            };
+            let addr = format!("{}:{}", bind_host, port);
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    self.config.dynamic_forwards.push(port);
+                    let tx = accept_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((s, _)) => {
+                                    if tx.send(AcceptEvent::Dynamic(s)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                    eprintln!("Dynamic forwarding (SOCKS5) listening on {}.", addr);
+                }
+                Err(e) => eprintln!("ns-ssh: cannot listen on {}: {}", addr, e),
+            }
+            return;
+        }
+        if let Some(spec) = line.strip_prefix("-R") {
+            match crate::config::parse_forward_spec(spec.trim()) {
+                Some((bind_addr, bind_port, host, connect_port)) => {
+                    let req = build_global_request_tcpip_forward(true, &bind_addr, bind_port as u32);
+                    if let Some(stream) = self.stream.as_mut() {
+                        if send_encrypted_packet(stream, &req, &mut self.transport, false, aead)
+                            .await
+                            .is_ok()
+                        {
+                            remote_forward_map.insert(bind_port, (host, connect_port));
+                            eprintln!("Remote forwarding listening on port {}.", bind_port);
+                        }
+                    }
+                }
+                None => eprintln!("ns-ssh: invalid forward specification: {}", spec.trim()),
+            }
+            return;
+        }
+        eprintln!("ns-ssh: unsupported escape command: {}", line);
+    }
+
+    /// Send SSH_MSG_IGNORE chaff plus a random delay to obscure keystroke
+    /// timing (`ObscureKeystrokeTiming`).
+    async fn send_obscure_chaff(&mut self) -> Result<()> {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let packets = rng.gen_range(1..=3);
+        for _ in 0..packets {
+            let len = rng.gen_range(8..=64);
+            let data: Vec<u8> = (0..len).map(|_| rng.gen::<u8>()).collect();
+            let mut payload = vec![msg::SSH_MSG_IGNORE];
+            SshBytes(data).encode(&mut payload).unwrap();
+            self.send_packet(&payload, false).await?;
+        }
+        let interval = self.config.obscure_keystroke_timing_interval.max(1) as u64;
+        let delay = rng.gen_range(0..interval);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        Ok(())
+    }
+
     fn is_aead(&self) -> bool {
         self.transport.client_to_server_cipher.as_ref()
             .map(|c| c.is_aead())
@@ -4430,22 +4660,50 @@ fn split_command(line: &str) -> Vec<String> {
     args
 }
 
-fn connect_proxy_command(config: &ResolvedConfig, cmd: &str, target_host: &str, target_port: u16) -> Result<BoxedStream> {
-    use tokio::process::Command;
-    use std::process::Stdio;
-    let expanded = cmd
-        .replace("%%", "\u{0}")
+/// Expand the ProxyCommand token substitutions (`%h`, `%n`, `%p`, `%r`, `%u`,
+/// `%%`).
+fn expand_proxy_command(cmd: &str, config: &ResolvedConfig, target_host: &str, target_port: u16) -> String {
+    cmd.replace("%%", "\u{0}")
         .replace("%h", target_host)
         .replace("%p", &target_port.to_string())
         .replace("%r", &config.user)
         .replace("%n", target_host)
         .replace("%u", &config.user)
-        .replace('\u{0}', "%");
+        .replace('\u{0}', "%")
+}
+
+async fn connect_proxy_command(
+    config: &ResolvedConfig,
+    cmd: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<BoxedStream> {
+    use std::process::Stdio;
+    let expanded = expand_proxy_command(cmd, config, target_host, target_port);
+    if config.proxy_use_fdpass {
+        // OpenSSH refuses FDpass with `ProxyCommand=-`, which expects the
+        // caller to own the stdio descriptors.
+        if cmd.trim() == "-" {
+            return Err(SshError::Config(
+                "ProxyCommand=\"-\" is not compatible with ProxyUseFDpass".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            return connect_proxy_fdpass(&expanded).await;
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(SshError::Config(
+                "ProxyUseFDpass is not supported on this platform".into(),
+            ));
+        }
+    }
     let argv = split_command(&expanded);
     if argv.is_empty() {
         return Err(SshError::Protocol("empty ProxyCommand".into()));
     }
-    let mut child = Command::new(&argv[0])
+    let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4456,6 +4714,185 @@ fn connect_proxy_command(config: &ResolvedConfig, cmd: &str, target_host: &str, 
     let stdout = child.stdout.take().ok_or_else(|| SshError::Protocol("proxy stdout not captured".into()))?;
     let stdin = child.stdin.take().ok_or_else(|| SshError::Protocol("proxy stdin not captured".into()))?;
     Ok(Box::pin(ProxyStream { _child: child, stdout, stdin }))
+}
+
+/// Run the proxy command and receive its connected descriptor over
+/// SCM_RIGHTS (`ProxyUseFDpass`), mirroring OpenSSH's
+/// `ssh_proxy_fdpass_connect()`.
+#[cfg(unix)]
+async fn connect_proxy_fdpass(expanded: &str) -> Result<BoxedStream> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut sp = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
+        return Err(SshError::Io(std::io::Error::last_os_error()));
+    }
+    let child_end = unsafe { OwnedFd::from_raw_fd(sp[0]) };
+    let parent_end = unsafe { OwnedFd::from_raw_fd(sp[1]) };
+    let dup_fd = unsafe { libc::dup(child_end.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(SshError::Io(std::io::Error::last_os_error()));
+    }
+    let child_out = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(expanded)
+        .stdin(std::process::Stdio::from(std::fs::File::from(child_end)))
+        .stdout(std::process::Stdio::from(std::fs::File::from(child_out)))
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(SshError::Io)?;
+
+    // Blocking recvmsg is confined to a blocking thread so it cannot stall
+    // the async runtime.
+    let received = tokio::task::spawn_blocking(move || receive_fd(parent_end))
+        .await
+        .map_err(|e| SshError::Protocol(format!("proxy fdpass task failed: {}", e)))??;
+    let _reaper = tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
+
+    let fd = unsafe { OwnedFd::from_raw_fd(received) };
+    // AsyncFd requires the descriptor to be non-blocking.
+    let flags = unsafe { libc::fcntl(received, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(received, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+    let afd = tokio::io::unix::AsyncFd::new(fd).map_err(SshError::Io)?;
+    Ok(Box::pin(FdStream { fd: afd }))
+}
+
+/// Receive one descriptor passed as an SCM_RIGHTS ancillary message.
+#[cfg(unix)]
+fn receive_fd(parent_end: std::os::unix::io::OwnedFd) -> Result<i32> {
+    use std::os::unix::io::AsRawFd;
+
+    let pfd = parent_end.as_raw_fd();
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut cmsg_buf = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1 as _;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_buf.len() as _;
+
+    let n = unsafe { libc::recvmsg(pfd, &mut msg, 0) };
+    if n < 0 {
+        return Err(SshError::Io(std::io::Error::last_os_error()));
+    }
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null()
+        || unsafe { (*cmsg).cmsg_level } != libc::SOL_SOCKET
+        || unsafe { (*cmsg).cmsg_type } != libc::SCM_RIGHTS
+    {
+        return Err(SshError::Protocol(
+            "proxy did not pass a socket via SCM_RIGHTS".into(),
+        ));
+    }
+    let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32) };
+    Ok(fd)
+}
+
+/// Async wrapper around a connected descriptor received from a proxy command.
+#[cfg(unix)]
+struct FdStream {
+    fd: tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>,
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncRead for FdStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::os::unix::io::AsRawFd;
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        loop {
+            let mut guard = match self.fd.poll_read_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+            let res = guard.try_io(|inner| {
+                let mut tmp = vec![0u8; buf.remaining()];
+                let n = unsafe {
+                    libc::read(
+                        inner.as_raw_fd(),
+                        tmp.as_mut_ptr() as *mut libc::c_void,
+                        tmp.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    buf.put_slice(&tmp[..n as usize]);
+                    Ok(())
+                }
+            });
+            match res {
+                Ok(r) => return std::task::Poll::Ready(r),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl tokio::io::AsyncWrite for FdStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let mut guard = match self.fd.poll_write_ready(cx) {
+                std::task::Poll::Ready(Ok(g)) => g,
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            };
+            let res = guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::write(
+                        inner.as_raw_fd(),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            });
+            match res {
+                Ok(r) => return std::task::Poll::Ready(r),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin, W: Unpin> tokio::io::AsyncRead for CombinedStream<R, W> {
@@ -5237,8 +5674,39 @@ impl SshClient {
     }
 }
 
+/// `ForkAfterAuthentication`: fork into the background after a successful
+/// authentication. The runtime must be single-threaded for this to be safe:
+/// fork only duplicates the calling thread, so worker/driver threads of a
+/// multi-threaded runtime would not exist in the child.
+#[cfg(unix)]
+fn fork_after_authentication() {
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("ns-ssh: fork failed: {}", std::io::Error::last_os_error());
+        } else if pid > 0 {
+            // Parent returns to the shell; the child keeps the session.
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn fork_after_authentication() {
+    eprintln!("ns-ssh: ForkAfterAuthentication is not supported on this platform");
+}
+
 pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, force_tty: bool) -> i32 {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // ForkAfterAuthentication forks after auth, so the runtime must live on the
+    // calling thread to survive the fork.
+    let rt = if config.fork_after_authentication {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    } else {
+        tokio::runtime::Runtime::new().unwrap()
+    };
     rt.block_on(async move {
         let mut client = SshClient::new(config.clone());
         tracing::info!("connecting to {}:{} as {}", config.hostname, config.port, config.user);
@@ -5312,6 +5780,11 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
         if client.authenticate().await.is_err() {
             eprintln!("ns-ssh: authentication failed");
             return 255;
+        }
+        // ForkAfterAuthentication / -f: background the client now that the
+        // connection is authenticated.
+        if config.fork_after_authentication {
+            fork_after_authentication();
         }
         if config.add_keys_to_agent {
             client.add_loaded_keys_to_agent().await;
@@ -5389,11 +5862,11 @@ mod tests {
     fn escape_state_disconnect() {
         let mut s = EscapeState::new();
         // "echo hi\n" passes through; then "~." terminates.
-        let (out, exit) = s.process(b"echo hi\n", '~');
+        let (out, action) = s.process(b"echo hi\n", '~', false);
         assert_eq!(out, b"echo hi\n".to_vec());
-        assert!(!exit);
-        let (out, exit) = s.process(b"~.", '~');
-        assert!(exit);
+        assert!(matches!(action, EscapeAction::None));
+        let (out, action) = s.process(b"~.", '~', false);
+        assert!(matches!(action, EscapeAction::Exit));
         assert!(out.is_empty());
     }
 
@@ -5401,16 +5874,16 @@ mod tests {
     fn escape_state_midline_tilde_passthrough() {
         let mut s = EscapeState::new();
         // A '~' mid-line (not at line start) is forwarded verbatim.
-        let (out, exit) = s.process(b"a~b\n", '~');
+        let (out, action) = s.process(b"a~b\n", '~', false);
         assert_eq!(out, b"a~b\n".to_vec());
-        assert!(!exit);
+        assert!(matches!(action, EscapeAction::None));
     }
 
     #[test]
     fn escape_state_unknown_escape() {
         let mut s = EscapeState::new();
-        let (out, exit) = s.process(b"~x", '~');
-        assert!(!exit);
+        let (out, action) = s.process(b"~x", '~', false);
+        assert!(matches!(action, EscapeAction::None));
         assert_eq!(out, b"~x".to_vec());
     }
 
@@ -5418,11 +5891,11 @@ mod tests {
     fn escape_state_spanning_chunks() {
         let mut s = EscapeState::new();
         // '~' at end of chunk, '.' at start of next chunk => disconnect.
-        let (out, exit) = s.process(b"~", '~');
-        assert!(!exit);
+        let (out, action) = s.process(b"~", '~', false);
+        assert!(matches!(action, EscapeAction::None));
         assert!(out.is_empty());
-        let (out, exit) = s.process(b".", '~');
-        assert!(exit);
+        let (out, action) = s.process(b".", '~', false);
+        assert!(matches!(action, EscapeAction::Exit));
         assert!(out.is_empty());
     }
 

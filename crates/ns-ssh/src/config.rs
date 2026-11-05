@@ -119,6 +119,23 @@ pub struct HostConfig {
     /// keyboard-interactive USERAUTH_REQUEST.
     #[serde(default)]
     pub kbd_interactive_devices: Option<String>,
+    /// EnableEscapeCommandline: allow `~C` to request forwards interactively.
+    #[serde(default)]
+    pub enable_escape_commandline: Option<bool>,
+    /// ObscureKeystrokeTiming: `yes`/`no`/`interval:N` (0 = disabled).
+    #[serde(default)]
+    pub obscure_keystroke_timing_interval: Option<u32>,
+    /// ForkAfterAuthentication: fork into the background after authenticating.
+    #[serde(default)]
+    pub fork_after_authentication: Option<bool>,
+    /// ProxyUseFDpass: obtain the proxy socket over SCM_RIGHTS instead of
+    /// piping the proxy command's stdin/stdout.
+    #[serde(default)]
+    pub proxy_use_fdpass: Option<bool>,
+    /// EnableSSHKeysign: use the setuid ssh-keysign helper (not used by
+    /// ns-ssh, which signs with readable host keys directly).
+    #[serde(default)]
+    pub enable_ssh_keysign: Option<bool>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -477,6 +494,16 @@ pub struct ResolvedConfig {
     pub stdin_null: bool,
     /// KbdInteractiveDevices: keyboard-interactive submethods.
     pub kbd_interactive_devices: Option<String>,
+    /// EnableEscapeCommandline: `~C` opens an interactive forward command line.
+    pub enable_escape_commandline: bool,
+    /// ObscureKeystrokeTiming: keystroke obfuscation interval in ms (0 = off).
+    pub obscure_keystroke_timing_interval: u32,
+    /// ForkAfterAuthentication: background the client after authentication.
+    pub fork_after_authentication: bool,
+    /// ProxyUseFDpass: receive the proxy socket via SCM_RIGHTS.
+    pub proxy_use_fdpass: bool,
+    /// EnableSSHKeysign: request the ssh-keysign helper (ns-ssh signs directly).
+    pub enable_ssh_keysign: bool,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -617,6 +644,11 @@ impl ResolvedConfig {
             session_type: None,
             stdin_null: false,
             kbd_interactive_devices: None,
+            enable_escape_commandline: false,
+            obscure_keystroke_timing_interval: 0,
+            fork_after_authentication: false,
+            proxy_use_fdpass: false,
+            enable_ssh_keysign: false,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -1012,6 +1044,11 @@ impl SshConfig {
         let mut session_type = None;
         let mut stdin_null = None;
         let mut kbd_interactive_devices = None;
+        let mut enable_escape_commandline = None;
+        let mut obscure_keystroke_timing_interval = None;
+        let mut fork_after_authentication = None;
+        let mut proxy_use_fdpass = None;
+        let mut enable_ssh_keysign = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1112,6 +1149,11 @@ impl SshConfig {
                             session_type: session_type.take(),
                             stdin_null: stdin_null.take(),
                             kbd_interactive_devices: kbd_interactive_devices.take(),
+                            enable_escape_commandline: enable_escape_commandline.take(),
+                            obscure_keystroke_timing_interval: obscure_keystroke_timing_interval.take(),
+                            fork_after_authentication: fork_after_authentication.take(),
+                            proxy_use_fdpass: proxy_use_fdpass.take(),
+                            enable_ssh_keysign: enable_ssh_keysign.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1229,6 +1271,11 @@ impl SshConfig {
                             session_type: session_type.take(),
                             stdin_null: stdin_null.take(),
                             kbd_interactive_devices: kbd_interactive_devices.take(),
+                            enable_escape_commandline: enable_escape_commandline.take(),
+                            obscure_keystroke_timing_interval: obscure_keystroke_timing_interval.take(),
+                            fork_after_authentication: fork_after_authentication.take(),
+                            proxy_use_fdpass: proxy_use_fdpass.take(),
+                            enable_ssh_keysign: enable_ssh_keysign.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1326,6 +1373,11 @@ impl SshConfig {
                             session_type: session_type.take(),
                             stdin_null: stdin_null.take(),
                             kbd_interactive_devices: kbd_interactive_devices.take(),
+                            enable_escape_commandline: enable_escape_commandline.take(),
+                            obscure_keystroke_timing_interval: obscure_keystroke_timing_interval.take(),
+                            fork_after_authentication: fork_after_authentication.take(),
+                            proxy_use_fdpass: proxy_use_fdpass.take(),
+                            enable_ssh_keysign: enable_ssh_keysign.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1605,15 +1657,22 @@ impl SshConfig {
                 "kbdinteractivedevices" | "kbd_interactive_devices" => {
                     kbd_interactive_devices = Some(value.to_string());
                 }
-                // Known OpenSSH directives that we accept but do not enforce.
-                // Accepting them keeps real-world configs loadable; enforcement
-                // is tracked separately (see docs/openssh-gap-audit.md).
-                | "enableescapecommandline" | "enable_escape_commandline"
-                | "enablesshkeysign" | "enable_ssh_keysign"
-                | "forkafterauthentication" | "fork_after_authentication"
-                | "obscurekeystroketiming" | "obscure_keystroke_timing"
-                | "proxyusefdpass" | "proxy_use_fdpass"
-                | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
+                "enableescapecommandline" | "enable_escape_commandline" => {
+                    enable_escape_commandline = Some(yes(value));
+                }
+                "obscurekeystroketiming" | "obscure_keystroke_timing" => {
+                    obscure_keystroke_timing_interval =
+                        Some(parse_obscure_keystroke_timing(value)?);
+                }
+                "forkafterauthentication" | "fork_after_authentication" => {
+                    fork_after_authentication = Some(yes(value));
+                }
+                "proxyusefdpass" | "proxy_use_fdpass" => {
+                    proxy_use_fdpass = Some(yes(value));
+                }
+                "enablesshkeysign" | "enable_ssh_keysign" => {
+                    enable_ssh_keysign = Some(yes(value));
+                }
                 // Deprecated/obsolete OpenSSH directive names: accepted and
                 // ignored, matching OpenSSH's oDeprecated/oUnsupported/oIgnore
                 // handling so old configs keep loading.
@@ -1705,6 +1764,11 @@ impl SshConfig {
                 session_type: session_type.clone(),
                 stdin_null: stdin_null.clone(),
                 kbd_interactive_devices: kbd_interactive_devices.clone(),
+                enable_escape_commandline: enable_escape_commandline.clone(),
+                obscure_keystroke_timing_interval,
+                fork_after_authentication: fork_after_authentication.clone(),
+                proxy_use_fdpass: proxy_use_fdpass.clone(),
+                enable_ssh_keysign: enable_ssh_keysign.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
@@ -2021,6 +2085,35 @@ pub fn parse_syslog_facility(value: &str) -> std::result::Result<String, SshErro
         Ok(v)
     } else {
         Err(SshError::Config(format!("unsupported SyslogFacility: {}", value)))
+    }
+}
+
+/// Parse `ObscureKeystrokeTiming`: `yes`/`true` = 20 ms, `no`/`false` = off,
+/// `interval:N` with N in 0..=1000 milliseconds (readconf.c semantics).
+pub fn parse_obscure_keystroke_timing(value: &str) -> std::result::Result<u32, SshError> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "yes" | "true" => Ok(20),
+        "no" | "false" => Ok(0),
+        _ => {
+            let n = v
+                .strip_prefix("interval:")
+                .ok_or_else(|| {
+                    SshError::Config(format!("bad ObscureKeystrokeTiming: {}", value))
+                })?
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| {
+                    SshError::Config(format!("bad ObscureKeystrokeTiming: {}", value))
+                })?;
+            if n > 1000 {
+                return Err(SshError::Config(format!(
+                    "bad ObscureKeystrokeTiming interval: {}",
+                    value
+                )));
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -2545,6 +2638,33 @@ Match tagged !jump
         );
 
         assert!(SshConfig::parse("Host example\n  SessionType bogus\n").is_err());
+    }
+
+    #[test]
+    fn escape_fork_fdpass_keysign_directives() {
+        let cfg = SshConfig::parse(
+            "Host example\n  EnableEscapeCommandline yes\n  ObscureKeystrokeTiming interval:50\n  ForkAfterAuthentication yes\n  ProxyUseFDpass yes\n  EnableSSHKeysign yes\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hosts[0].enable_escape_commandline, Some(true));
+        assert_eq!(cfg.hosts[0].obscure_keystroke_timing_interval, Some(50));
+        assert_eq!(cfg.hosts[0].fork_after_authentication, Some(true));
+        assert_eq!(cfg.hosts[0].proxy_use_fdpass, Some(true));
+        assert_eq!(cfg.hosts[0].enable_ssh_keysign, Some(true));
+
+        // ObscureKeystrokeTiming value forms (readconf.c semantics).
+        assert_eq!(parse_obscure_keystroke_timing("yes").unwrap(), 20);
+        assert_eq!(parse_obscure_keystroke_timing("no").unwrap(), 0);
+        assert_eq!(parse_obscure_keystroke_timing("interval:0").unwrap(), 0);
+        assert!(parse_obscure_keystroke_timing("interval:1001").is_err());
+        assert!(parse_obscure_keystroke_timing("bogus").is_err());
+
+        // NoHostAuthenticationForProxyCommand is not an OpenSSH keyword and
+        // must be rejected like any other unknown directive.
+        assert!(SshConfig::parse(
+            "Host example\n  NoHostAuthenticationForProxyCommand yes\n"
+        )
+        .is_err());
     }
 
     #[test]

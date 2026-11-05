@@ -382,6 +382,10 @@ fn main() {
     if args.no_remote_command {
         config.no_remote_command = true;
     }
+    // -f: fork into the background after authentication.
+    if args.fork_to_background {
+        config.fork_after_authentication = true;
+    }
 
     // -M / -S are short aliases for -o ControlMaster=yes / -o ControlPath=...
     if args.control_master {
@@ -584,6 +588,18 @@ fn print_effective_config(cfg: &ResolvedConfig) {
     println!("passwordauthentication {}", yesno(cfg.password_authentication));
     println!("pubkeyauthentication {}", yesno(cfg.pubkey_authentication));
     println!("kbdinteractiveauthentication {}", yesno(cfg.kbd_interactive_authentication));
+    println!("enableescapecommandline {}", yesno(cfg.enable_escape_commandline));
+    println!(
+        "obscurekeystroketiming {}",
+        if cfg.obscure_keystroke_timing_interval == 0 {
+            "no".to_string()
+        } else {
+            cfg.obscure_keystroke_timing_interval.to_string()
+        }
+    );
+    println!("forkafterauthentication {}", yesno(cfg.fork_after_authentication));
+    println!("proxyusefdpass {}", yesno(cfg.proxy_use_fdpass));
+    println!("enablesshkeysign {}", yesno(cfg.enable_ssh_keysign));
     if let Some(v) = &cfg.preferred_authentications {
         println!("preferredauthentications {}", v.join(","));
     }
@@ -1708,6 +1724,21 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(v) = &h.kbd_interactive_devices {
             resolved.kbd_interactive_devices = Some(v.clone());
         }
+        if let Some(v) = h.enable_escape_commandline {
+            resolved.enable_escape_commandline = v;
+        }
+        if let Some(v) = h.obscure_keystroke_timing_interval {
+            resolved.obscure_keystroke_timing_interval = v;
+        }
+        if let Some(v) = h.fork_after_authentication {
+            resolved.fork_after_authentication = v;
+        }
+        if let Some(v) = h.proxy_use_fdpass {
+            resolved.proxy_use_fdpass = v;
+        }
+        if let Some(v) = h.enable_ssh_keysign {
+            resolved.enable_ssh_keysign = v;
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1923,6 +1954,21 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = &host_config.kbd_interactive_devices {
                 resolved.kbd_interactive_devices = Some(v.clone());
+            }
+            if let Some(v) = host_config.enable_escape_commandline {
+                resolved.enable_escape_commandline = v;
+            }
+            if let Some(v) = host_config.obscure_keystroke_timing_interval {
+                resolved.obscure_keystroke_timing_interval = v;
+            }
+            if let Some(v) = host_config.fork_after_authentication {
+                resolved.fork_after_authentication = v;
+            }
+            if let Some(v) = host_config.proxy_use_fdpass {
+                resolved.proxy_use_fdpass = v;
+            }
+            if let Some(v) = host_config.enable_ssh_keysign {
+                resolved.enable_ssh_keysign = v;
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2250,6 +2296,21 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &mc.kbd_interactive_devices {
                 resolved.kbd_interactive_devices = Some(v.clone());
             }
+            if let Some(v) = mc.enable_escape_commandline {
+                resolved.enable_escape_commandline = v;
+            }
+            if let Some(v) = mc.obscure_keystroke_timing_interval {
+                resolved.obscure_keystroke_timing_interval = v;
+            }
+            if let Some(v) = mc.fork_after_authentication {
+                resolved.fork_after_authentication = v;
+            }
+            if let Some(v) = mc.proxy_use_fdpass {
+                resolved.proxy_use_fdpass = v;
+            }
+            if let Some(v) = mc.enable_ssh_keysign {
+                resolved.enable_ssh_keysign = v;
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2527,6 +2588,23 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         "stdinnull" | "stdin_null" => resolved.stdin_null = value == "yes",
         "kbdinteractivedevices" | "kbd_interactive_devices" => {
             resolved.kbd_interactive_devices = Some(value.to_string());
+        }
+        "enableescapecommandline" | "enable_escape_commandline" => {
+            resolved.enable_escape_commandline = value != "no";
+        }
+        "obscurekeystroketiming" | "obscure_keystroke_timing" => {
+            if let Ok(v) = crate::config::parse_obscure_keystroke_timing(value) {
+                resolved.obscure_keystroke_timing_interval = v;
+            }
+        }
+        "forkafterauthentication" | "fork_after_authentication" => {
+            resolved.fork_after_authentication = value != "no";
+        }
+        "proxyusefdpass" | "proxy_use_fdpass" => {
+            resolved.proxy_use_fdpass = value != "no";
+        }
+        "enablesshkeysign" | "enable_ssh_keysign" => {
+            resolved.enable_ssh_keysign = value != "no";
         }
         "connecttimeout" | "connect_timeout" => {
             if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }
