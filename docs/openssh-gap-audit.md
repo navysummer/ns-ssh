@@ -313,6 +313,10 @@ exit code：0
 完成判据实测：`non_etm_exec_round_trip`/`gcm_exec_round_trip`/`large_upload_to_non_echoing_command_completes`/`sntrup_hybrid_kex_round_trip`/`umac_mac_negotiation_round_trip` 全绿；`ns-ssh -Q cipher` 与 `ssh -G` 逐项一致；OpenSSH 9.9 `ssh -vvv`→ns-ssh-server 协商出 `aes128-gcm@openssh.com` + `ssh-ed25519` host key；ns-ssh 客户端→OpenSSH 9.9 sshd 双向互通。
 **残留（不属于 D1 判据，归入 D2）**：KEX 默认列表仍缺 OpenSSH 9.9 第 4 位 `mlkem768x25519-sha256`（ML-KEM-768 混合 KEX）；全仓无 mlkem 实现、无可用 `ml-kem` 纯 Rust crate（2026-11-05 网络不可达 crates.io，本地 cargo 缓存无 ml-kem crate），外部依赖不可得，按 §19.2 需产品决策。
 
+**D2 状态（2026-11-05 复核）**：✅ 判据达成（残留为外部依赖阻塞，见下）。P09（EXT_INFO 条件发送）已实现：`server.rs:647-670` 仅在 `client_ext_info_c` 时发送，`server-sig-algs` 不含 `ssh-rsa`；实测 OpenSSH `-vvv` 收到 `server-sig-algs=<ssh-ed25519,ecdsa-sha2-nistp256/384/521,rsa-sha2-512/256>` 且 "Sending SSH2_MSG_EXT_INFO"。K06（gex，`server_moduli_file_supplies_gex_group`）、C07（none cipher，`none_cipher_is_identity`）、M03（umac，`046f127`）、M04（hmac-md5，`hmac_md5_matches_rfc2202_vector`）均已有单测证据。
+首选 KEX 实测：OpenSSH 9.9 `-vvv`→ns-ssh-server 协商 `ecdh-sha2-nistp256`（双方共同首选项一致）；OpenSSH 的 `mlkem768x25519-sha256`（默认第 4 位）为唯一 KEX 差异。
+**残留（依赖阻塞）**：① `mlkem768x25519-sha256`（K07）：无 `ml-kem` 纯 Rust crate（crates.io 网络不可达、本地缓存无）；② `hmac-ripemd160`（M04）：本机 OpenSSH 9.9p2/LibreSSL 构建的 `ssh -Q mac` 不含 ripemd（LibreSSL 未启用 RIPEMD160），且本地无 `ripemd` crate。两者均按 §19 需产品决策。
+
 ## 19. 需要产品决策的选型（先确认再实现）
 
 1. **PAM / GSSAPI / 证书**：OpenSSH 的这些能力依赖系统库（PAM、GSSAPI）或新增纯 Rust 依赖，与原始“零第三方依赖”约束冲突。需要确认是否允许新增依赖或改为平台条件编译。
