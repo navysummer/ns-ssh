@@ -51,12 +51,15 @@ const DEFAULT_HOST_KEYS: &[&str] = &[
 ];
 
 const DEFAULT_CIPHERS: &[&str] = &[
+    // Order follows OpenSSH 9.9p2's default KEXINIT proposal (ssh -G): GCM
+    // first, chacha third, CTR last. CBC/3DES are supported but never
+    // advertised by default.
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
     "chacha20-poly1305@openssh.com",
     "aes128-ctr",
     "aes192-ctr",
     "aes256-ctr",
-    "aes128-gcm@openssh.com",
-    "aes256-gcm@openssh.com",
 ];
 
 const DEFAULT_MACS: &[&str] = &[
