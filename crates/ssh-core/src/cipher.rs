@@ -850,8 +850,53 @@ impl SshCipher for TDesCbcCipher {
     }
 }
 
+/// RFC 4253 §6.4 / OpenSSH cipher.c `cipher_none`: no encryption. Only usable
+/// when explicitly configured (never advertised by default) and only in
+/// combination with the `none` MAC.
+pub struct NoneCipher {
+    _private: (),
+}
+
+impl NoneCipher {
+    pub fn new() -> Self {
+        NoneCipher { _private: () }
+    }
+}
+
+impl SshCipher for NoneCipher {
+    fn name(&self) -> &str { "none" }
+    fn key_len(&self) -> usize { 0 }
+    fn iv_len(&self) -> usize { 0 }
+    fn block_size(&self) -> usize { 8 }
+    fn tag_len(&self) -> usize { 0 }
+    fn is_aead(&self) -> bool { false }
+
+    fn set_key(&mut self, key: &[u8]) -> Result<()> {
+        if !key.is_empty() {
+            return Err(SshError::InvalidKey("none cipher takes no key".into()));
+        }
+        Ok(())
+    }
+
+    fn set_iv(&mut self, iv: &[u8]) -> Result<()> {
+        if !iv.is_empty() {
+            return Err(SshError::InvalidKey("none cipher takes no IV".into()));
+        }
+        Ok(())
+    }
+
+    fn encrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
+
+    fn decrypt(&mut self, _seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
+}
+
 pub fn create_cipher(name: &str) -> Result<Box<dyn SshCipher>> {
     match name {
+        "none" => Ok(Box::new(NoneCipher::new())),
         "chacha20-poly1305@openssh.com" => Ok(Box::new(ChaCha20Poly1305Cipher::new())),
         "aes128-ctr" => Ok(Box::new(Aes128CtrCipher::new())),
         "aes192-ctr" => Ok(Box::new(Aes192CtrCipher::new())),
@@ -990,6 +1035,29 @@ mod tests {
     fn aes_gcm_block_size_is_sixteen() {
         assert_eq!(configured_128().block_size(), 16);
         assert_eq!(configured_256().block_size(), 16);
+    }
+
+    #[test]
+    fn none_cipher_is_identity() {
+        // `none` is only reachable by explicit configuration; it encrypts and
+        // decrypts as identity with zero key/IV and a block size of 8.
+        let mut c = create_cipher("none").unwrap();
+        assert_eq!(c.name(), "none");
+        assert_eq!(c.key_len(), 0);
+        assert_eq!(c.iv_len(), 0);
+        assert_eq!(c.block_size(), 8);
+        assert!(!c.is_aead());
+        c.set_key(&[]).unwrap();
+        c.set_iv(&[]).unwrap();
+        let data = b"hello packet";
+        let ct = c.encrypt(42, data).unwrap();
+        assert_eq!(ct, data);
+        let pt = c.decrypt(42, &ct).unwrap();
+        assert_eq!(pt, data);
+        // A non-empty key must be rejected.
+        assert!(c.set_key(&[0u8; 1]).is_err());
+        // The default supported set never advertises `none`.
+        assert!(!get_supported_ciphers().contains(&"none"));
     }
 }
 

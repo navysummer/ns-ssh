@@ -27,5 +27,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
 md-5 = "0.10"
 sha-crypt = "0.6"
+bcrypt = "0.15"
+yescrypt = "0.1"
 ed25519-dalek = "2"
 p256 = "0.13"

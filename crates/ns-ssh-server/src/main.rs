@@ -23,6 +23,15 @@ struct SshdArgs {
     #[arg(short = 'd')]
     debug: bool,
 
+    #[arg(short = 't')]
+    test_mode: bool,
+
+    #[arg(short = 'T')]
+    dump_config: bool,
+
+    #[arg(short = '6')]
+    force_ipv6: bool,
+
     #[arg(short = 'D')]
     no_daemon: bool,
 
@@ -365,9 +374,27 @@ fn main() {
         }
     }
 
+    if args.force_ipv6 && !config.listen_address.contains(':') {
+        // OpenSSH `-6`: force IPv6. Wrap the listen address in brackets for an
+        // IPv6 literal (e.g. ::1) so the bind succeeds.
+        config.listen_address = format!("[{}]", config.listen_address);
+    }
+
+    if args.test_mode {
+        // `sshd -t`: validate the configuration and exit without starting.
+        // A config that loaded is considered valid; report the effective port.
+        println!("config ok: port {}", config.port);
+        std::process::exit(0);
+    }
+
+    if args.dump_config {
+        // `sshd -T`: dump the effective configuration as a diagnostic.
+        print_effective_config(&config);
+        std::process::exit(0);
+    }
+
     // Initialize logging after config is loaded so `LogLevel`/`-d`/`-e` apply.
     init_logging(&config, args.debug || args.log_to_stderr);
-
     if !args.no_daemon && !args.debug {
         if let Err(e) = session::daemonize() {
             eprintln!("ns-ssh-server: failed to daemonize: {}", e);
@@ -394,6 +421,23 @@ fn main() {
             std::process::exit(1);
         }
     });
+}
+
+/// `sshd -T`: dump the effective server configuration as `key value` lines.
+fn print_effective_config(cfg: &ServerConfig) {
+    println!("port {}", cfg.port);
+    println!("listenaddress {}", cfg.listen_address);
+    println!("hostkey {}", cfg.host_key_files.join(" "));
+    println!("passwordauthentication {}", cfg.password_auth);
+    println!("pubkeyauthentication {}", cfg.pubkey_auth);
+    println!("permitrootlogin {}", cfg.permit_root_login);
+    println!("authorizedkeysfile {}", cfg.authorized_keys_files.join(" "));
+    println!("maxauthtries {}", cfg.max_auth_tries);
+    println!("maxsessions {}", cfg.max_sessions);
+    println!("loglevel {}", cfg.log_level.as_deref().unwrap_or("INFO"));
+    if let Some(kex) = &cfg.kex_algorithms {
+        println!("kexalgorithms {}", kex);
+    }
 }
 
 /// Initialize the tracing subscriber, honoring `LogLevel`/`-d`/`-e`/`RUST_LOG`.

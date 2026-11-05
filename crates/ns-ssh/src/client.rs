@@ -936,9 +936,16 @@ impl SshClient {
             &self.transport.client_kex_init,
             &self.transport.server_kex_init,
         )?;
+        // RFC 4253 §7: if the server guessed a KEX algorithm that was not
+        // selected, the server's next packet (the KEX reply/init it
+        // optimistically sent) must be discarded before we read the real one.
+        if negotiation.server_first_kex_follows_wrong_guess {
+            let discarded = receive_raw_packet(stream).await?;
+            self.transport.incoming_seq += 1;
+            let _ = discarded;
+        }
         self.transport.strict_kex = negotiation.strict_kex;
         self.transport.strict_kex_peer_kexinit = negotiation.strict_kex;
-
         let mut kex = SshTransport::create_kex_algorithm(&negotiation.kex_algorithm)?;
 
         let (server_host_key_blob, _server_public_key, server_signature_blob, shared_secret, exchange_hash, kex_hash_name) = if negotiation.kex_algorithm.starts_with("diffie-hellman-group-exchange") {
@@ -1064,17 +1071,28 @@ impl SshClient {
                 server_kex_init: self.transport.server_kex_init.clone(),
             };
 
-            let exch_hash = ssh_core::kex::compute_exchange_hash(
-                &hash_name,
-                &exchange,
-                &host_key_blob,
-                &kex.public_key_bytes(),
-                &srv_pub,
-                &shared,
-                // Finite-field DH hashes e/f as mpints; ECDH/curve25519 as
-                // byte strings.
-                negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
-            );
+            let exch_hash = if negotiation.kex_algorithm.starts_with("sntrup761x25519") {
+                // RFC 9941 §3: K is a string, Q_C/Q_S are byte strings.
+                ssh_core::kex::compute_hybrid_exchange_hash(
+                    &exchange,
+                    &host_key_blob,
+                    &kex.public_key_bytes(),
+                    &srv_pub,
+                    &shared,
+                )
+            } else {
+                ssh_core::kex::compute_exchange_hash(
+                    &hash_name,
+                    &exchange,
+                    &host_key_blob,
+                    &kex.public_key_bytes(),
+                    &srv_pub,
+                    &shared,
+                    // Finite-field DH hashes e/f as mpints; ECDH/curve25519 as
+                    // byte strings.
+                    negotiation.kex_algorithm.starts_with("diffie-hellman-group"),
+                )
+            };
             (host_key_blob, srv_pub, sig_blob, shared, exch_hash, hash_name)
         };
 
@@ -1825,22 +1843,17 @@ impl SshClient {
 
         if self.config.forward_x11 {
             let mut cookie = [0u8; 16];
-            let mut seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            for b in cookie.iter_mut() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                *b = (seed >> 33) as u8;
-            }
+            // OpenSSH generates a cryptographically random cookie for -X/-Y;
+            // a predictable LCG would let a remote attacker forge X11 auth.
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut cookie);
             let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
             let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
             self.send_packet(&x11_msg, false).await?;
             let _resp = self.recv_packet().await?;
             if let Some(ref xauth) = self.config.xauth_location {
-                register_x11_cookie(xauth, &cookie_hex).await;
+                register_x11_cookie(xauth, &cookie_hex, self.config.forward_x11_trusted).await;
             }
         }
 
@@ -2855,10 +2868,23 @@ impl SshClient {
             }
         }
 
-        // The loop can stop on CHANNEL_CLOSE/DISCONNECT while bytes decoded from
-        // earlier CHANNEL_DATA packets are still queued in the forwarding
-        // channels (the select! only moves one item per iteration). Flush them
-        // before exiting, otherwise the tail of the command's output is dropped.
+        // The loop can stop on CHANNEL_CLOSE/DISCONNECT while window-gated data
+        // (peer window exhausted) is still queued, or while the socket write
+        // backlog still holds deferred packets. Flush both before exiting so a
+        // large upload's tail is not truncated when the server closes the
+        // channel immediately after the final WINDOW_ADJUST.
+        if !pending_write.is_empty() || !pending_window_data.is_empty() {
+            self.flush_pending_window_data(&mut pending_window_data, &mut pending_write, aead).await;
+            // Best-effort blocking flush of the socket backlog.
+            if let Some(stream) = self.stream.as_mut() {
+                use tokio::io::AsyncWriteExt;
+                while let Some(packet) = pending_write.pop_front() {
+                    let _ = stream.write_all(&packet).await;
+                }
+                let _ = stream.flush().await;
+            }
+        }
+
         {
             use std::io::Write;
             if let Some(mut rx) = session_data_rx.take() {
@@ -3322,15 +3348,9 @@ impl SshClient {
         // X11 forwarding request (x11-req) with a random MIT-MAGIC-COOKIE.
         if req.want_x11 {
             let mut cookie = [0u8; 16];
-            let mut seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            for b in cookie.iter_mut() {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                *b = (seed >> 33) as u8;
-            }
+            // Cryptographically random cookie (see the session path above).
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut cookie);
             let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
             let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
@@ -3338,7 +3358,7 @@ impl SshClient {
             send_encrypted_packet(stream, &x11_msg, &mut self.transport, false, aead).await?;
             let _ = self.await_request_reply().await;
             if let Some(ref xauth) = self.config.xauth_location {
-                register_x11_cookie(xauth, &cookie_hex).await;
+                register_x11_cookie(xauth, &cookie_hex, self.config.forward_x11_trusted).await;
             }
         }
 
@@ -3862,6 +3882,14 @@ impl SshClient {
             &self.transport.client_kex_init,
             &self.transport.server_kex_init,
         )?;
+        // RFC 4253 §7: discard the server's optimistic KEX packet if its
+        // guess was wrong.
+        if negotiation.server_first_kex_follows_wrong_guess {
+            let discarded = receive_encrypted_packet(stream, &mut self.transport, false, aead).await?;
+            if discarded.first() == Some(&msg::SSH_MSG_DISCONNECT) {
+                return Err(SshError::ConnectionClosed);
+            }
+        }
         self.transport.strict_kex = negotiation.strict_kex;
         self.transport.strict_kex_peer_kexinit = negotiation.strict_kex;
 
@@ -4213,9 +4241,10 @@ fn apply_socket_mask(path: &str, mask: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask));
 }
 
-/// Register the fake X11 cookie with the local X server through
-/// `XAuthLocation` (`xauth add <DISPLAY> MIT-MAGIC-COOKIE-1 <cookie>`).
-async fn register_x11_cookie(xauth: &str, cookie_hex: &str) {
+/// Register the X11 MIT-MAGIC-COOKIE with `XAuthLocation` so local X11 clients
+/// can reach the forwarded display. For `-X` (untrusted) the cookie is added
+/// as an untrusted entry; for `-Y` (trusted) it is a plain trusted entry.
+async fn register_x11_cookie(xauth: &str, cookie_hex: &str, trusted: bool) {
     let Ok(display) = std::env::var("DISPLAY") else { return };
     if display.is_empty() {
         return;
@@ -4225,6 +4254,12 @@ async fn register_x11_cookie(xauth: &str, cookie_hex: &str) {
         cmd.arg("-f").arg(authfile);
     }
     cmd.arg("add").arg(&display).arg("MIT-MAGIC-COOKIE-1").arg(cookie_hex);
+    if !trusted {
+        // `xauth add` supports an optional data field; OpenSSH marks the
+        // untrusted cookie with the literal `untrusted` so Xlib applies the
+        // security extension to remote clients.
+        cmd.arg("untrusted");
+    }
     if let Err(e) = cmd.status().await {
         tracing::debug!("xauth add failed: {}", e);
     }

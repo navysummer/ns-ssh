@@ -433,6 +433,14 @@ async fn handle_connection(
             return Err(e);
         }
     };
+    // RFC 4253 §7: if the client guessed a KEX algorithm that was not
+    // selected, the client's next packet (the KEX_DH_GEX_INIT / KEXDH_INIT it
+    // optimistically sent) must be discarded before we read the real one.
+    if negotiation.client_first_kex_follows_wrong_guess {
+        let discarded = receive_raw_packet(&mut stream).await?;
+        transport.incoming_seq += 1;
+        let _ = discarded;
+    }
     // Terrapin mitigation: enable the strict KEX rules only when both the
     // client's `-c-` and our `-s-` pseudo algorithms were advertised. We have
     // the client's KEXINIT at this point, so the peer-side rule is active.
@@ -514,9 +522,16 @@ async fn handle_connection(
                 let client_dh_init = receive_raw_packet(&mut stream).await?;
                 transport.incoming_seq += 1;
                 let mut r = &client_dh_init[1..];
-                let client_pub = SshMpInt::decode(&mut r)?.0;
+                // Finite-field DH (group14/16/18) sends e as an mpint; ECDH,
+                // curve25519 and the RFC 9941 hybrid send the ephemeral public
+                // key as a plain byte string.
+                let client_pub = if negotiation.kex_algorithm.starts_with("diffie-hellman-group") {
+                    SshMpInt::decode(&mut r)?.0
+                } else {
+                    SshBytes::decode(&mut r)?.0
+                };
                 (client_pub, None, None, None, None, None, None)
-            };
+             };
 
         let (shared_secret, hash_name, client_pub_for_hash, server_pub_for_hash) = if let Some(mut am) = actual_modp {
             let shared = am.compute_shared_secret(&client_public_key)?;
@@ -546,6 +561,15 @@ async fn handle_connection(
                 &exchange,
                 mn, nb, mx,
                 &pb, &gb,
+                &host_key_blob,
+                &client_pub_for_hash,
+                &server_pub_for_hash,
+                &shared_secret,
+            )
+        } else if negotiation.kex_algorithm.starts_with("sntrup761x25519") {
+            // RFC 9941 §3: K is a string, Q_C/Q_S are byte strings.
+            ssh_core::kex::compute_hybrid_exchange_hash(
+                &exchange,
                 &host_key_blob,
                 &client_pub_for_hash,
                 &server_pub_for_hash,
@@ -620,25 +644,31 @@ async fn handle_connection(
     transport.last_rekey_instant = std::time::Instant::now();
 
     {
-        let mut ext_info = vec![msg::SSH_EXT_INFO_S];
-        1u32.encode(&mut ext_info)?;
-        SshString::new("server-sig-algs").encode(&mut ext_info)?;
-        let mut sig_algs = Vec::new();
-        let algs = [
-            "ssh-ed25519",
-            "ecdsa-sha2-nistp256",
-            "ecdsa-sha2-nistp384",
-            "ecdsa-sha2-nistp521",
-            "rsa-sha2-512",
-            "rsa-sha2-256",
-            "ssh-rsa",
-        ];
-        for (i, a) in algs.iter().enumerate() {
-            if i > 0 { sig_algs.push(b','); }
-            sig_algs.extend_from_slice(a.as_bytes());
+        // RFC 8308 §3.1: send SSH_MSG_EXT_INFO only when the client
+        // advertised `ext-info-c`. OpenSSH never sends it unconditionally.
+        if negotiation.client_ext_info_c {
+            let mut ext_info = vec![msg::SSH_EXT_INFO_S];
+            1u32.encode(&mut ext_info)?;
+            SshString::new("server-sig-algs").encode(&mut ext_info)?;
+            let mut sig_algs = Vec::new();
+            // OpenSSH's default `server-sig-algs` does not include the SHA-1
+            // `ssh-rsa` signature; it is only reachable via an explicit
+            // `PubkeyAcceptedAlgorithms`/`HostKeyAlgorithms` override.
+            let algs = [
+                "ssh-ed25519",
+                "ecdsa-sha2-nistp256",
+                "ecdsa-sha2-nistp384",
+                "ecdsa-sha2-nistp521",
+                "rsa-sha2-512",
+                "rsa-sha2-256",
+            ];
+            for (i, a) in algs.iter().enumerate() {
+                if i > 0 { sig_algs.push(b','); }
+                sig_algs.extend_from_slice(a.as_bytes());
+            }
+            SshBytes(sig_algs).encode(&mut ext_info)?;
+            let _ = send_encrypted_packet_server(&mut stream, &ext_info, &mut transport, false, aead).await;
         }
-        SshBytes(sig_algs).encode(&mut ext_info)?;
-        let _ = send_encrypted_packet_server(&mut stream, &ext_info, &mut transport, false, aead).await;
     }
 
     // Authentication is complete: this connection no longer counts against
@@ -749,6 +779,14 @@ async fn send_auth_failure(
     Ok(())
 }
 
+/// Decide whether a failed keyboard-interactive round should re-prompt the
+/// client. OpenSSH/PAM drives multiple rounds; we cap the total rounds to
+/// `max_auth_tries` so a malicious client cannot loop forever. An empty user
+/// (no pending kbd session) is never re-prompted.
+fn kbd_should_reprompt(kbd_round: u32, max_auth_tries: u32, current_user: &str) -> bool {
+    kbd_round < max_auth_tries && !current_user.is_empty()
+}
+
 /// Record a successful authentication step and reply to the client: either
 /// USERAUTH_SUCCESS when the configured chain is complete, or a partial
 /// success failure naming the next required step. Returns `true` when the
@@ -799,7 +837,17 @@ async fn handle_authenticated_session(
         .map(|c| c.is_aead())
         .unwrap_or(false);
 
-    let svc_request = receive_encrypted_packet_server(&mut stream, &mut transport, false, aead).await?;
+    // RFC 8308: the client may send SSH_MSG_EXT_INFO before its
+    // SERVICE_REQUEST when the server advertised `ext-info-s`. Skip it.
+    let svc_request = loop {
+        let pkt = receive_encrypted_packet_server(&mut stream, &mut transport, false, aead).await?;
+        match pkt.first() {
+            Some(&msg::SSH_EXT_INFO_S) => continue,
+            Some(&msg::SSH_MSG_IGNORE) => continue,
+            Some(&msg::SSH_MSG_DEBUG) => continue,
+            _ => break pkt,
+        }
+    };
     if svc_request.first() != Some(&msg::SSH_MSG_SERVICE_REQUEST) {
         return Err(SshError::Protocol("expected service request".into()));
     }
@@ -831,6 +879,9 @@ async fn handle_authenticated_session(
     let mut authenticated = false;
     let mut auth_tries = 0;
     let mut pending_kbd_user: Option<String> = None;
+    // Number of keyboard-interactive rounds completed in the current session.
+    // OpenSSH/PAM drives multiple rounds; we cap it to bound a malicious peer.
+    let mut kbd_round: u32 = 0;
     let mut auth_key_options: Option<crate::auth::AuthorizedKeyOptions> = None;
     // Methods successfully completed so far, in order, for AuthenticationMethods.
     let mut completed_methods: Vec<String> = Vec::new();
@@ -900,12 +951,13 @@ async fn handle_authenticated_session(
                 for _ in 0..num_answers {
                     answers.push(SshString::decode(&mut r)?.as_str()?.to_string());
                 }
-                let current_user = pending_kbd_user.take().unwrap_or_default();
+                let current_user = pending_kbd_user.clone().unwrap_or_default();
                 let answer = answers.get(0).cloned().unwrap_or_default();
                 if config.kbd_interactive_auth
                     && config.password_auth
                     && auth.lock().await.verify_password(&current_user, &answer)
                 {
+                    pending_kbd_user = None;
                     auth_info.push("keyboard-interactive".to_string());
                     if complete_auth_step(
                         &mut stream,
@@ -919,16 +971,32 @@ async fn handle_authenticated_session(
                         break;
                     }
                 } else {
-                    let (methods, partial) = failure_methods(
-                        &config,
-                        &completed_methods,
-                        enabled_auth_methods(&config),
-                    );
-                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
-                    if config.auth_failure_delay > 0 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                    // Multi-round keyboard-interactive (OpenSSH/PAM style): on
+                    // a wrong answer, re-send the prompt round instead of
+                    // immediately failing, up to `max_auth_tries` rounds.
+                    kbd_round += 1;
+                    if kbd_should_reprompt(kbd_round, config.max_auth_tries, &current_user) {
+                        let mut info_req = vec![msg::SSH_MSG_USERAUTH_INFO_REQUEST];
+                        SshString::new("").encode(&mut info_req)?; // name
+                        SshString::new("").encode(&mut info_req)?; // instruction
+                        SshString::new("en").encode(&mut info_req)?; // language tag
+                        1u32.encode(&mut info_req)?; // num prompts
+                        SshString::new("Password: ").encode(&mut info_req)?; // prompt
+                        false.encode(&mut info_req)?; // echo=false
+                        send_encrypted_packet_server(&mut stream, &info_req, &mut transport, false, aead).await?;
+                    } else {
+                        pending_kbd_user = None;
+                        let (methods, partial) = failure_methods(
+                            &config,
+                            &completed_methods,
+                            enabled_auth_methods(&config),
+                        );
+                        send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                        if config.auth_failure_delay > 0 {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                        }
+                        auth_tries += 1;
                     }
-                    auth_tries += 1;
                 }
             }
             msg::SSH_MSG_USERAUTH_REQUEST => {
@@ -1339,6 +1407,7 @@ async fn handle_authenticated_session(
                         }
 
                         pending_kbd_user = Some(username.clone());
+                        kbd_round = 0;
                         let mut info_req = vec![msg::SSH_MSG_USERAUTH_INFO_REQUEST];
                         SshString::new("").encode(&mut info_req)?; // name
                         SshString::new("").encode(&mut info_req)?; // instruction
@@ -1431,6 +1500,10 @@ fn forward_policy_allows_remote(
     _bind_addr: &str,
     _port: u32,
 ) -> bool {
+    // DisableForwarding overrides all forwarding controls (OpenSSH semantics).
+    if cfg.disable_forwarding {
+        return false;
+    }
     // authorized_keys no-port-forwarding disables all forwarding.
     if let Some(opts) = auth_key_options {
         if opts.no_port_forwarding {
@@ -1534,6 +1607,10 @@ fn forward_policy_allows_direct(
     host: &str,
     port: u32,
 ) -> bool {
+    // DisableForwarding overrides all forwarding controls (OpenSSH semantics).
+    if cfg.disable_forwarding {
+        return false;
+    }
     // authorized_keys restrictions take precedence.
     if let Some(opts) = auth_key_options {
         if opts.no_port_forwarding {
@@ -1556,6 +1633,10 @@ fn forward_policy_allows_listen(
     bind_addr: &str,
     port: u32,
 ) -> bool {
+    // DisableForwarding overrides all forwarding controls (OpenSSH semantics).
+    if cfg.disable_forwarding {
+        return false;
+    }
     // authorized_keys restrictions take precedence.
     if let Some(opts) = auth_key_options {
         if !opts.permit_listen.is_empty() && !permit_list_allows(&opts.permit_listen, bind_addr, port, true) {
@@ -1573,6 +1654,10 @@ fn forward_policy_allows_streamlocal(
     cfg: &ServerConfig,
     auth_key_options: &Option<crate::auth::AuthorizedKeyOptions>,
 ) -> bool {
+    // DisableForwarding overrides all forwarding controls (OpenSSH semantics).
+    if cfg.disable_forwarding {
+        return false;
+    }
     if !cfg.allow_streamlocal_forwarding {
         return false;
     }
@@ -2340,6 +2425,19 @@ async fn handle_connection_service(
                                     }
                                 }
                             }
+                            t if t == msg::SSH_CHANNEL_TYPE_TUN => {
+                                // PermitTunnel: OpenSSH's default is "no". We
+                                // do not implement tun/tap device forwarding, so
+                                // the request is always rejected — with a
+                                // clear reason when the admin enabled it.
+                                let reason = if config.permit_tunnel {
+                                    "tunnel forwarding is not implemented by ns-ssh-server"
+                                } else {
+                                    "tunnel forwarding disabled"
+                                };
+                                let fail = build_channel_open_failure(sender_channel, 1, reason);
+                                send_encrypted_packet_server(stream, &fail, transport, false, aead).await?;
+                            }
                             _ => {
                                 let fail = build_channel_open_failure(sender_channel, 4, "channel type not supported");
                                 send_encrypted_packet_server(stream, &fail, transport, false, aead).await?;
@@ -2571,7 +2669,7 @@ async fn handle_connection_service(
                                         continue;
                                     }
 
-                                    if config.x11_forwarding {
+                                    if config.x11_forwarding && !config.disable_forwarding {
                                         let display = x11_display_name(config);
                                         if let Some(sid) = local_channel.and_then(|lc| channel_session.get(&lc).copied()) {
                                             session_manager.set_env_var(sid, "DISPLAY".to_string(), display.clone());
@@ -2625,7 +2723,7 @@ async fn handle_connection_service(
                                         continue;
                                     }
 
-                                    if config.allow_agent_forwarding {
+                                    if config.allow_agent_forwarding && !config.disable_forwarding {
                                         let sid = local_channel.and_then(|lc| channel_session.get(&lc).copied())
                         .unwrap_or_else(|| {
                             let sid = session_manager.create_session(
@@ -3873,6 +3971,15 @@ async fn run_internal_sftp(
         data.as_str().ok().map(|s| s.to_string())
     }
 
+    fn read_exact_into(r: &mut &[u8], out: &mut [u8]) -> bool {
+        if r.len() < out.len() {
+            return false;
+        }
+        out.copy_from_slice(&r[..out.len()]);
+        *r = &r[out.len()..];
+        true
+    }
+
     loop {
         // NOTE: do NOT clear `buf` here. The inner loop only consumes complete
         // frames; any partial frame stays in `buf` and must be preserved so a
@@ -3910,6 +4017,12 @@ async fn run_internal_sftp(
                     ("hardlink@openssh.com", "1"),
                     ("fsync@openssh.com", "1"),
                     ("limits@openssh.com", "1"),
+                    ("copy-data@openssh.com", "1"),
+                    ("expand-path@openssh.com", "1"),
+                    ("check-file@openssh.com", "1"),
+                    ("lsetstat@openssh.com", "1"),
+                    ("home-directory@openssh.com", "1"),
+                    ("users-groups-by-id@openssh.com", "1"),
                 ] {
                     SshString::new(ext.0).encode(&mut resp).unwrap();
                     SshString::new(ext.1).encode(&mut resp).unwrap();
@@ -4390,14 +4503,286 @@ async fn run_internal_sftp(
                             out.extend(rp);
                             send_raw(&to_client_tx, remote_id, &out);
                         }
-                        _ => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_OP_UNSUPPORTED, "unsupported extension")),
-                    }
-                }
+                        Some("expand-path@openssh.com") => {
+                            // Expand ~ and %-tokens in a path (OpenSSH
+                            // expand-path@openssh.com). Reply is the expanded
+                            // absolute path as a string.
+                            let p = SshString::decode(&mut r).ok().and_then(sftp_string);
+                            match p {
+                                Some(p) => {
+                                    let expanded = expand_sftp_path(&base_dir, &p);
+                                    let mut out = vec![SSH_FXP_EXTENDED_REPLY];
+                                    out.extend(id.to_be_bytes());
+                                    SshString::new(expanded.as_str()).encode(&mut out).unwrap();
+                                    send_raw(&to_client_tx, remote_id, &out);
+                                }
+                                None => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, "")),
+                            }
+                        }
+                        Some("home-directory@openssh.com") => {
+                            // The SFTP root is the user's home; reply with it.
+                            let mut out = vec![SSH_FXP_EXTENDED_REPLY];
+                            out.extend(id.to_be_bytes());
+                            SshString::new(base_dir.to_string_lossy().as_ref()).encode(&mut out).unwrap();
+                            send_raw(&to_client_tx, remote_id, &out);
+                        }
+                        Some("users-groups-by-id@openssh.com") => {
+                            // Resolve uid/gid pairs to user/group names.
+                            // Request: uint32 count, then count × (uint32 id_type, uint32 id).
+                            // Reply: uint32 count, then count × (uint32 id_type, string name).
+                            let mut cnt_b = [0u8; 4];
+                            if !read_exact_into(&mut r, &mut cnt_b) {
+                                send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, ""));
+                                continue;
+                            }
+                            let count = u32::from_be_bytes(cnt_b);
+                            let mut entries = Vec::new();
+                            for _ in 0..count {
+                                let mut ty_b = [0u8; 4];
+                                let mut id_b = [0u8; 4];
+                                if !read_exact_into(&mut r, &mut ty_b) || !read_exact_into(&mut r, &mut id_b) {
+                                    send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, ""));
+                                    continue;
+                                }
+                                entries.push((u32::from_be_bytes(ty_b), u32::from_be_bytes(id_b)));
+                            }
+                            let mut out = vec![SSH_FXP_EXTENDED_REPLY];
+                            out.extend(id.to_be_bytes());
+                            out.extend((entries.len() as u32).to_be_bytes());
+                            for (ty, idv) in entries {
+                                let name = resolve_id_name(ty, idv);
+                                out.extend(ty.to_be_bytes());
+                                SshString::new(name.as_str()).encode(&mut out).unwrap();
+                            }
+                            send_raw(&to_client_tx, remote_id, &out);
+                        }
+                        Some("lsetstat@openssh.com") => {
+                            // Like SSH_FXP_SETSTAT but does not follow symlinks.
+                            let p_s = SshString::decode(&mut r).ok().and_then(sftp_string);
+                            let attrs = SftpFileAttr::decode(&mut r).unwrap_or_else(|_| SftpFileAttr::new());
+                            let res: std::result::Result<(), std::io::Error> = (|| {
+                                let full = match p_s {
+                                    Some(p) => resolve_path(&base_dir, &p),
+                                    None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad path")),
+                                };
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    if let Some(perm) = attrs.permissions {
+                                        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(perm))?;
+                                    }
+                                    if attrs.atime.is_some() || attrs.mtime.is_some() {
+                                        use std::os::unix::fs::MetadataExt;
+                                        let meta = std::fs::symlink_metadata(&full)?;
+                                        let atime = attrs.atime.unwrap_or(meta.atime() as u32) as i64;
+                                        let mtime = attrs.mtime.unwrap_or(meta.mtime() as u32) as i64;
+                                        let times = [libc::timespec { tv_sec: atime, tv_nsec: 0 }, libc::timespec { tv_sec: mtime, tv_nsec: 0 }];
+                                        let cpath = std::ffi::CString::new(full.as_os_str().as_encoded_bytes()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path"))?;
+                                        if unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                                            return Err(std::io::Error::last_os_error());
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            })();
+                            match res {
+                                Ok(_) => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_OK, "")),
+                                Err(e) => send_raw(&to_client_tx, remote_id, &status_pkt(id, ioerr_to_code(&e), &e.to_string())),
+                            }
+                        }
+                        Some("copy-data@openssh.com") => {
+                            // copy-data@openssh.com: read a range from one
+                            // handle and write it to another. Read the whole
+                            // range into a buffer first so both handles are not
+                            // mutably borrowed at once.
+                            let read_h = SshBytes::decode(&mut r).ok().map(|x| x.0);
+                            let mut read_off = [0u8; 8];
+                            let mut len_b = [0u8; 8];
+                            let write_h = SshBytes::decode(&mut r).ok().map(|x| x.0);
+                            let mut write_off = [0u8; 8];
+                            let ok_fields = read_exact_into(&mut r, &mut read_off)
+                                && read_exact_into(&mut r, &mut len_b)
+                                && read_exact_into(&mut r, &mut write_off);
+                            if !ok_fields {
+                                send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, ""));
+                                continue;
+                            }
+                            let read_off = u64::from_be_bytes(read_off);
+                            let len = u64::from_be_bytes(len_b);
+                            let write_off = u64::from_be_bytes(write_off);
+                            let res: std::result::Result<(), String> = async {
+                                let rh = read_h.ok_or("bad read handle")?;
+                                let wh = write_h.ok_or("bad write handle")?;
+                                // Stage the source range into a Vec.
+                                let data = {
+                                    let rf = match handles.get_mut(&rh) {
+                                        Some(Handle::File { file, .. }) => file,
+                                        _ => return Err("bad read handle".into()),
+                                    };
+                                    let mut buf = vec![0u8; 64 * 1024];
+                                    let mut out = Vec::new();
+                                    let mut pos = read_off;
+                                    let mut remaining = len;
+                                    while remaining > 0 {
+                                        let want = remaining.min(buf.len() as u64) as usize;
+                                        rf.seek(std::io::SeekFrom::Start(pos)).await.map_err(|e| e.to_string())?;
+                                        let n = rf.read(&mut buf[..want]).await.map_err(|e| e.to_string())?;
+                                        if n == 0 { break; }
+                                        out.extend_from_slice(&buf[..n]);
+                                        pos += n as u64;
+                                        remaining -= n as u64;
+                                    }
+                                    out
+                                };
+                                let wf = match handles.get_mut(&wh) {
+                                    Some(Handle::File { file, .. }) => file,
+                                    _ => return Err("bad write handle".into()),
+                                };
+                                wf.seek(std::io::SeekFrom::Start(write_off)).await.map_err(|e| e.to_string())?;
+                                wf.write_all(&data).await.map_err(|e| e.to_string())?;
+                                wf.flush().await.map_err(|e| e.to_string())?;
+                                Ok(())
+                            }
+                            .await;
+                            match res {
+                                Ok(_) => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_OK, "")),
+                                Err(e) => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_FAILURE, &e)),
+                            }
+                        }
+                        Some(name) if name.starts_with("check-file") => {
+                            // check-file@openssh.com: hash a file (or a range)
+                            // in blocks. Reply is the hash algorithm + hashes.
+                            let p_s = SshString::decode(&mut r).ok().and_then(sftp_string);
+                            let mut flags_b = [0u8; 4];
+                            let mut start_b = [0u8; 8];
+                            let mut length_b = [0u8; 8];
+                            let mut block_b = [0u8; 4];
+                            let ok_fields = read_exact_into(&mut r, &mut flags_b)
+                                && read_exact_into(&mut r, &mut start_b)
+                                && read_exact_into(&mut r, &mut length_b)
+                                && read_exact_into(&mut r, &mut block_b);
+                            if !ok_fields {
+                                send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_BAD_MESSAGE, ""));
+                                continue;
+                            }
+                            let start = u64::from_be_bytes(start_b);
+                            let block_size = u32::from_be_bytes(block_b);
+                            let res: std::result::Result<Vec<u8>, String> = (|| {
+                                let full = p_s.ok_or("bad path")?;
+                                let full = resolve_path(&base_dir, &full);
+                                let data = std::fs::read(&full).map_err(|e| e.to_string())?;
+                                let bs = if block_size == 0 { 8192 } else { block_size as usize };
+                                let mut hashes = Vec::new();
+                                let mut i = start as usize;
+                                while i < data.len() {
+                                    let end = (i + bs).min(data.len());
+                                    use sha2::{Digest, Sha256};
+                                    let mut h = Sha256::new();
+                                    h.update(&data[i..end]);
+                                    hashes.extend_from_slice(&h.finalize());
+                                    i = end;
+                                }
+                                Ok(hashes)
+                            })();
+                            match res {
+                                Ok(hashes) => {
+                                    let mut out = vec![SSH_FXP_EXTENDED_REPLY];
+                                    out.extend(id.to_be_bytes());
+                                    SshString::new("sha256").encode(&mut out).unwrap();
+                                    SshBytes(hashes).encode(&mut out).unwrap();
+                                    send_raw(&to_client_tx, remote_id, &out);
+                                }
+                                Err(e) => send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_FAILURE, &e)),
+                            }
+                        }
                 _ => {
                     send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_OP_UNSUPPORTED, "unknown"));
                 }
             }
         }
+                _ => {
+                    send_raw(&to_client_tx, remote_id, &status_pkt(id, SSH_FX_OP_UNSUPPORTED, "unknown"));
+                }
+    }
+}
+}
+}
+
+/// Expand `~`, `~/`, and `%`-tokens in an SFTP path the way OpenSSH's
+/// `expand-path@openssh.com` does. `%` is expanded relative to the SFTP
+/// root (the user's home directory).
+fn expand_sftp_path(base: &std::path::Path, p: &str) -> String {
+    use std::path::Path;
+    let mut out = String::new();
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '~' => {
+                if chars.peek() == Some(&'/') || chars.peek().is_none() {
+                    out.push_str(&base.to_string_lossy());
+                } else {
+                    out.push('~');
+                }
+            }
+            '%' => match chars.peek() {
+                Some('h') | Some('d') | Some('u') => {
+                    chars.next();
+                    out.push_str(&base.to_string_lossy());
+                }
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                _ => out.push('%'),
+            },
+            _ => out.push(c),
+        }
+    }
+    // Normalise to an absolute path string.
+    let path = Path::new(&out);
+    if path.is_absolute() {
+        out
+    } else {
+        base.join(path).to_string_lossy().into_owned()
+    }
+}
+
+/// Resolve a uid (id_type 0) or gid (id_type 1) to a user/group name for the
+/// `users-groups-by-id@openssh.com` SFTP extension. Returns a decimal string
+/// when the id cannot be resolved, matching OpenSSH's sftp-server.
+fn resolve_id_name(id_type: u32, id: u32) -> String {
+    #[cfg(unix)]
+    {
+        use std::ffi::CStr;
+        let mut buf = vec![0u8; 1024];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let name = unsafe {
+            if id_type == 0 {
+                if libc::getpwuid_r(id as libc::uid_t, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result) == 0
+                    && !result.is_null()
+                {
+                    CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned()
+                } else {
+                    id.to_string()
+                }
+            } else {
+                let mut grp: libc::group = std::mem::zeroed();
+                let mut gresult: *mut libc::group = std::ptr::null_mut();
+                if libc::getgrgid_r(id as libc::gid_t, &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut gresult) == 0
+                    && !gresult.is_null()
+                {
+                    CStr::from_ptr(grp.gr_name).to_string_lossy().into_owned()
+                } else {
+                    id.to_string()
+                }
+            }
+        };
+        name
+    }
+    #[cfg(not(unix))]
+    {
+        id.to_string()
     }
 }
 
@@ -4471,6 +4856,12 @@ async fn perform_rekey_server(
         }
         transport.client_kex_init = c_kex_init.clone();
         let neg = SshTransport::negotiate_algorithms(&transport.client_kex_init, &transport.server_kex_init)?;
+        // RFC 4253 §7: discard the client's optimistic KEX packet if its
+        // guess was wrong.
+        if neg.client_first_kex_follows_wrong_guess {
+            let discarded = receive_encrypted_packet_server(stream, transport, false, aead).await?;
+            rekey_disconnect_guard(&discarded)?;
+        }
         transport.strict_kex = neg.strict_kex;
         transport.strict_kex_peer_kexinit = neg.strict_kex;
         let (hk_name, pk_bytes) = {
@@ -4705,5 +5096,17 @@ mod tests {
         let (methods, partial) = failure_methods(&config, &[], Vec::new());
         assert_eq!(methods, vec!["publickey"]);
         assert!(!partial);
+    }
+
+    #[test]
+    fn kbd_should_reprompt_respects_round_cap() {
+        // Within the cap, a pending user is re-prompted.
+        assert!(kbd_should_reprompt(0, 6, "alice"));
+        assert!(kbd_should_reprompt(3, 6, "alice"));
+        // At or past the cap: fail instead of looping forever.
+        assert!(!kbd_should_reprompt(6, 6, "alice"));
+        assert!(!kbd_should_reprompt(7, 6, "alice"));
+        // No pending kbd session: never re-prompt.
+        assert!(!kbd_should_reprompt(0, 6, ""));
     }
 }

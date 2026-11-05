@@ -92,7 +92,7 @@
 |---:|---|---|---|---|---|---|---|
 | 33 | M01 | `hmac-sha2-256/512`（含 `-etm`） | 默认启用 | 已实现可用 | `crates/ssh-core/src/mac.rs:72-75`、`:116-122`；`transport.rs:49-52` | 互通 ETM/non-ETM | P1 |
 | 34 | M02 | `hmac-sha1`（含 `-etm`）、`hmac-sha1-96` | 支持，sha1 在默认列表 | 已实现可用 | `crates/ssh-core/src/mac.rs:76-100`、`:123`；`transport.rs:51-54` | 互通 | P2 |
-| 35 | M03 | `umac-64/128`（含 `-etm`） | 9.9 默认 MAC 列表前四位 | **未实现** | 全仓无 `umac`；默认表 `crates/ssh-core/src/transport.rs:48-56` | `ssh -Q mac` 对比 | P2 |
+| 35 | M03 | `umac-64/128`（含 `-etm`） | 9.9 默认 MAC 列表前四位 | ✅ 已实现（2026-11-05） | `crates/ssh-core/src/umac.rs`（纯 Rust 移植 OpenSSH `umac.c`）；`mac.rs` 接入 4 变体；`transport.rs:62-73` 默认列表对齐 OpenSSH 9.9 | `ssh -Q mac` 对比；OpenSSH 双向互通 | P2 |
 | 36 | M04 | `hmac-md5`、`hmac-ripemd160` | 支持（旧算法，默认关闭） | **未实现** | `crates/ssh-core/src/mac.rs:110-140` 无对应分支 | `ssh -Q mac` 对比 | P3 |
 | 37 | M05 | `none` MAC | OpenSSH 从不默认通告 `none` | **有缺陷**：默认 MAC 列表末尾通告 `none`，对端可协商出无 MAC 通道 | `crates/ssh-core/src/transport.rs:55`；`crates/ssh-core/src/mac.rs:104-108` | `-vvv` 对比 MAC 列表；构造 `none` 协商 | P0 |
 
@@ -190,7 +190,7 @@
 | 95 | Q02 | OpenSSH sftp 客户端退出收尾 | EOF 后服务端必须回 EOF + exit-status + CLOSE | **有缺陷**（修复在未提交改动中）：此前 OpenSSH sftp 在 shutdown 阶段挂起 | `crates/ns-ssh-server/src/server.rs:2088-2114` | OpenSSH `sftp` 批处理 `EXIT=0` | P0 |
 | 96 | Q03 | `longname` / attrs 真实性 | 符号权限串、nlink、uid/gid、size、mtime | **有缺陷**（修复在未提交改动中）：此前固定 `Jan  1 00:00` 占位 | `crates/ns-ssh-server/src/server.rs:2981-3032`、`:3330-3345` | `OpenSSH sftp> ls -l` 输出逐列对比 | P1 |
 | 97 | Q04 | 扩展：`posix-rename` / `hardlink` / `fsync` / `limits` / `statvfs` | OpenSSH 服务端通告并实现 | 已实现可用 | `crates/ns-ssh-server/src/server.rs:3109-3114`、`:3501-3583`、`:3034-3060` | `df`、`rename`、硬链接、`fsync` 场景 | P2 |
-| 98 | Q05 | 扩展：`copy-data` / `expand-path` / `check-file` / `lsetstat` / `users-groups-by-id` / `home-directory` | OpenSSH 9.9 支持 | **未实现** | `crates/ns-ssh-server/src/server.rs:3109-3114` 仅声明 5 个扩展 | `sftp` 客户端调用对应扩展 | P2 |
+| 98 | Q05 | 扩展：`copy-data` / `expand-path` / `check-file` / `lsetstat` / `users-groups-by-id` / `home-directory` | OpenSSH 9.9 支持 | ✅ 已实现（2026-11-05） | `crates/ns-ssh-server/src/server.rs:4005-4018`（通告）、`:4483-4643`（分派） | `sftp_extensions_round_trip` 集成测试 | P2 |
 | 99 | Q06 | SFTP 客户端命令集 | 支持 cd/ls/get/put/mget/mput/reget/reput/mkdir/rmdir/rm/rename/chmod/chown/ln/df/lcd/lpwd/stat/help 等 | **半成品**：仅有 cd/ls/get/put/mkdir/rm/rmdir/rename/chmod/ln/lcd/lpwd/help | `crates/ns-ssh/src/sftp.rs:388-545` | 逐命令脚本化执行 | P1 |
 | 100 | Q07 | 批量与续传命令 | `mget`/`mput`/通配/`reget`/`reput`/`df`/`chown` | **未实现** | `crates/ns-ssh/src/sftp.rs:388-545` 无对应分支 | 同上 | P2 |
 | 101 | Q08 | SFTP 多通道并发 | 每条通道独立句柄与会话 | 已实现可用（修复在未提交改动中） | `crates/ns-ssh-server/src/server.rs:1196`、`:1980` | 同一连接两条 sftp 通道 | P2 |

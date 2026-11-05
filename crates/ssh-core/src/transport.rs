@@ -20,9 +20,11 @@ pub const KEX_STRICT_SERVER: &str = "kex-strict-s-v00@openssh.com";
 // sk-hostkey and ssh-rsa (host key), aes*-cbc/3des (cipher) remain
 // available via explicit config but are no longer advertised by default.
 const DEFAULT_KEX: &[&str] = &[
+    "ecdh-sha2-nistp256",
+    "sntrup761x25519-sha512",
+    "sntrup761x25519-sha512@openssh.com",
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
-    "ecdh-sha2-nistp256",
     "ecdh-sha2-nistp384",
     "ecdh-sha2-nistp521",
     "diffie-hellman-group-exchange-sha256",
@@ -59,26 +61,82 @@ const DEFAULT_CIPHERS: &[&str] = &[
 
 const DEFAULT_MACS: &[&str] = &[
     "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-256",
+    "umac-64-etm@openssh.com",
+    "umac-128-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha1-etm@openssh.com",
+    "umac-64@openssh.com",
+    "umac-128@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha1",
+];
+
+/// Full cipher set that `create_cipher` can construct, for explicit `Ciphers`
+/// config (the default proposal only advertises `DEFAULT_CIPHERS`).
+const SUPPORTED_CIPHERS: &[&str] = &[
+    "none",
+    "chacha20-poly1305@openssh.com",
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
+    "aes128-cbc",
+    "aes192-cbc",
+    "aes256-cbc",
+    "3des-cbc",
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+];
+
+/// Full MAC set that `create_mac` can construct, for explicit `MACs` config.
+const SUPPORTED_MACS: &[&str] = &[
+    "none",
+    "hmac-sha2-256-etm@openssh.com",
     "hmac-sha2-512-etm@openssh.com",
     "hmac-sha1-etm@openssh.com",
     "hmac-sha2-256",
     "hmac-sha2-512",
     "hmac-sha1",
     "hmac-sha1-96",
+    "hmac-sha1-96-etm@openssh.com",
+    "hmac-md5",
+    "hmac-md5-96",
+    "hmac-md5-etm@openssh.com",
+    "hmac-md5-96-etm@openssh.com",
+    "umac-64@openssh.com",
+    "umac-128@openssh.com",
+    "umac-64-etm@openssh.com",
+    "umac-128-etm@openssh.com",
 ];
-
 /// Return the default supported algorithms for a `-Q` query (key/cipher/mac/kex).
 pub fn supported_algorithms(query: &str) -> Option<&'static [&'static str]> {
     match query.to_lowercase().as_str() {
         "key" | "hostkey" | "host-key" => Some(DEFAULT_HOST_KEYS),
+        "key-sig" | "sig" => Some(DEFAULT_SIG_ALGS),
         "cipher" | "ciphers" => Some(DEFAULT_CIPHERS),
         "mac" | "macs" => Some(DEFAULT_MACS),
         "kex" | "key-exchange" | "key-exchange-algorithm" => Some(DEFAULT_KEX),
+        "help" => Some(&["help", "key", "key-sig", "sig", "cipher", "mac", "kex"]),
         _ => None,
     }
 }
 
-fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&'a [String]>) -> Vec<&'a str> {
+/// Non-certificate signature (public key) algorithms, for `-Q sig`.
+const DEFAULT_SIG_ALGS: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "ssh-rsa",
+];
+
+fn filter_algos<'a>(
+    defaults: &'a [&'a str],
+    supported: &'a [&'a str],
+    config: Option<&'a [String]>,
+) -> Vec<&'a str> {
     match config {
         Some(list) if !list.is_empty() => {
             // OpenSSH supports leading `+`/`-`/`^` on the whole comma list to
@@ -97,7 +155,7 @@ fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&'a [String]>) -> Ve
                 // Append the listed algorithms to the defaults (dedup, keep order).
                 let mut out: Vec<&str> = defaults.to_vec();
                 for item in items {
-                    if !out.contains(&item) {
+                    if !out.contains(&item) && supported.contains(&item) {
                         out.push(item);
                     }
                 }
@@ -110,11 +168,14 @@ fn filter_algos<'a>(defaults: &'a [&'a str], config: Option<&'a [String]>) -> Ve
                     .filter(|d| !items.iter().any(|n| *n == *d))
                     .collect()
             } else {
-                // Explicit list: keep only algorithms we support, preserving order.
+                // Explicit list: keep only algorithms we support, preserving
+                // order. `supported` includes legacy/default-disabled algorithms
+                // (e.g. `none` cipher/MAC, MD5 MACs) so they are selectable when
+                // explicitly configured but never advertised by default.
                 list.iter()
                     .filter_map(|item| {
                         let item = item.trim();
-                        defaults.iter().find(|d| **d == item).copied()
+                        supported.iter().find(|s| **s == item).copied()
                     })
                     .collect()
             }
@@ -148,6 +209,15 @@ pub struct AlgorithmNegotiation {
     pub server_to_client_compression: String,
     /// Both strict-kex pseudo algorithms were present in the exchange.
     pub strict_kex: bool,
+    /// RFC 8308: the client advertised `ext-info-c` (client-side negotiation).
+    pub client_ext_info_c: bool,
+    pub server_ext_info_s: bool,
+    /// RFC 4253 §7: the client set `first_kex_packet_follows` but the guessed
+    /// algorithm was not selected, so the client's next KEX packet must be
+    /// discarded by the receiver.
+    pub client_first_kex_follows_wrong_guess: bool,
+    /// Same as above for the server side.
+    pub server_first_kex_follows_wrong_guess: bool,
 }
 
 pub struct SshTransport {
@@ -238,11 +308,15 @@ impl SshTransport {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
         payload.extend_from_slice(&cookie);
 
-        let mut kex_list: Vec<&str> = filter_algos(DEFAULT_KEX, kex_algorithms);
+        let mut kex_list: Vec<&str> = filter_algos(DEFAULT_KEX, DEFAULT_KEX, kex_algorithms);
         // Terrapin mitigation: always advertise our strict-kex pseudo algorithm.
         // The peer detects it in this name-list; it is never selected as a real
         // key exchange (see `choose_kex_algorithm`).
         kex_list.push(if is_server { KEX_STRICT_SERVER } else { KEX_STRICT_CLIENT });
+        // RFC 8308 §3: the client advertises `ext-info-c` to ask the server to
+        // send SSH_MSG_EXT_INFO; the server advertises `ext-info-s`. Both are
+        // pseudo algorithms, never selected as a real KEX.
+        kex_list.push(if is_server { "ext-info-s" } else { "ext-info-c" });
         payload.extend(encode_name_list(&kex_list));
 
         let host_key_list: Vec<&str> = match host_key_algorithms {
@@ -251,11 +325,11 @@ impl SshTransport {
         };
         payload.extend(encode_name_list(&host_key_list));
 
-        let cipher_list: Vec<&str> = filter_algos(DEFAULT_CIPHERS, ciphers);
+        let cipher_list: Vec<&str> = filter_algos(DEFAULT_CIPHERS, SUPPORTED_CIPHERS, ciphers);
         payload.extend(encode_name_list(&cipher_list));
         payload.extend(encode_name_list(&cipher_list));
 
-        let mac_list: Vec<&str> = filter_algos(DEFAULT_MACS, macs);
+        let mac_list: Vec<&str> = filter_algos(DEFAULT_MACS, SUPPORTED_MACS, macs);
         payload.extend(encode_name_list(&mac_list));
         payload.extend(encode_name_list(&mac_list));
 
@@ -324,6 +398,11 @@ impl SshTransport {
         let client_macs_sc = SshNameList::decode(&mut cr)?;
         let client_comps_cs = SshNameList::decode(&mut cr)?;
         let client_comps_sc = SshNameList::decode(&mut cr)?;
+        let _client_lang_cs = SshNameList::decode(&mut cr)?;
+        let _client_lang_sc = SshNameList::decode(&mut cr)?;
+        // RFC 4253 §7: after the two language lists comes a single byte
+        // `first_kex_packet_follows` and a reserved uint32.
+        let client_first_kex_follows = *cr.first().unwrap_or(&0) != 0;
 
         let mut sr = &server_kex[17..];
 
@@ -335,6 +414,9 @@ impl SshTransport {
         let server_macs_sc = SshNameList::decode(&mut sr)?;
         let server_comps_cs = SshNameList::decode(&mut sr)?;
         let server_comps_sc = SshNameList::decode(&mut sr)?;
+        let _server_lang_cs = SshNameList::decode(&mut sr)?;
+        let _server_lang_sc = SshNameList::decode(&mut sr)?;
+        let server_first_kex_follows = *sr.first().unwrap_or(&0) != 0;
 
         // Strict KEX (Terrapin mitigation) requires the client to advertise
         // `-c-` and the server to advertise `-s-`; either name alone is inert.
@@ -371,6 +453,14 @@ impl SshTransport {
         let comp_sc = choose_algorithm(&client_comps_sc.0, &server_comps_sc.0)
             .unwrap_or_else(|| "none".to_string());
 
+        // RFC 4253 §7: if `first_kex_packet_follows` was set but the guessed
+        // algorithm was not selected, the peer's next KEX packet must be
+        // discarded by the receiver.
+        let client_first_kex_follows_wrong_guess = client_first_kex_follows
+            && client_kex_algos.0.first() != Some(&kex);
+        let server_first_kex_follows_wrong_guess = server_first_kex_follows
+            && server_kex_algos.0.first() != Some(&kex);
+
         Ok(AlgorithmNegotiation {
             kex_algorithm: kex,
             host_key_algorithm: host_key,
@@ -381,6 +471,13 @@ impl SshTransport {
             client_to_server_compression: comp_cs,
             server_to_client_compression: comp_sc,
             strict_kex,
+            // RFC 8308 §3.1: `ext-info-c`/`ext-info-s` are pseudo algorithms
+            // carried in the KEX name-list; their presence signals the peer's
+            // willingness to exchange EXT_INFO.
+            client_ext_info_c: client_kex_algos.0.iter().any(|a| a == "ext-info-c"),
+            server_ext_info_s: server_kex_algos.0.iter().any(|a| a == "ext-info-s"),
+            client_first_kex_follows_wrong_guess: client_first_kex_follows_wrong_guess,
+            server_first_kex_follows_wrong_guess: server_first_kex_follows_wrong_guess,
         })
     }
 
@@ -439,6 +536,9 @@ impl SshTransport {
             "curve25519-sha256" | "curve25519-sha256@libssh.org" => {
                 Ok(Box::new(Curve25519Kex::new()))
             }
+            "sntrup761x25519-sha512" | "sntrup761x25519-sha512@openssh.com" => {
+                Ok(Box::new(SntrupX25519Kex::new()))
+            }
             "ecdh-sha2-nistp256" => {
                 Ok(Box::new(EcdhP256Kex::new()))
             }
@@ -490,18 +590,43 @@ impl SshTransport {
         let key_len = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?.key_len();
         let iv_len = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?.iv_len();
         let mac_len = crate::mac::create_mac(&negotiation.client_to_server_mac)?.key_len();
-
-        let c2s_iv = derive_initial_iv(hash_name, shared_secret, exchange_hash, session_id, iv_len);
-        let c2s_key = derive_encryption_key(hash_name, shared_secret, exchange_hash, session_id, key_len);
-        let c2s_mac_key = derive_integrity_key(hash_name, shared_secret, exchange_hash, session_id, mac_len);
-
         let s2c_key_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.key_len();
         let s2c_iv_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.iv_len();
         let s2c_mac_len = crate::mac::create_mac(&negotiation.server_to_client_mac)?.key_len();
 
-        let s2c_iv = crate::kex::derive_s2c_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len);
-        let s2c_key = crate::kex::derive_s2c_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len);
-        let s2c_mac_key = crate::kex::derive_s2c_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len);
+        // RFC 9941 §3: the hybrid KEX encodes K as a `string` (not an mpint)
+        // in both the exchange hash and key derivation. All other KEX methods
+        // use the canonical mpint form.
+        let hybrid = negotiation.kex_algorithm.starts_with("sntrup761x25519");
+        let (c2s_iv, c2s_key, c2s_mac_key) = if hybrid {
+            (
+                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'A', iv_len),
+                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'C', key_len),
+                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'E', mac_len),
+            )
+        } else {
+            (
+                derive_initial_iv(hash_name, shared_secret, exchange_hash, session_id, iv_len),
+                derive_encryption_key(hash_name, shared_secret, exchange_hash, session_id, key_len),
+                derive_integrity_key(hash_name, shared_secret, exchange_hash, session_id, mac_len),
+            )
+        };
+
+        let s2c_iv = if hybrid {
+            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'B', s2c_iv_len)
+        } else {
+            crate::kex::derive_s2c_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len)
+        };
+        let s2c_key = if hybrid {
+            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'D', s2c_key_len)
+        } else {
+            crate::kex::derive_s2c_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len)
+        };
+        let s2c_mac_key = if hybrid {
+            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'F', s2c_mac_len)
+        } else {
+            crate::kex::derive_s2c_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len)
+        };
 
         let mut c2s_cipher = crate::cipher::create_cipher(&negotiation.client_to_server_cipher)?;
         c2s_cipher.set_key(&c2s_key)?;
@@ -1261,12 +1386,12 @@ mod tests {
     fn filter_algos_handles_caret_prefix() {
         // Explicit list keeps only supported algorithms, preserving order.
         let list = vec!["curve25519-sha256".to_string(), "not-real".to_string()];
-        let out = filter_algos(DEFAULT_KEX, Some(&list));
+        let out = filter_algos(DEFAULT_KEX, DEFAULT_KEX, Some(&list));
         assert_eq!(out, vec!["curve25519-sha256"]);
 
         // `^` prefix excludes algorithms from the default set.
         let list = vec!["^ecdh-sha2-nistp256".to_string()];
-        let out = filter_algos(DEFAULT_KEX, Some(&list));
+        let out = filter_algos(DEFAULT_KEX, DEFAULT_KEX, Some(&list));
         assert!(out.contains(&"curve25519-sha256"));
         assert!(!out.contains(&"ecdh-sha2-nistp256"));
 
@@ -1275,21 +1400,21 @@ mod tests {
             "^aes128-gcm@openssh.com".to_string(),
             "aes256-gcm@openssh.com".to_string(),
         ];
-        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
+        let out = filter_algos(DEFAULT_CIPHERS, SUPPORTED_CIPHERS, Some(&list));
         assert!(!out.contains(&"aes128-gcm@openssh.com"));
         assert!(!out.contains(&"aes256-gcm@openssh.com"));
         assert!(out.contains(&"aes256-ctr"));
 
         // `+` appends to the default set.
-        let list = vec!["+blowfish-cbc".to_string()];
-        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
-        assert!(out.contains(&"blowfish-cbc"));
+        let list = vec!["+3des-cbc".to_string()];
+        let out = filter_algos(DEFAULT_CIPHERS, SUPPORTED_CIPHERS, Some(&list));
+        assert!(out.contains(&"3des-cbc"));
         assert_eq!(out.len(), DEFAULT_CIPHERS.len() + 1);
-        assert!(out.ends_with(&["blowfish-cbc"]));
+        assert!(out.ends_with(&["3des-cbc"]));
 
         // `-` removes from the default set.
         let list = vec!["-aes256-ctr".to_string()];
-        let out = filter_algos(DEFAULT_CIPHERS, Some(&list));
+        let out = filter_algos(DEFAULT_CIPHERS, SUPPORTED_CIPHERS, Some(&list));
         assert!(!out.contains(&"aes256-ctr"));
         assert!(out.contains(&"aes128-ctr"));
     }
@@ -1821,4 +1946,76 @@ mod tests {
             Err(SshError::DecryptionFailed)
         ));
     }
+
+    #[test]
+    fn ext_info_negotiation_flags() {
+        // Both sides advertise their ext-info pseudo algorithm by default.
+        let mut c = SshTransport::new();
+        let c_init = c.build_kex_init(None, None, None, None, false);
+        let mut s = SshTransport::new();
+        let s_init = s.build_kex_init(None, None, None, None, true);
+        let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
+        assert!(neg.client_ext_info_c);
+        assert!(neg.server_ext_info_s);
+
+        // The pseudo algorithm must never be selected as the real KEX.
+        assert!(!is_pseudo_kex(&neg.kex_algorithm));
+    }
+
+    #[test]
+    fn first_kex_follows_wrong_guess_is_detected() {
+        // Build a KEXINIT, then patch the trailing `first_kex_packet_follows`
+        // byte to 1 so the receiver knows the sender guessed its own first
+        // KEX choice. If that guess disagrees with the negotiated algorithm,
+        // the receiver must discard the sender's next packet.
+        let mut c = SshTransport::new();
+        let mut c_init = c.build_kex_init(None, None, None, None, false);
+        // The flag byte sits after the two language lists and before the
+        // 4-byte reserved field at the end of the KEXINIT payload.
+        let flag_pos = c_init.len() - 5;
+        c_init[flag_pos] = 1;
+        let mut s = SshTransport::new();
+        let s_init = s.build_kex_init(None, None, None, None, true);
+
+        let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
+        // The client's guess is its own first KEX entry; wrong-guess must be
+        // true exactly when that entry is not the negotiated algorithm.
+        let guessed = {
+            let mut r = &c_init[17..];
+            let list = SshNameList::decode(&mut r).unwrap();
+            list.0.first().cloned().unwrap_or_default()
+        };
+        assert_eq!(neg.client_first_kex_follows_wrong_guess, guessed != neg.kex_algorithm);
+
+        // A well-formed KEXINIT with the flag cleared never forces a discard.
+        let mut c2 = SshTransport::new();
+        let c2_init = c2.build_kex_init(None, None, None, None, false);
+        let neg2 = SshTransport::negotiate_algorithms(&c2_init, &s_init).unwrap();
+        assert!(!neg2.client_first_kex_follows_wrong_guess);
+        assert!(!neg2.server_first_kex_follows_wrong_guess);
+    }
+
+    #[test]
+    fn none_cipher_is_negotiable_only_when_explicitly_configured() {
+        // With the default proposal, `none` must never be advertised.
+        let mut c = SshTransport::new();
+        let c_init = c.build_kex_init(None, None, None, None, false);
+        let mut s = SshTransport::new();
+        let s_init = s.build_kex_init(None, None, None, None, true);
+        let neg = SshTransport::negotiate_algorithms(&c_init, &s_init).unwrap();
+        assert_ne!(neg.client_to_server_cipher, "none");
+        assert_ne!(neg.server_to_client_cipher, "none");
+
+        // When both sides explicitly configure `none` (with `none` MAC), it is
+        // negotiated.
+        let mut c2 = SshTransport::new();
+        let c2_init = c2.build_kex_init(None, None, Some(&["none".to_string()]), Some(&["none".to_string()]), false);
+        let mut s2 = SshTransport::new();
+        let s2_init = s2.build_kex_init(None, None, Some(&["none".to_string()]), Some(&["none".to_string()]), true);
+        let neg2 = SshTransport::negotiate_algorithms(&c2_init, &s2_init).unwrap();
+        assert_eq!(neg2.client_to_server_cipher, "none");
+        assert_eq!(neg2.server_to_client_cipher, "none");
+    }
 }
+
+

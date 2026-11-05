@@ -156,6 +156,24 @@ struct SshArgs {
     #[arg(short = 'x')]
     disable_x11_forwarding: bool,
 
+    #[arg(short = 'B', long)]
+    bind_interface: Option<String>,
+
+    #[arg(short = 'w')]
+    tunnel_device: Option<String>,
+
+    #[arg(short = 'P', long)]
+    tag: Option<String>,
+
+    #[arg(short = 'y')]
+    log_to_stderr: bool,
+
+    #[arg(short = 'I')]
+    pkcs11: Option<String>,
+
+    #[arg(short = 'K')]
+    gssapi_deleg_creds: bool,
+
     target: Option<String>,
 
     command: Vec<String>,
@@ -283,6 +301,12 @@ fn main() {
 
     if args.forward_x11 || args.forward_x11_trusted {
         config.forward_x11 = true;
+        // OpenSSH defaults XAuthLocation to the configured xauth binary
+        // (_PATH_XAUTH = /usr/bin/xauth); without it -X cannot register the
+        // MIT-MAGIC-COOKIE and remote X11 clients are rejected.
+        if config.xauth_location.is_none() {
+            config.xauth_location = Some("/usr/bin/xauth".to_string());
+        }
     }
     if args.disable_x11_forwarding {
         config.forward_x11 = false;
@@ -296,6 +320,34 @@ fn main() {
     if let Some(bind) = args.bind_address.clone() {
         config.bind_address = Some(bind);
     }
+
+    if let Some(bind_if) = args.bind_interface.clone() {
+        config.bind_interface = Some(bind_if);
+    }
+
+    if let Some(tun) = args.tunnel_device.clone() {
+        // OpenSSH -w: request a tun(4) tunnel device. This implementation does
+        // not support tun forwarding; reject it with a clear error rather than
+        // silently ignoring it.
+        eprintln!("ns-ssh: -w tun device forwarding is not supported (got {:?})", tun);
+        std::process::exit(1);
+    }
+
+    if args.log_to_stderr {
+        // OpenSSH -y: log to stderr instead of syslog. We already log to
+        // stderr by default; this is a no-op that accepts the flag.
+        config.syslog_facility = None;
+    }
+
+    if let Some(ref pkcs11) = args.pkcs11 {
+        eprintln!("ns-ssh: -I PKCS#11 provider is not supported (got {:?})", pkcs11);
+        std::process::exit(1);
+    }
+    if args.gssapi_deleg_creds {
+        eprintln!("ns-ssh: -K GSSAPI credential delegation is not supported");
+        std::process::exit(1);
+    }
+
 
     if let Some(ref proxy) = args.proxy_jump {
         config.proxy_jump = Some(proxy.clone());
@@ -702,6 +754,8 @@ fn run_scp_mode() -> i32 {
     while let Some(arg) = iter.next() {
         if arg == "-r" {
             _recursive = true;
+        } else if arg == "-p" {
+            // preserve times/mode (the remote scp -t/-f already runs with -p)
         } else if arg == "-v" || arg == "-q" || arg == "-t" || arg == "-f" {
             // verbose / quiet / remote-side mode flags
         } else if let Some(v) = arg.strip_prefix("-P") {
@@ -751,12 +805,10 @@ fn run_scp_mode() -> i32 {
                     iter.next();
                 }
             }
-        } else if contains_scp_remote(arg) && target.is_none() && sources.len() == 1 {
-            target = Some(arg.clone());
-        } else if contains_scp_remote(arg) && target.is_none() && sources.is_empty() {
-            // first arg is remote: keep as source until we see a local target
-            sources.push(arg.clone());
         } else {
+            // The last positional token is always the target; everything before
+            // it is a source. Direction is decided later from whether the
+            // target is remote (upload) or local (download).
             sources.push(arg.clone());
         }
     }
@@ -834,27 +886,50 @@ fn run_scp_mode() -> i32 {
     }
 
     if upload_remote.is_some() {
-        // scp local remote  → upload
-        let local = sources.first().cloned().unwrap_or_default();
+        // scp local... remote  → upload (one or more sources).
+        let locals: Vec<std::path::PathBuf> =
+            sources.iter().map(|s| std::path::PathBuf::from(s)).collect();
         return rt.block_on(async move {
-            let path = std::path::Path::new(&local);
-            match scp::scp_upload(&config, path, &remote_path).await {
-                Ok(_) => 0,
-                Err(e) => {
-                    eprintln!("ns-scp: upload failed: {}", e);
-                    1
+            if locals.len() > 1 {
+                match scp::scp_upload_multi(&config, &locals, &remote_path, _recursive).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: upload failed: {}", e);
+                        1
+                    }
+                }
+            } else {
+                let path = locals.first().cloned().unwrap_or_default();
+                match scp::scp_upload(&config, &path, &remote_path, _recursive).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: upload failed: {}", e);
+                        1
+                    }
                 }
             }
         });
     } else {
-        // scp remote local  → download
+        // scp remote... local  → download (one or more remote sources).
         let local = target.clone().unwrap_or_else(|| ".".to_string());
+        let remote_sources: Vec<String> =
+            sources.iter().filter(|s| contains_scp_remote(s)).cloned().collect();
         return rt.block_on(async move {
-            match scp::scp_download(&config, &remote_path, std::path::Path::new(&local)).await {
-                Ok(_) => 0,
-                Err(e) => {
-                    eprintln!("ns-scp: download failed: {}", e);
-                    1
+            if remote_sources.len() > 1 {
+                match scp::scp_download_multi(&config, &remote_sources, std::path::Path::new(&local), _recursive).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: download failed: {}", e);
+                        1
+                    }
+                }
+            } else {
+                match scp::scp_download(&config, &remote_path, std::path::Path::new(&local), _recursive).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: download failed: {}", e);
+                        1
+                    }
                 }
             }
         });
@@ -1849,6 +1924,11 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
         // `Tag` / `Match tagged`). Command-line `-o Tag=...` is processed
         // first by OpenSSH, so those tags are visible to every block.
         let mut tags: Vec<String> = Vec::new();
+        // OpenSSH `-P tag` sets a tag visible to every Match block, like
+        // `-o Tag=...` processed first.
+        if let Some(cli_tag) = &args.tag {
+            tags.extend(cli_tag.split_whitespace().map(|s| s.to_string()));
+        }
         for opt in &args.options {
             if let Some((k, v)) = opt.trim().split_once('=') {
                 if k.trim().eq_ignore_ascii_case("tag") {

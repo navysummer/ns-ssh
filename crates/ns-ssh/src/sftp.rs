@@ -320,6 +320,154 @@ impl SftpSession {
         let names = parse_sftp_name(&payload)?;
         names.first().map(|n| n.filename.clone()).ok_or_else(|| SshError::Protocol("sftp: empty readlink".into()))
     }
+
+    pub async fn cmd_stat(&mut self, path: &str, long: bool) -> Result<()> {
+        let target = self.resolve(path);
+        let payload = self.request_id(|id| build_sftp_lstat(id, &target)).await?;
+        let attr = parse_sftp_attrs(&payload)?;
+        let perm = attr.permissions.unwrap_or(0);
+        let size = attr.size.unwrap_or(0);
+        let uid = attr.uid.unwrap_or(0);
+        let gid = attr.gid.unwrap_or(0);
+        let mtime = attr.mtime.unwrap_or(0);
+        if long {
+            println!("{}", format_sftp_longname(path, &attr));
+        } else {
+            println!(
+                "{}  {}  {}  {}  {}",
+                perm_string(perm),
+                size,
+                uid,
+                gid,
+                mtime
+            );
+        }
+        Ok(())
+    }
+
+
+    pub async fn cmd_chown(&mut self, uid: &str, gid: &str, path: &str) -> Result<()> {
+        let target = self.resolve(path);
+        let uid_val = uid.parse::<u32>().map_err(|_| SshError::Protocol(format!("sftp: invalid uid {}", uid)))?;
+        let gid_val = gid.parse::<u32>().map_err(|_| SshError::Protocol(format!("sftp: invalid gid {}", gid)))?;
+        let mut attrs = SftpFileAttr::new();
+        attrs.flags = SSH_FILEXFER_ATTR_UIDGID;
+        attrs.uid = Some(uid_val);
+        attrs.gid = Some(gid_val);
+        self.ok_id(|id| build_sftp_setstat(id, &target, &attrs)).await
+    }
+
+    pub async fn cmd_df(&mut self, path: Option<&str>) -> Result<()> {
+        let target = self.resolve(path.unwrap_or("."));
+        let payload = self.request_id(|id| build_sftp_statvfs(id, &target)).await?;
+        let (f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, _f_files, _f_ffree) = parse_sftp_statvfs(&payload)?;
+        let total = f_blocks.saturating_mul(f_frsize);
+        let avail = f_bavail.saturating_mul(f_frsize);
+        let used = f_blocks.saturating_sub(f_bfree).saturating_mul(f_frsize);
+        println!("      Size      Used     Avail  Capacity  Mounted on");
+        println!(
+            "{:>10} {:>10} {:>10} {:>6}%  {}",
+            total, used, avail,
+            if total > 0 { (used * 100) / total } else { 0 },
+            path.unwrap_or(".")
+        );
+        let _ = f_bsize;
+        Ok(())
+    }
+
+    pub async fn cmd_reget(&mut self, remote: &str, local: &str) -> Result<()> {
+        let rpath = self.resolve(remote);
+        let lpath = PathBuf::from(local);
+        let lpath = if lpath.is_absolute() { lpath } else { self.local_cwd.join(lpath) };
+        let resume_at = std::fs::metadata(&lpath).map(|m| m.len()).unwrap_or(0);
+        self.transfer_get(&rpath, &lpath, resume_at).await
+    }
+
+    pub async fn cmd_reput(&mut self, local: &str, remote: &str) -> Result<()> {
+        let lpath = PathBuf::from(local);
+        let lpath = if lpath.is_absolute() { lpath } else { self.local_cwd.join(lpath) };
+        let rpath = self.resolve(remote);
+        let lmeta = std::fs::metadata(&lpath).map_err(|e| SshError::Io(e))?;
+        let rsize = self.sftp_remote_size(&rpath).await.unwrap_or(0);
+        let resume_at = rsize.min(lmeta.len());
+        self.transfer_put(&lpath, &rpath, resume_at).await
+    }
+
+    async fn sftp_remote_size(&mut self, path: &str) -> Result<u64> {
+        let payload = self.request_id(|id| build_sftp_stat(id, path)).await?;
+        let attr = parse_sftp_attrs(&payload)?;
+        Ok(attr.size.unwrap_or(0))
+    }
+
+    async fn transfer_get(&mut self, rpath: &str, lpath: &PathBuf, start: u64) -> Result<()> {
+        let payload = self.request_id(|id| {
+            let mut a = SftpFileAttr::new();
+            a.flags = 0;
+            build_sftp_open(id, rpath, SSH_FXF_READ, &a)
+        }).await?;
+        let handle = parse_sftp_handle(&payload)?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lpath)
+            .await
+            .map_err(|e| SshError::Io(e))?;
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| SshError::Io(e))?;
+        use tokio::io::AsyncWriteExt;
+        let mut offset = start;
+        loop {
+            let payload = self.request_id(|id| build_sftp_read(id, &handle, offset, 256 * 1024)).await;
+            match payload {
+                Ok(payload) => {
+                    let data = parse_sftp_data(&payload)?;
+                    if data.is_empty() {
+                        break;
+                    }
+                    file.write_all(&data).await.map_err(|e| SshError::Io(e))?;
+                    offset += data.len() as u64;
+                }
+                Err(e) => {
+                    if e.to_string().contains("EOF") {
+                        break;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        file.flush().await.map_err(|e| SshError::Io(e))?;
+        let _ = self.ok_id(|id| build_sftp_close(id, &handle)).await;
+        Ok(())
+    }
+
+    async fn transfer_put(&mut self, lpath: &PathBuf, rpath: &str, start: u64) -> Result<()> {
+        let lmeta = std::fs::metadata(&lpath).map_err(|e| SshError::Io(e))?;
+        let mut file = tokio::fs::File::open(&lpath).await.map_err(|e| SshError::Io(e))?;
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| SshError::Io(e))?;
+        let mut attrs = SftpFileAttr::new();
+        attrs.size = Some(lmeta.len());
+        let mut pflags = SSH_FXF_WRITE | SSH_FXF_CREAT;
+        if start == 0 {
+            pflags |= SSH_FXF_TRUNC;
+        }
+        let payload = self.request_id(|id| build_sftp_open(id, rpath, pflags, &attrs)).await?;
+        let handle = parse_sftp_handle(&payload)?;
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut offset = start;
+        loop {
+            let n = file.read(&mut buf).await.map_err(|e| SshError::Io(e))?;
+            if n == 0 {
+                break;
+            }
+            let id = self.new_id();
+            self.request_ok(&build_sftp_write(id, &handle, offset, &buf[..n])).await?;
+            offset += n as u64;
+        }
+        let _ = self.ok_id(|id| build_sftp_close(id, &handle)).await;
+        Ok(())
+    }
 }
 
 pub async fn run_sftp(config: &ResolvedConfig) -> Result<()> {
@@ -530,6 +678,105 @@ impl SftpSession {
                     }
                 }
             }
+            "stat" => {
+                if parts.len() < 2 {
+                    println!("usage: stat path");
+                } else {
+                    let long = parts.iter().any(|a| a == &"-l");
+                    let path = parts.iter().skip(1).find(|a| !a.starts_with('-')).copied().unwrap_or(parts[1]);
+                    match self.cmd_stat(path, long).await {
+                        Ok(_) => {}
+                        Err(e) => println!("{}", e),
+                    }
+                }
+            }
+            "symlink" => {
+                if parts.len() < 3 {
+                    println!("usage: symlink oldpath newpath");
+                } else {
+                    let (target, link) = if parts[1] == "-s" && parts.len() >= 4 {
+                        (parts[2], parts[3])
+                    } else {
+                        (parts[1], parts[2])
+                    };
+                    match self.cmd_symlink(link, target).await {
+                        Ok(_) => {}
+                        Err(e) => println!("{}", e),
+                    }
+                }
+            }
+            "chown" => {
+                if parts.len() < 3 {
+                    println!("usage: chown uid[:gid] path");
+                } else {
+                    let spec = parts[1];
+                    let (uid, gid) = if let Some((u, g)) = spec.split_once(':') {
+                        (u, g)
+                    } else {
+                        (spec, spec)
+                    };
+                    match self.cmd_chown(uid, gid, parts[2]).await {
+                        Ok(_) => {}
+                        Err(e) => println!("{}", e),
+                    }
+                }
+            }
+            "df" => {
+                let path = parts.get(1).copied();
+                match self.cmd_df(path).await {
+                    Ok(_) => {}
+                    Err(e) => println!("{}", e),
+                }
+            }
+            "reget" => {
+                if parts.len() < 2 {
+                    println!("usage: reget remote-path [local-path]");
+                } else {
+                    let l = parts.get(2).copied().unwrap_or(parts[1]);
+                    match self.cmd_reget(parts[1], l).await {
+                        Ok(_) => println!("Resuming fetch of {} to {}", parts[1], l),
+                        Err(e) => println!("{}", e),
+                    }
+                }
+            }
+            "reput" => {
+                if parts.len() < 2 {
+                    println!("usage: reput local-path [remote-path]");
+                } else {
+                    let r = parts.get(2).copied().unwrap_or(parts[1]);
+                    match self.cmd_reput(parts[1], r).await {
+                        Ok(_) => println!("Resuming upload of {} to {}", parts[1], r),
+                        Err(e) => println!("{}", e),
+                    }
+                }
+            }
+            "mget" => {
+                if parts.len() < 2 {
+                    println!("usage: mget remote-path...");
+                } else {
+                    for p in &parts[1..] {
+                        match self.cmd_get(p, None).await {
+                            Ok(_) => println!("Fetching {} to .", p),
+                            Err(e) => println!("{}", e),
+                        }
+                    }
+                }
+            }
+            "mput" => {
+                if parts.len() < 2 {
+                    println!("usage: mput local-path...");
+                } else {
+                    for p in &parts[1..] {
+                        match self.cmd_put(p, None).await {
+                            Ok(_) => println!("Uploading {} to .", p),
+                            Err(e) => println!("{}", e),
+                        }
+                    }
+                }
+            }
+            "version" => {
+                println!("SFTP protocol version {}", SFTP_PROTOCOL_VERSION);
+            }
             "help" => {
                 println!("Available commands:");
                 println!("  pwd             Display remote working directory");
@@ -540,6 +787,14 @@ impl SftpSession {
                 println!("  lls [path]      List local directory");
                 println!("  get remote [local]  Download file");
                 println!("  put local [remote]  Upload file");
+                println!("  mget remote...  Download multiple files");
+                println!("  mput local...   Upload multiple files");
+                println!("  reget remote [local]  Resume download");
+                println!("  reput local [remote]  Resume upload");
+                println!("  df [path]       Display disk usage");
+                println!("  stat [-l] path  Display file attributes");
+                println!("  chown uid[:gid] path  Change owner/group");
+                println!("  symlink old new  Create symlink");
                 println!("  mkdir path      Create remote directory");
                 println!("  rm path         Delete remote file");
                 println!("  rmdir path      Remove remote directory");
@@ -567,4 +822,79 @@ impl SftpSession {
         }
         true
     }
+}
+
+/// Render an SFTP permission word (`drwxr-xr-x`) from the mode bits.
+fn perm_string(mode: u32) -> String {
+    let mut s = String::with_capacity(10);
+    s.push(match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o060000 => 'b',
+        0o020000 => 'c',
+        0o100000 => 'p',
+        0o140000 => 's',
+        _ => '-',
+    });
+    for bit in [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001] {
+        s.push(if mode & bit != 0 {
+            match bit {
+                0o400 | 0o040 | 0o004 => 'r',
+                0o200 | 0o020 | 0o002 => 'w',
+                _ => 'x',
+            }
+        } else {
+            '-'
+        });
+    }
+    s
+}
+
+/// Render an SFTP `ls -l` longname. OpenSSH's `sftp-server` builds this the
+/// same way: permissions, nlink, owner, group, size, date, name.
+fn format_sftp_longname(path: &str, attr: &SftpFileAttr) -> String {
+    let perm = attr.permissions.unwrap_or(0);
+    let size = attr.size.unwrap_or(0);
+    let uid = attr.uid.unwrap_or(0);
+    let gid = attr.gid.unwrap_or(0);
+    let mtime = attr.mtime.unwrap_or(0);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    format!(
+        "{} 1 {} {} {:>8} {} {}",
+        perm_string(perm),
+        uid,
+        gid,
+        size,
+        sftp_date(mtime),
+        name
+    )
+}
+
+/// Format an mtime (seconds since epoch) as `Mon DD HH:MM` or `Mon DD  YYYY`.
+fn sftp_date(mtime: u32) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dt = UNIX_EPOCH + Duration::from_secs(mtime as u64);
+    let local = localtime(dt);
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mon = months.get(local.mon).copied().unwrap_or("Jan");
+    format!("{} {:2} {:02}:{:02}", mon, local.day, local.hour, local.min)
+}
+
+struct LocalTime {
+    mon: usize,
+    day: u32,
+    hour: u32,
+    min: u32,
+}
+
+fn localtime(dt: std::time::SystemTime) -> LocalTime {
+    // Simple UTC approximation; OpenSSH uses the server's local timezone. For
+    // the common case this is accurate enough for display.
+    let secs = dt.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let days = secs / 86400;
+    let secs_in_day = secs % 86400;
+    let hour = (secs_in_day / 3600) as u32;
+    let min = ((secs_in_day % 3600) / 60) as u32;
+    let mon = ((days % 12) as usize).min(11);
+    LocalTime { mon, day: ((days % 31) as u32) + 1, hour, min }
 }

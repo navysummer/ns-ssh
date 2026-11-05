@@ -429,3 +429,17 @@ pub fn parse_sftp_attrs(data: &[u8]) -> Result<SftpFileAttr> {
     let mut r = data;
     SftpFileAttr::decode(&mut r)
 }
+
+/// Parse an `SSH_FXP_EXTENDED_REPLY` for `statvfs@openssh.com` / `fstatvfs@openssh.com`.
+/// Returns `(f_bsize, f_frsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree)`.
+pub fn parse_sftp_statvfs(data: &[u8]) -> Result<(u64, u64, u64, u64, u64, u64, u64)> {
+    let mut r = data;
+    let bsize = u64::decode(&mut r)?;
+    let frsize = u64::decode(&mut r)?;
+    let blocks = u64::decode(&mut r)?;
+    let bfree = u64::decode(&mut r)?;
+    let bavail = u64::decode(&mut r)?;
+    let files = u64::decode(&mut r)?;
+    let ffree = u64::decode(&mut r)?;
+    Ok((bsize, frsize, blocks, bfree, bavail, files, ffree))
+}

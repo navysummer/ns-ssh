@@ -22,7 +22,13 @@ async fn recv_byte(client: &mut SshClient, local_id: ChannelId) -> Result<u8> {
                     continue;
                 }
                 if data.len() > 1 {
-                    return Err(SshError::Protocol("unexpected data during SCP control".into()));
+                    // The remote scp sends an error message (e.g. "scp: ...")
+                    // instead of a single ack byte; surface it for diagnosis.
+                    let msg = String::from_utf8_lossy(&data);
+                    return Err(SshError::Protocol(format!(
+                        "remote scp error: {}",
+                        msg.trim()
+                    )));
                 }
                 return Ok(data[0]);
             }
@@ -52,9 +58,15 @@ async fn send_byte(client: &mut SshClient, local_id: ChannelId, b: u8) -> Result
     client.send_channel_data(local_id, &[b]).await
 }
 
-pub async fn scp_upload(config: &ResolvedConfig, local_path: &Path, remote_path: &str) -> Result<()> {
+pub async fn scp_upload(config: &ResolvedConfig, local_path: &Path, remote_path: &str, recursive: bool) -> Result<()> {
     let mut client = new_scp_client(config).await?;
-    let remote_cmd = format!("scp -t -p {}", remote_path);
+    // OpenSSH passes -r to the remote `scp -t` only when the local side
+    // recurses; without it the remote rejects a directory header.
+    let remote_cmd = if recursive {
+        format!("scp -t -r -p {}", remote_path)
+    } else {
+        format!("scp -t -p {}", remote_path)
+    };
     let local_id = client.request_session(Some(&remote_cmd), false, "dumb", 80, 24).await?;
 
     let metadata = std::fs::metadata(local_path).map_err(|e| SshError::Io(e))?;
@@ -66,7 +78,18 @@ pub async fn scp_upload(config: &ResolvedConfig, local_path: &Path, remote_path:
     }
 
     if metadata.is_dir() {
-        return scp_upload_recursive(&mut client, local_id, local_path, remote_path).await;
+        // OpenSSH scp requires -r to recurse into a directory source; without
+        // it a directory is an error rather than a silent recursive copy.
+        if !recursive {
+            return Err(SshError::Protocol(format!(
+                "{} is a directory (use -r to copy recursively)",
+                local_path.display()
+            )));
+        }
+        let dir_name = local_path.file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scp".to_string());
+        return scp_upload_recursive(&mut client, local_id, local_path, &dir_name).await;
     }
 
     let mode = format!("{:04o}", metadata.permissions().mode() & 0o7777);
@@ -113,9 +136,79 @@ pub async fn scp_upload(config: &ResolvedConfig, local_path: &Path, remote_path:
     Ok(())
 }
 
-pub async fn scp_download(config: &ResolvedConfig, remote_path: &str, local_path: &Path) -> Result<()> {
+/// Upload multiple local sources to a single remote target in one SCP session
+/// (`scp f1 f2 host:/dst/`). Each source is sent as a separate C (file) or
+/// D (directory, requires -r) record; the session ends with a close byte.
+pub async fn scp_upload_multi(
+    config: &ResolvedConfig,
+    sources: &[std::path::PathBuf],
+    remote_path: &str,
+    recursive: bool,
+) -> Result<()> {
+    if sources.is_empty() {
+        return Err(SshError::Protocol("no source files".into()));
+    }
     let mut client = new_scp_client(config).await?;
-    let remote_cmd = format!("scp -f -p {}", remote_path);
+    let remote_cmd = if recursive {
+        format!("scp -t -r -p {}", remote_path)
+    } else {
+        format!("scp -t -p {}", remote_path)
+    };
+    let local_id = client.request_session(Some(&remote_cmd), false, "dumb", 80, 24).await?;
+
+    let init = recv_byte(&mut client, local_id).await?;
+    if init != 0 {
+        return Err(SshError::Protocol("SCP remote did not start cleanly".into()));
+    }
+
+    for src in sources {
+        let meta = std::fs::metadata(src).map_err(|e| SshError::Io(e))?;
+        if meta.is_dir() {
+            if !recursive {
+                return Err(SshError::Protocol(format!(
+                    "{} is a directory (use -r to copy recursively)",
+                    src.display()
+                )));
+            }
+            let dir_name = src.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "scp".to_string());
+            send_timestamp(&mut client, local_id, &meta).await?;
+            scp_upload_recursive(&mut client, local_id, src, &dir_name).await?;
+        } else {
+            send_timestamp(&mut client, local_id, &meta).await?;
+            let mode = format!("{:04o}", meta.permissions().mode() & 0o7777);
+            let size = meta.len();
+            let fname = src.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            client.send_channel_data(local_id, format!("C{} {} {}\n", mode, size, fname).as_bytes()).await?;
+            let ack = recv_byte(&mut client, local_id).await?;
+            if ack != 0 {
+                return Err(SshError::Protocol("SCP rejected control message".into()));
+            }
+            let mut file = tokio::fs::File::open(src).await.map_err(|e| SshError::Io(e))?;
+            let mut buf = vec![0u8; 16384];
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                client.send_channel_data(local_id, &buf[..n]).await?;
+            }
+            client.send_channel_data(local_id, &[0]).await?;
+            let _ack = recv_byte(&mut client, local_id).await?;
+        }
+    }
+    Ok(())
+}
+pub async fn scp_download(config: &ResolvedConfig, remote_path: &str, local_path: &Path, recursive: bool) -> Result<()> {
+    let mut client = new_scp_client(config).await?;
+    let remote_cmd = if recursive {
+        format!("scp -f -r -p {}", remote_path)
+    } else {
+        format!("scp -f -p {}", remote_path)
+    };
     let local_id = client.request_session(Some(&remote_cmd), false, "dumb", 80, 24).await?;
 
     send_byte(&mut client, local_id, 0).await?;
@@ -132,9 +225,16 @@ pub async fn scp_download(config: &ResolvedConfig, remote_path: &str, local_path
             } else {
                 local_path.to_path_buf()
             };
-            recv_scp_file(&mut client, local_id, &dest, mode, size, mtime).await?;
+            let _ = recv_scp_file(&mut client, local_id, &dest, mode, size, mtime).await?;
         }
         'D' => {
+            // OpenSSH scp requires -r to descend into a directory source.
+            if !recursive {
+                return Err(SshError::Protocol(format!(
+                    "{} is a directory (use -r to copy recursively)",
+                    remote_path
+                )));
+            }
             send_byte(&mut client, local_id, 0).await?;
             let dir = if local_path.is_dir() {
                 local_path.join(&fname)
@@ -153,6 +253,141 @@ pub async fn scp_download(config: &ResolvedConfig, remote_path: &str, local_path
     Ok(())
 }
 
+/// Download multiple remote sources to a single local target in one SCP
+/// session (`scp host:/f1 host:/f2 local_dir`). The remote `scp -f` sends one
+/// control record per source; we loop until the channel closes.
+pub async fn scp_download_multi(
+    config: &ResolvedConfig,
+    sources: &[String],
+    local_path: &Path,
+    recursive: bool,
+) -> Result<()> {
+    if sources.is_empty() {
+        return Err(SshError::Protocol("no source files".into()));
+    }
+    let mut client = new_scp_client(config).await?;
+    // The remote `scp -f` must receive bare paths, not `user@host:path` specs.
+    let path_args: Vec<String> = sources
+        .iter()
+        .map(|s| {
+            s.rsplit_once(':')
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_else(|| s.clone())
+        })
+        .collect();
+    let remote_cmd = if recursive {
+        format!("scp -f -r -p {}", path_args.join(" "))
+    } else {
+        format!("scp -f -p {}", path_args.join(" "))
+    };
+    let local_id = client.request_session(Some(&remote_cmd), false, "dumb", 80, 24).await?;
+    send_byte(&mut client, local_id, 0).await?;
+
+    let dest_dir = if local_path.is_dir() {
+        local_path.to_path_buf()
+    } else {
+        local_path.to_path_buf()
+    };
+    std::fs::create_dir_all(&dest_dir).map_err(|e| SshError::Io(e))?;
+
+    // A buffered line reader: `recv_channel_data` may coalesce several control
+    // lines (T + C) into one packet, and the old per-call reader discarded the
+    // bytes after the first '\n'. Keep a carry buffer so no line is lost.
+    struct LineReader {
+        client: SshClient,
+        local_id: ChannelId,
+        carry: Vec<u8>,
+    }
+    impl LineReader {
+        fn new(client: SshClient, local_id: ChannelId) -> Self {
+            Self { client, local_id, carry: Vec::new() }
+        }
+        async fn next(&mut self) -> Result<Option<String>> {
+            loop {
+                if let Some(pos) = self.carry.iter().position(|&b| b == b'\n') {
+                    let mut line: Vec<u8> = self.carry.drain(..=pos).collect();
+                    line.pop();
+                    return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+                }
+                match self.client.recv_channel_data(self.local_id).await? {
+                    Some(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        self.carry.extend_from_slice(&data);
+                    }
+                    None => {
+                        if self.carry.is_empty() {
+                            return Ok(None);
+                        }
+                        let line = std::mem::take(&mut self.carry);
+                        return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Loop receiving entries until the channel closes (normal end).
+    let mut reader = LineReader::new(client, local_id);
+    loop {
+        let control = match reader.next().await? {
+            Some(c) => c,
+            None => break,
+        };
+        if control.starts_with('E') {
+            send_byte(&mut reader.client, reader.local_id, 0).await?;
+            continue;
+        }
+        let mut mtime = None;
+        let control = if control.starts_with('T') {
+            mtime = parse_timestamp(&control);
+            send_byte(&mut reader.client, reader.local_id, 0).await?;
+            match reader.next().await? {
+                Some(c) => c,
+                None => break,
+            }
+        } else {
+            control
+        };
+        let (kind, mode, size, fname) = parse_control(&control)?;
+        match kind {
+            'C' => {
+                send_byte(&mut reader.client, reader.local_id, 0).await?;
+                let dest = dest_dir.join(&fname);
+                let leftover = recv_scp_file(
+                    &mut reader.client,
+                    reader.local_id,
+                    &dest,
+                    mode,
+                    size,
+                    mtime,
+                )
+                .await?;
+                if !leftover.is_empty() {
+                    // Bytes after the '\0' marker belong to the next control
+                    // line; keep them so the reader does not lose them.
+                    reader.carry.extend_from_slice(&leftover);
+                }
+            }
+            'D' => {
+                if !recursive {
+                    return Err(SshError::Protocol(format!(
+                        "{} is a directory (use -r to copy recursively)",
+                        fname
+                    )));
+                }
+                send_byte(&mut reader.client, reader.local_id, 0).await?;
+                let dir = dest_dir.join(&fname);
+                std::fs::create_dir_all(&dir).map_err(|e| SshError::Io(e))?;
+                apply_file_meta(&dir, mode, mtime)?;
+                scp_recv_entries(&mut reader.client, reader.local_id, &dir).await?;
+            }
+            _ => return Err(SshError::Protocol("unexpected SCP control message".into())),
+        }
+    }
+    Ok(())
+}
 /// Read one control header, transparently skipping an optional T timestamp header.
 async fn read_first_control(client: &mut SshClient, local_id: ChannelId) -> Result<(String, Option<(i64, i64)>)> {
     let mut control = recv_control_line(client, local_id).await?;
@@ -231,9 +466,10 @@ async fn recv_scp_file(
     mode: Option<u32>,
     size: u64,
     mtime: Option<(i64, i64)>,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let mut file = tokio::fs::File::create(dest).await.map_err(|e| SshError::Io(e))?;
     let mut remaining = size;
+    let mut leftover: Vec<u8> = Vec::new();
     while remaining > 0 {
         match client.recv_channel_data(local_id).await? {
             Some(data) => {
@@ -243,13 +479,40 @@ async fn recv_scp_file(
                 let take = data.len().min(remaining as usize);
                 file.write_all(&data[..take]).await?;
                 remaining -= take as u64;
+                if take < data.len() {
+                    // File data ended mid-chunk; the rest holds the '\0'
+                    // file-end marker and possibly the next control line.
+                    leftover.extend_from_slice(&data[take..]);
+                    break;
+                }
             }
             None => return Err(SshError::Protocol("connection closed during transfer".into())),
         }
     }
+    if leftover.first() == Some(&0) {
+        // Drop the '\0' marker; anything after it is the next header.
+        leftover.remove(0);
+    } else if remaining == 0 {
+        // Data ended exactly at a chunk boundary: the '\0' marker is the next
+        // chunk. Consume it and keep any bytes that follow.
+        loop {
+            match client.recv_channel_data(local_id).await? {
+                Some(data) => {
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data.len() > 1 {
+                        leftover.extend_from_slice(&data[1..]);
+                    }
+                    break;
+                }
+                None => return Err(SshError::Protocol("connection closed during transfer".into())),
+            }
+        }
+    }
     send_byte(client, local_id, 0).await?;
     apply_file_meta(dest, mode, mtime)?;
-    Ok(())
+    Ok(leftover)
 }
 
 /// Recursively receive directory entries into `dest_dir` until an 'E' header or channel close.
@@ -278,7 +541,7 @@ async fn scp_recv_entries(client: &mut SshClient, local_id: ChannelId, dest_dir:
             'C' => {
                 send_byte(client, local_id, 0).await?;
                 let dest = dest_dir.join(&fname);
-                recv_scp_file(client, local_id, &dest, mode, size, mtime).await?;
+                let _ = recv_scp_file(client, local_id, &dest, mode, size, mtime).await?;
             }
             'D' => {
                 send_byte(client, local_id, 0).await?;

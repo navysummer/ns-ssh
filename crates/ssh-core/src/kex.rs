@@ -5,6 +5,16 @@ use sha2::{Sha256, Sha384, Sha512, Digest};
 use rand::rngs::OsRng;
 use num_traits::Num;
 
+/// Draw a fresh 32-byte seed from the workspace RNG. The `sntrup761` crate
+/// depends on rand 0.10, which is incompatible with this workspace's rand 0.8
+/// `OsRng`; its key generation and encapsulation are seeded from this instead.
+fn random_seed() -> [u8; 32] {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
 pub trait KexAlgorithm: Send + Sync {
     fn name(&self) -> &str;
     fn hash_name(&self) -> &'static str { "sha256" }
@@ -503,7 +513,211 @@ impl KexAlgorithm for EcdhP256Kex {
         self.public_key_bytes_cache.clone()
     }
 }
+/// RFC 9941 `sntrup761x25519-sha512` hybrid key exchange.
+///
+/// The two roles are asymmetric:
+/// - Client: `generate_keypair` produces an sntrup761 encapsulation (public)
+///   key and an X25519 keypair. `public_key_bytes` = sntrup_pk (1158) ||
+///   x25519_pub (32) = 1190 bytes (Q_C). `compute_shared_secret(Q_S)`
+///   decapsulates the server's 1039-byte ciphertext and does X25519.
+/// - Server: `generate_keypair` produces only the X25519 keypair. The sntrup
+///   public key arrives in `compute_shared_secret(Q_C)`, which encapsulates
+///   into it; `public_key_bytes` then returns ct (1039) || x25519_pub (32) =
+///   1071 bytes (Q_S).
+///
+/// The shared secret K = SHA-512(sntrup_ss || x25519_shared) is 64 bytes and
+/// is encoded as a `string` (not an mpint) in the exchange hash and key
+/// derivation (RFC 9941 §3).
+pub struct SntrupX25519Kex {
+    x_private: x25519_dalek::StaticSecret,
+    x_public: x25519_dalek::PublicKey,
+    // Client role: our sntrup encapsulation key (None on the server until it
+    // receives the client's public key).
+    sntrup_pk: Option<sntrup761::EncapsulationKey>,
+    // Client role: our decapsulation key.
+    sntrup_sk: Option<sntrup761::DecapsulationKey>,
+    // Server role: the ciphertext produced by encapsulating into the client's
+    // public key (None until `compute_shared_secret`).
+    sntrup_ct: Option<sntrup761::Ciphertext>,
+}
 
+impl SntrupX25519Kex {
+    pub fn new() -> Self {
+        let x_private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let x_public = x25519_dalek::PublicKey::from(&x_private);
+        SntrupX25519Kex {
+            x_private,
+            x_public,
+            sntrup_pk: None,
+            sntrup_sk: None,
+            sntrup_ct: None,
+        }
+    }
+
+    pub fn kex_name() -> &'static str {
+        "sntrup761x25519-sha512"
+    }
+
+    /// The RFC 9941 shared secret K = SHA-512(sntrup_ss || x25519_shared).
+    fn hybrid_shared_secret(sntrup_ss: &[u8], x25519_shared: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha512::new();
+        hasher.update(sntrup_ss);
+        hasher.update(x25519_shared);
+        hasher.finalize().to_vec()
+    }
+}
+
+impl KexAlgorithm for SntrupX25519Kex {
+    fn name(&self) -> &str {
+        Self::kex_name()
+    }
+
+    fn hash_name(&self) -> &'static str {
+        "sha512"
+    }
+
+    fn generate_keypair(&mut self) -> Result<()> {
+        // Client role: generate the sntrup761 keypair and X25519 keypair.
+        // The sntrup761 crate uses rand 0.10, which does not match this
+        // workspace's rand 0.8 OsRng; derive the KEM from a fresh 32-byte
+        // seed drawn from the workspace RNG instead.
+        let x_private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let x_public = x25519_dalek::PublicKey::from(&x_private);
+        let (sntrup_pk, sntrup_sk) = sntrup761::generate_key_from_seed(random_seed());
+        self.x_private = x_private;
+        self.x_public = x_public;
+        self.sntrup_pk = Some(sntrup_pk);
+        self.sntrup_sk = Some(sntrup_sk);
+        Ok(())
+    }
+
+    fn compute_shared_secret(&mut self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
+        // Q_C = 1190 bytes (client public key, server role) or Q_S = 1071
+        // bytes (server reply, client role). The length identifies the role.
+        if peer_public_key.len() == 1071 {
+            // Client role: Q_S = ciphertext (1039) || x25519_pub (32).
+            let ct = sntrup761::Ciphertext::try_from(&peer_public_key[..1039])
+                .map_err(|_| SshError::KexFailed("invalid sntrup761 ciphertext".into()))?;
+            let mut x_pub = [0u8; 32];
+            x_pub.copy_from_slice(&peer_public_key[1039..]);
+            let peer = x25519_dalek::PublicKey::from(x_pub);
+            let x_shared = self.x_private.diffie_hellman(&peer);
+            let sk = self.sntrup_sk.as_ref()
+                .ok_or_else(|| SshError::KexFailed("sntrup761 secret key not generated".into()))?;
+            let ss = sk.decapsulate(&ct);
+            Ok(Self::hybrid_shared_secret(ss.as_ref(), x_shared.as_bytes()))
+        } else if peer_public_key.len() == 1190 {
+            // Server role: Q_C = sntrup_pk (1158) || x25519_pub (32).
+            let pk = sntrup761::EncapsulationKey::try_from(&peer_public_key[..1158])
+                .map_err(|_| SshError::KexFailed("invalid sntrup761 public key".into()))?;
+            let mut x_pub = [0u8; 32];
+            x_pub.copy_from_slice(&peer_public_key[1158..]);
+            let peer = x25519_dalek::PublicKey::from(x_pub);
+            let x_shared = self.x_private.diffie_hellman(&peer);
+            let (ct, ss) = pk.encapsulate_deterministic(random_seed());
+            self.sntrup_ct = Some(ct);
+            Ok(Self::hybrid_shared_secret(ss.as_ref(), x_shared.as_bytes()))
+        } else {
+            Err(SshError::KexFailed(format!(
+                "invalid sntrup761x25519 peer key length {}",
+                peer_public_key.len()
+            )))
+        }
+    }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        // Client: Q_C = sntrup_pk (1158) || x25519_pub (32).
+        // Server: Q_S = ct (1039) || x25519_pub (32).
+        let mut out = Vec::new();
+        if let Some(ct) = &self.sntrup_ct {
+            out.extend_from_slice(ct.as_ref());
+        } else if let Some(pk) = &self.sntrup_pk {
+            out.extend_from_slice(pk.as_ref());
+        }
+        out.extend_from_slice(self.x_public.as_bytes());
+        out
+    }
+}
+
+/// RFC 9941 §3: compute the exchange hash for `sntrup761x25519-sha512`.
+/// Unlike finite-field DH and ECDH, the hybrid shared secret K is a 64-byte
+/// SHA-512 output encoded as a `string`, and Q_C/Q_S are byte strings.
+pub fn compute_hybrid_exchange_hash(
+    exchange: &KexExchange,
+    server_host_key: &[u8],
+    client_public_key: &[u8],
+    server_public_key: &[u8],
+    shared_secret: &[u8],
+) -> Vec<u8> {
+    // `SshString` is already in scope via `use crate::encoding::*`.
+    let mut hasher = Khasher::new("sha512");
+
+    let mut buf = Vec::new();
+    SshString(exchange.client_version.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(exchange.server_version.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(exchange.client_kex_init.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(exchange.server_kex_init.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(server_host_key.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(client_public_key.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    SshString(server_public_key.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    buf.clear();
+    // K is a string, not an mpint.
+    SshString(shared_secret.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+
+    hasher.finalize()
+}
+
+/// RFC 9941 §3: derive keys from the hybrid K (encoded as a string).
+pub fn derive_hybrid_key(
+    shared_secret: &[u8],
+    exchange_hash: &[u8],
+    session_id: &[u8],
+    char_tag: u8,
+    key_len: usize,
+) -> Vec<u8> {
+    let mut hasher = Khasher::new("sha512");
+
+    let mut buf = Vec::new();
+    SshString(shared_secret.to_vec()).encode(&mut buf).unwrap();
+    hasher.update(&buf);
+    hasher.update(exchange_hash);
+    hasher.update(&[char_tag]);
+    hasher.update(session_id);
+
+    let hash = hasher.finalize();
+    let hash_len = hash.len();
+    if key_len <= hash_len {
+        return hash[..key_len].to_vec();
+    }
+
+    let mut out = hash.clone();
+    while out.len() < key_len {
+        let mut h = Khasher::new("sha512");
+        let mut b = Vec::new();
+        SshString(shared_secret.to_vec()).encode(&mut b).unwrap();
+        h.update(&b);
+        h.update(exchange_hash);
+        h.update(&out);
+        let next = h.finalize();
+        out.extend_from_slice(&next);
+    }
+    out.truncate(key_len);
+    out
+}
 pub fn derive_key(
     hash_name: &str,
     shared_secret: &[u8],
@@ -775,6 +989,34 @@ mod tests {
         }
         let p_minus_one = (kex.p() - num_bigint::BigUint::from(1u32)).to_bytes_be();
         assert!(kex.compute_shared_secret(&p_minus_one).is_err());
+    }
+
+    #[test]
+    fn sntrup_hybrid_round_trip_agrees_on_shared_secret() {
+        // Client role generates Q_C (1190) and decapsulates Q_S (1071).
+        let mut client = SntrupX25519Kex::new();
+        client.generate_keypair().unwrap();
+        let q_c = client.public_key_bytes();
+        assert_eq!(q_c.len(), 1190);
+
+        // Server role encapsulates into Q_C and produces Q_S (1071).
+        let mut server = SntrupX25519Kex::new();
+        server.generate_keypair().unwrap();
+        let server_k = server.compute_shared_secret(&q_c).unwrap();
+        let q_s = server.public_key_bytes();
+        assert_eq!(q_s.len(), 1071);
+
+        let client_k = client.compute_shared_secret(&q_s).unwrap();
+        assert_eq!(client_k.len(), 64);
+        assert_eq!(client_k, server_k, "hybrid shared secrets must agree");
+    }
+
+    #[test]
+    fn sntrup_hybrid_rejects_wrong_key_lengths() {
+        let mut client = SntrupX25519Kex::new();
+        client.generate_keypair().unwrap();
+        assert!(client.compute_shared_secret(&[]).is_err());
+        assert!(client.compute_shared_secret(&vec![0u8; 100]).is_err());
     }
 }
 

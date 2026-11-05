@@ -7,6 +7,7 @@ description = "Pure Rust SSH protocol implementation"
 
 [dependencies]
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+sntrup761 = "0.2"
 ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 signature = "2"
@@ -22,8 +23,8 @@ chacha20 = "0.9"
 poly1305 = "0.8"
 sha2 = "0.10"
 sha1 = "0.10"
+md-5 = "0.10"
 hmac = "0.12"
-pbkdf2 = "0.12"
 bcrypt-pbkdf = "0.10"
 aes-gcm = "0.10"
 num-bigint = { version = "0.4", features = ["rand"] }

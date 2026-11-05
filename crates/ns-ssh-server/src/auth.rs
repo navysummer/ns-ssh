@@ -263,6 +263,14 @@ impl ServerAuth {
         self.required_rsa_size = bits as usize;
     }
 
+    /// Insert a password hash for `username`. Primarily for tests: real server
+    /// passwords come from `/etc/shadow`; there is no production config path
+    /// that stores hashes in memory.
+    #[allow(dead_code)]
+    pub fn set_password_hash(&mut self, username: &str, hash: &str) {
+        self.password_hashes.insert(username.to_string(), hash.to_string());
+    }
+
     /// Set StrictModes (authorized_keys file/directory ownership & permissions).
     pub fn set_strict_modes(&mut self, strict: bool) {
         self.strict_modes = strict;
@@ -857,11 +865,31 @@ fn verify_unix_password(password: &str, hash: &str) -> bool {
         return verify_md5_crypt(password, hash);
     }
     if hash.starts_with("$2") {
-        // bcrypt ($2a$/$2b$/$2y$) and yescrypt ($y$) not supported in pure Rust core
-        return false;
+        // bcrypt ($2a$/$2b$/$2y$/$2x$). The `bcrypt` crate verifies the MCF
+        // string directly.
+        return verify_bcrypt(password, hash);
+    }
+    if hash.starts_with("$y$") {
+        // yescrypt ($y$), used by newer shadow implementations.
+        return verify_yescrypt(password, hash);
     }
 
     password == hash
+}
+
+fn verify_bcrypt(password: &str, hash: &str) -> bool {
+    bcrypt::verify(password, hash).unwrap_or(false)
+}
+
+fn verify_yescrypt(password: &str, hash: &str) -> bool {
+    use yescrypt::password_hash::PasswordVerifier;
+    use yescrypt::Yescrypt as YescryptType;
+    // Alias the struct (the crate also exports a `yescrypt()` free function in
+    // the value namespace, so `yescrypt::Yescrypt` alone is ambiguous). The
+    // struct derives Default. `PasswordVerifier<str>` parses the `$y$` MCF
+    // string itself.
+    let yc = YescryptType::default();
+    yc.verify_password(password.as_bytes(), hash).is_ok()
 }
 
 fn verify_sha_crypt(password: &str, hash: &str) -> bool {
@@ -1240,6 +1268,45 @@ mod tests {
             .authorized_principals("bob", Some("/nonexistent"), None, None)
             .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn verify_unix_password_supports_sha_crypt() {
+        use sha_crypt::password_hash::PasswordHasher;
+        use sha_crypt::ShaCrypt;
+        // Generate a real sha512-crypt hash for "secret" and verify it.
+        let hash = ShaCrypt::SHA512
+            .hash_password_with_salt(b"secret", b"abcdefgh")
+            .unwrap()
+            .to_string();
+        assert!(verify_unix_password("secret", &hash));
+        assert!(!verify_unix_password("wrong", &hash));
+
+        // In-memory hash path.
+        let mut auth = ServerAuth::new();
+        auth.set_password_hash("alice", "secret");
+        assert!(auth.verify_password("alice", "secret"));
+        assert!(!auth.verify_password("alice", "wrong"));
+        assert!(!auth.verify_password("nobody", "secret"));
+    }
+
+    #[test]
+    fn verify_unix_password_supports_bcrypt() {
+        // A real bcrypt hash for "secret" (cost 10).
+        let hash = bcrypt::hash("secret", 10).unwrap();
+        assert!(hash.starts_with("$2"));
+        assert!(verify_unix_password("secret", &hash));
+        assert!(!verify_unix_password("wrong", &hash));
+    }
+
+    #[test]
+    fn verify_unix_password_supports_yescrypt() {
+        // Reference vector from the yescrypt crate (password "pleaseletmein",
+        // salt "WZaPV7LSUEKMo34.").
+        let hash = "$y$jD5.7$LdJMENpBABJJ3hIHjB1Bi.$HboGM6qPrsK.StKYGt6KErmUYtioHreJd98oIugoNB6";
+        assert!(verify_unix_password("pleaseletmein", hash));
+        assert!(!verify_unix_password("wrong", hash));
     }
 }
 

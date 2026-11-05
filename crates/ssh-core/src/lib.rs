@@ -4,6 +4,7 @@ pub mod msg;
 pub mod kex;
 pub mod cipher;
 pub mod mac;
+pub mod umac;
 pub mod hostkey;
 pub mod transport;
 pub mod auth;

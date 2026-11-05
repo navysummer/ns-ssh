@@ -80,6 +80,7 @@ pub const SSH_CHANNEL_TYPE_AUTH_AGENT_IDENTITY: &str = "auth-agent-req@openssh.c
 pub const SSH_CHANNEL_TYPE_X11: &str = "x11";
 pub const SSH_CHANNEL_TYPE_DIRECT_STREAMLOCAL: &str = "direct-streamlocal@openssh.com";
 pub const SSH_CHANNEL_TYPE_FORWARDED_STREAMLOCAL: &str = "forwarded-streamlocal@openssh.com";
+pub const SSH_CHANNEL_TYPE_TUN: &str = "tun@openssh.com";
 
 pub const SSH_GLOBAL_REQUEST_TCPIP_FORWARD: &str = "tcpip-forward";
 pub const SSH_GLOBAL_REQUEST_CANCEL_TCPIP_FORWARD: &str = "cancel-tcpip-forward";

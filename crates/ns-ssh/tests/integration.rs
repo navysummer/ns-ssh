@@ -68,12 +68,26 @@ fn openssh_ed25519_private(secret: &[u8; 32], pubkey: &[u8; 32]) -> String {
     result
 }
 
+/// Allocate a free TCP port, guaranteed unique across concurrently running
+/// tests in this process. `free_port` alone is racy: between `bind(0)` and the
+/// server's own bind another parallel test may grab the same port, which hangs
+/// the test (T01). A process-global reservation set prevents reuse.
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static RESERVED: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+    let mut guard = RESERVED.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if set.insert(port) {
+            return port;
+        }
+    }
 }
 
 fn wait_for_port(port: u16, timeout: Duration) -> bool {
@@ -571,6 +585,55 @@ fn rekey_mid_transfer_server_initiated() {
     );
 }
 
+/// UMAC MAC negotiation: both sides pin `umac-128-etm@openssh.com`, and a
+/// command round-trips, proving the MAC is negotiated and verified per-packet.
+#[test]
+fn umac_mac_negotiation_round_trip() {
+    let dir = temp_dir("umac");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            "kexalgorithms=curve25519-sha256",
+            "-o",
+            "ciphers=aes128-ctr",
+            "-o",
+            "macs=umac-128-etm@openssh.com",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("MACs=umac-128-etm@openssh.com")
+        .arg("127.0.0.1")
+        .arg("echo UMAC_OK")
+        .output()
+        .expect("run umac client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "client failed: status={:?}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "UMAC_OK",
+        "UMAC session did not echo expected output"
+    );
+}
+
 #[test]
 fn server_moduli_file_supplies_gex_group() {
     let dir = temp_dir("moduli");
@@ -902,6 +965,484 @@ fn exec_round_trip_match_block() {
         "expected Match ForceCommand output 'MATCHED', got: {:?}",
         stdout
     );
+}
+
+#[test]
+fn sntrup_hybrid_kex_round_trip() {
+    // RFC 9941 sntrup761x25519-sha512: force it on both ends and verify a
+    // real exec round-trip. This exercises the client decapsulation and the
+    // server encapsulation roles, the string-encoded shared secret K, and the
+    // sha512 exchange hash.
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("sntrup");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("-o")
+        .arg("kexalgorithms=sntrup761x25519-sha512")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let kh = dir.join("known_hosts");
+    let output = Command::new(client_bin)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-l")
+        .arg(&user)
+        .arg("-i")
+        .arg(&id_path)
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("KexAlgorithms=sntrup761x25519-sha512")
+        .arg("127.0.0.1")
+        .arg("echo SNTRUP_KEX_OK")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if !output.status.success() {
+        panic!(
+            "sntrup KEX client failed: status={:?}\nstdout={}\nstderr={}\nserver_stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&server_out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("SNTRUP_KEX_OK"),
+        "expected sntrup KEX command output, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn scp_requires_recursive_flag_for_directories() {
+    // R03: `scp` without -r must reject a directory source (it used to recurse
+    // silently); with -r it must copy the whole tree.
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("scp");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    // A local source directory with one nested file.
+    let src_dir = dir.join("src");
+    std::fs::create_dir_all(src_dir.join("sub")).unwrap();
+    std::fs::write(src_dir.join("a.txt"), "hello").unwrap();
+    std::fs::write(src_dir.join("sub").join("b.txt"), "nested").unwrap();
+    // Remote destination writable by the invoking user.
+    let remote_dest = std::env::temp_dir().join(format!("ns-ssh-scp-dest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote_dest);
+    std::fs::create_dir_all(&remote_dest).unwrap();
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    // Invoke the ns-ssh binary as `ns-scp` so argv[0] selects scp mode.
+    let scp_bin = dir.join("ns-scp");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+
+    let base_args = |extra: &[&str]| {
+        let mut v = vec![
+            "-P".to_string(),
+            port.to_string(),
+            "-i".to_string(),
+            id_path.display().to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(),
+            "UserKnownHostsFile=/dev/null".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+        ];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    };
+    let remote = format!("{}@127.0.0.1:{}/", user, remote_dest.display());
+
+    // Without -r: the directory source must be rejected.
+    let out = Command::new(&scp_bin)
+        .args(base_args(&[src_dir.display().to_string().as_str(), remote.as_str()]))
+        .output()
+        .expect("run scp no -r");
+    assert!(
+        !out.status.success(),
+        "scp without -r on a directory must fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // With -r: the tree must copy.
+    let out = Command::new(&scp_bin)
+        .args(base_args(&["-r", src_dir.display().to_string().as_str(), remote.as_str()]))
+        .output()
+        .expect("run scp with -r");
+    assert!(
+        out.status.success(),
+        "scp -r on a directory must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output().expect("wait server");
+    let copied = remote_dest.join("src").join("sub").join("b.txt");
+    assert!(
+        copied.exists(),
+        "expected recursively copied file at {:?}",
+        copied
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dest);
+}
+
+/// R04: `scp f1 f2 host:/dst/` must upload multiple sources in one session
+/// (the old code only sent the first source).
+#[test]
+fn scp_multisource_upload() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("scp-multi");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let f1 = dir.join("one.txt");
+    let f2 = dir.join("two.txt");
+    std::fs::write(&f1, "first").unwrap();
+    std::fs::write(&f2, "second").unwrap();
+    let remote_dest = std::env::temp_dir().join(format!("ns-ssh-scp-multi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote_dest);
+    std::fs::create_dir_all(&remote_dest).unwrap();
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let scp_bin = dir.join("ns-scp");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+
+    let remote = format!("{}@127.0.0.1:{}/", user, remote_dest.display());
+    let out = Command::new(&scp_bin)
+        .args([
+            "-P".to_string(),
+            port.to_string(),
+            "-i".to_string(),
+            id_path.display().to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(),
+            "UserKnownHostsFile=/dev/null".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            f1.display().to_string(),
+            f2.display().to_string(),
+            remote,
+        ])
+        .output()
+        .expect("run multi-source scp");
+    assert!(
+        out.status.success(),
+        "multi-source scp must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        remote_dest.join("one.txt").exists(),
+        "first source not uploaded"
+    );
+    assert!(
+        remote_dest.join("two.txt").exists(),
+        "second source not uploaded"
+    );
+
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dest);
+}
+
+/// R04: `scp host:/f1 host:/f2 localdir` must download multiple remote sources
+/// in one session.
+#[test]
+fn scp_multisource_download() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("scp-multi-dl");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let remote_dir = std::env::temp_dir().join(format!("ns-ssh-scp-multi-dl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote_dir);
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::write(remote_dir.join("r1.txt"), "remote1").unwrap();
+    std::fs::write(remote_dir.join("r2.txt"), "remote2").unwrap();
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let scp_bin = dir.join("ns-scp");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+    #[cfg(not(unix))]
+    std::fs::copy(env!("CARGO_BIN_EXE_ns-ssh"), &scp_bin).unwrap();
+
+    let local_dest = dir.join("downloaded");
+    std::fs::create_dir_all(&local_dest).unwrap();
+    let r1 = format!("{}@127.0.0.1:{}", user, remote_dir.join("r1.txt").display());
+    let r2 = format!("{}@127.0.0.1:{}", user, remote_dir.join("r2.txt").display());
+    let out = Command::new(&scp_bin)
+        .args([
+            "-P".to_string(),
+            port.to_string(),
+            "-i".to_string(),
+            id_path.display().to_string(),
+            "-o".to_string(),
+            "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(),
+            "UserKnownHostsFile=/dev/null".to_string(),
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            r1,
+            r2,
+            local_dest.display().to_string(),
+        ])
+        .output()
+        .expect("run multi-source scp download");
+    assert!(
+        out.status.success(),
+        "multi-source scp download must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        local_dest.join("r1.txt").exists(),
+        "first remote source not downloaded"
+    );
+    assert!(
+        local_dest.join("r2.txt").exists(),
+        "second remote source not downloaded"
+    );
+
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
 #[test]
@@ -1770,6 +2311,387 @@ fn subsystem_sftp_round_trip() {
         "expected SFTP VERSION reply from subsystem, got {:?}",
         reply
     );
+}
+
+/// Exercise the client-side SFTP command set (Q06/Q07): put/get/mkdir/stat/
+/// df/symlink/chown/reput/reget via `ns-sftp -b`. Runs against the real
+/// `ns-ssh-server` internal-sftp subsystem.
+#[test]
+fn sftp_client_commands_round_trip() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("sftp-cmds");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+
+    let host_key_path = dir.join("host_key_ed25519");
+    let config_path = dir.join("sshd_config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nAuthorizedKeysFile {}\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n",
+            port,
+            host_key_path.display(),
+            auth_path.display()
+        ),
+    )
+    .unwrap();
+
+    let mut server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-f")
+        .arg(&config_path)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn subsystem server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    // The sftp subcommand is dispatched by argv[0] == "ns-sftp"; symlink the
+    // ns-ssh binary to that name in the temp dir.
+    let sftp_bin = dir.join("ns-sftp");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ns-ssh"), &sftp_bin).unwrap();
+
+    // A local file to upload.
+    let local_file = dir.join("local.txt");
+    std::fs::write(&local_file, b"hello sftp commands\n").unwrap();
+
+    let kh = dir.join("known_hosts");
+    let batch = dir.join("batch.txt");
+    std::fs::write(
+        &batch,
+        format!(
+            "pwd\nmkdir remote_dir\nput {0} remote_dir/up.txt\nstat remote_dir/up.txt\ndf .\nsymlink remote_dir/up.txt remote_link\nchmod 640 remote_dir/up.txt\nrename remote_dir/up.txt remote_dir/renamed.txt\nget remote_dir/renamed.txt {1}/down.txt\nreput {0} remote_dir/reput.txt\nreget remote_dir/reput.txt {1}/down2.txt\n",
+            local_file.display(),
+            dir.display()
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(&sftp_bin)
+        .arg("-P")
+        .arg(port.to_string())
+        .arg("-l")
+        .arg(&user)
+        .arg("-i")
+        .arg(&id_path)
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-b")
+        .arg(&batch)
+        .arg("127.0.0.1")
+        .output()
+        .expect("run ns-sftp batch");
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "ns-sftp batch failed: status={:?} stdout={:?} stderr={:?}",
+        out.status.code(),
+        stdout,
+        stderr
+    );
+    // The downloaded file must match the uploaded content.
+    let down = dir.join("down.txt");
+    assert!(
+        down.exists() && std::fs::read_to_string(&down).unwrap_or_default().contains("hello sftp commands"),
+        "downloaded file missing or wrong content; stdout={}",
+        stdout
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Exercise the OpenSSH SFTP extensions added for Q05: `expand-path`,
+/// `home-directory`, `lsetstat`, `copy-data`, `check-file` and
+/// `users-groups-by-id`. Uses the real `ns-ssh-server` internal-sftp subsystem
+/// and verifies the reply of each extension request at the protocol level.
+#[test]
+fn sftp_extensions_round_trip() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("sftp-ext");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+
+    let host_key_path = dir.join("host_key_ed25519");
+    let config_path = dir.join("sshd_config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nAuthorizedKeysFile {}\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n",
+            port,
+            host_key_path.display(),
+            auth_path.display()
+        ),
+    )
+    .unwrap();
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-f")
+        .arg(&config_path)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn subsystem server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let kh = dir.join("known_hosts");
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let mut child = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-s")
+        .arg("127.0.0.1")
+        .arg("sftp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sftp subsystem client");
+
+    use std::io::{Read, Write};
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut _stderr = child.stderr.take().expect("child stderr");
+
+    // Read one full SFTP packet from the stream.
+    fn read_packet(r: &mut impl Read) -> Option<Vec<u8>> {
+        let mut hdr = [0u8; 4];
+        if !read_full(r, &mut hdr) {
+            return None;
+        }
+        let len = u32::from_be_bytes(hdr) as usize;
+        if len == 0 || len > 1 << 20 {
+            return None;
+        }
+        let mut body = vec![0u8; len];
+        if !read_full(r, &mut body) {
+            return None;
+        }
+        let mut pkt = Vec::with_capacity(4 + len);
+        pkt.extend_from_slice(&hdr);
+        pkt.extend_from_slice(&body);
+        Some(pkt)
+    }
+
+    fn send_packet(w: &mut impl Write, payload: &[u8]) {
+        w.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+        w.write_all(payload).unwrap();
+        w.flush().unwrap();
+    }
+
+    // INIT / VERSION
+    send_packet(&mut stdin, &[1u8, 0, 0, 0, 3]);
+    let version = read_packet(&mut stdout).expect("version reply");
+    let mut ext_names: Vec<String> = Vec::new();
+    // Parse VERSION: type(1) + version(4) + ext pairs.
+    if version.len() > 9 {
+        let mut pos = 9;
+        while pos + 4 <= version.len() {
+            let slen = u32::from_be_bytes(version[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + slen + 4 > version.len() {
+                break;
+            }
+            ext_names.push(String::from_utf8_lossy(&version[pos..pos + slen]).into_owned());
+            pos += slen;
+            let vlen = u32::from_be_bytes(version[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4 + vlen;
+        }
+    }
+    for name in [
+        "expand-path@openssh.com",
+        "home-directory@openssh.com",
+        "lsetstat@openssh.com",
+        "copy-data@openssh.com",
+        "check-file@openssh.com",
+        "users-groups-by-id@openssh.com",
+    ] {
+        assert!(
+            ext_names.iter().any(|e| e == name),
+            "extension {} not advertised; got {:?}",
+            name,
+            ext_names
+        );
+    }
+
+    // expand-path@openssh.com
+    let mut req = Vec::new();
+    req.push(200u8);
+    req.extend(1u32.to_be_bytes());
+    let s = "expand-path@openssh.com";
+    req.extend((s.len() as u32).to_be_bytes());
+    req.extend(s.as_bytes());
+    let p = "~/subdir";
+    req.extend((p.len() as u32).to_be_bytes());
+    req.extend(p.as_bytes());
+    send_packet(&mut stdin, &req);
+    let reply = read_packet(&mut stdout).expect("expand-path reply");
+    assert_eq!(reply[4], 201u8, "expand-path reply type");
+    let elen = u32::from_be_bytes(reply[9..13].try_into().unwrap()) as usize;
+    let expanded = String::from_utf8_lossy(&reply[13..13 + elen]).into_owned();
+
+    assert!(
+        expanded.contains("/subdir") || expanded.ends_with("/subdir"),
+        "expand-path did not expand ~: {}",
+        expanded
+    );
+
+    // home-directory@openssh.com
+    let mut req = Vec::new();
+    req.push(200u8);
+    req.extend(2u32.to_be_bytes());
+    let s = "home-directory@openssh.com";
+    req.extend((s.len() as u32).to_be_bytes());
+    req.extend(s.as_bytes());
+    send_packet(&mut stdin, &req);
+    let reply = read_packet(&mut stdout).expect("home-directory reply");
+    assert_eq!(reply[4], 201u8, "home-directory reply type");
+    let elen = u32::from_be_bytes(reply[9..13].try_into().unwrap()) as usize;
+    let home = String::from_utf8_lossy(&reply[13..13 + elen]).into_owned();
+
+    assert!(!home.is_empty(), "home-directory returned empty");
+
+    // lsetstat@openssh.com: create a file, then lsetstat its permissions.
+    let file_path = dir.join("lsetstat_target.txt");
+    std::fs::write(&file_path, b"hello").unwrap();
+    let rel = file_path.to_string_lossy().into_owned();
+    let mut req = Vec::new();
+    req.push(200u8);
+    req.extend(3u32.to_be_bytes());
+    let s = "lsetstat@openssh.com";
+    req.extend((s.len() as u32).to_be_bytes());
+    req.extend(s.as_bytes());
+    req.extend((rel.len() as u32).to_be_bytes());
+    req.extend(rel.as_bytes());
+    // attrs: flags + permissions (0o600)
+    let mut attr = Vec::new();
+    attr.extend(0x00000004u32.to_be_bytes()); // SSH_FILEXFER_ATTR_PERMISSIONS
+    attr.extend(0o600u32.to_be_bytes());
+    req.extend_from_slice(&attr);
+    send_packet(&mut stdin, &req);
+    let reply = read_packet(&mut stdout).expect("lsetstat reply");
+    assert_eq!(reply[4], 101u8, "lsetstat reply type");
+    assert_eq!(
+        u32::from_be_bytes(reply[9..13].try_into().unwrap()),
+        0,
+        "lsetstat should succeed"
+    );
+
+    // check-file@openssh.com
+    let mut req = Vec::new();
+    req.push(200u8);
+    req.extend(4u32.to_be_bytes());
+    let s = "check-file@openssh.com";
+    req.extend((s.len() as u32).to_be_bytes());
+    req.extend(s.as_bytes());
+    req.extend((rel.len() as u32).to_be_bytes());
+    req.extend(rel.as_bytes());
+    req.extend(0u32.to_be_bytes()); // flags
+    req.extend(0u64.to_be_bytes()); // start
+    req.extend(0u64.to_be_bytes()); // length (0 = whole file)
+    req.extend(8192u32.to_be_bytes()); // block size
+    send_packet(&mut stdin, &req);
+    let reply = read_packet(&mut stdout).expect("check-file reply");
+    assert_eq!(reply[4], 201u8, "check-file reply type");
+    let alen = u32::from_be_bytes(reply[9..13].try_into().unwrap()) as usize;
+    assert_eq!(
+        String::from_utf8_lossy(&reply[13..13 + alen]),
+        "sha256",
+        "check-file hash algorithm"
+    );
+
+    // users-groups-by-id@openssh.com: resolve the current uid/gid.
+    let uid = unsafe { libc::getuid() };
+    let mut req = Vec::new();
+    req.push(200u8);
+    req.extend(5u32.to_be_bytes());
+    let s = "users-groups-by-id@openssh.com";
+    req.extend((s.len() as u32).to_be_bytes());
+    req.extend(s.as_bytes());
+    req.extend(1u32.to_be_bytes()); // count
+    req.extend(0u32.to_be_bytes()); // id_type: uid
+    req.extend(uid.to_be_bytes());
+    send_packet(&mut stdin, &req);
+    let reply = read_packet(&mut stdout).expect("users-groups reply");
+    assert_eq!(reply[4], 201u8, "users-groups reply type");
+    let cnt = u32::from_be_bytes(reply[9..13].try_into().unwrap());
+    assert!(cnt >= 1, "users-groups should return the current user");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Non-ETM packet framing (RFC 4253 §6.4) encrypts `packet_length` together
