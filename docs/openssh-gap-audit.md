@@ -317,6 +317,8 @@ exit code：0
 首选 KEX 实测：OpenSSH 9.9 `-vvv`→ns-ssh-server 协商 `ecdh-sha2-nistp256`（双方共同首选项一致）；OpenSSH 的 `mlkem768x25519-sha256`（默认第 4 位）为唯一 KEX 差异。
 **残留（依赖阻塞）**：① `mlkem768x25519-sha256`（K07）：无 `ml-kem` 纯 Rust crate（crates.io 网络不可达、本地缓存无）；② `hmac-ripemd160`（M04）：本机 OpenSSH 9.9p2/LibreSSL 构建的 `ssh -Q mac` 不含 ripemd（LibreSSL 未启用 RIPEMD160），且本地无 `ripemd` crate。两者均按 §19 需产品决策。
 
+**D3 状态（2026-11-05 复核）**：✅ 判据达成。H05（证书 host key）已实现（`5aa3511`），`client_accepts_host_certificate_via_cert_authority` 集成测试通过：CA 签发 host cert 经 `@cert-authority` 可连接，无 marker 则拒绝。H08（`@cert-authority`/`@revoked`）完整实现：`@cert-authority` 由上述测试覆盖；`@revoked` 于 `bd45d51` 新增（`KnownHostEntry.revoked`、`check` 撤销优先、客户端无条件拒绝），`revoked_known_hosts_entry_refuses_connection` 集成测试通过（`StrictHostKeyChecking=no` 下仍拒绝）。H06（SK host key）于 `bd45d51` 实现验签（`SkHostKey`：解析 `sk-ssh-ed25519`/`sk-ecdsa-sha2-nistp256` blob、提取底层公钥验签、服务端 `create_signer_for_key` 支持 SK 用户认证验签），`sk_ed25519_host_key_parses_and_verifies` 单测通过；硬件签名需 FIDO2 传输，按指示暂不验证（签名路径返回"需 FIDO2 硬件"错误）。
+
 ## 19. 需要产品决策的选型（先确认再实现）
 
 1. **PAM / GSSAPI / 证书**：OpenSSH 的这些能力依赖系统库（PAM、GSSAPI）或新增纯 Rust 依赖，与原始“零第三方依赖”约束冲突。需要确认是否允许新增依赖或改为平台条件编译。
