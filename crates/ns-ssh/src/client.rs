@@ -1860,7 +1860,12 @@ impl SshClient {
             use rand::RngCore;
             rand::rngs::OsRng.fill_bytes(&mut cookie);
             let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
-            let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
+            let x11_data = build_x11_request(
+                self.config.forward_x11_trusted,
+                "MIT-MAGIC-COOKIE-1",
+                &cookie_hex,
+                0,
+            );
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
             self.send_packet(&x11_msg, false).await?;
             let _resp = self.recv_packet().await?;
@@ -3364,7 +3369,12 @@ impl SshClient {
             use rand::RngCore;
             rand::rngs::OsRng.fill_bytes(&mut cookie);
             let cookie_hex: String = cookie.iter().map(|b| format!("{:02x}", b)).collect();
-            let x11_data = build_x11_request(false, "MIT-MAGIC-COOKIE-1", &cookie_hex, 0);
+            let x11_data = build_x11_request(
+                self.config.forward_x11_trusted,
+                "MIT-MAGIC-COOKIE-1",
+                &cookie_hex,
+                0,
+            );
             let x11_msg = build_channel_request(local_id, msg::SSH_REQUEST_X11, true, Some(&x11_data));
             let stream = self.stream.as_mut().ok_or_else(|| SshError::Protocol("not connected".into()))?;
             send_encrypted_packet(stream, &x11_msg, &mut self.transport, false, aead).await?;

@@ -4098,3 +4098,159 @@ fn revoked_known_hosts_entry_refuses_connection() {
         "stderr should report the revoked key, got: {stderr_second}"
     );
 }
+
+/// ControlMaster multiplexing: a master keeps one connection on a Unix socket,
+/// `-O check` reports it alive, a second client with `ControlMaster=auto`
+/// reuses the socket (slave), and `-O exit` shuts the master down cleanly.
+#[test]
+fn control_master_multiplex_and_commands() {
+    let dir = temp_dir("ctrlmaster");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let ctl = dir.join("control.sock");
+    let ctl_arg = format!("ControlPath={}", ctl.display());
+
+    // Start the master (no remote command, stays connected and serves).
+    let master_args = base_client_args(port, &user, &id_path, &kh);
+    let master = Command::new(&master_args[0])
+        .args(&master_args[1..])
+        .arg("-o")
+        .arg("ControlMaster=yes")
+        .arg("-o")
+        .arg(&ctl_arg)
+        .arg("-N")
+        .arg("127.0.0.1")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn control master");
+
+    // Wait for the master socket to appear and accept connections.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&ctl).is_ok() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("control master socket did not appear");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // `-O check` must report the master alive.
+    let check_args = base_client_args(port, &user, &id_path, &kh);
+    let check = Command::new(&check_args[0])
+        .args(&check_args[1..])
+        .arg("-o")
+        .arg(&ctl_arg)
+        .arg("-O")
+        .arg("check")
+        .arg("127.0.0.1")
+        .output()
+        .expect("run -O check");
+    assert!(
+        check.status.success(),
+        "-O check failed: stderr={}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // A second client with ControlMaster=auto reuses the master connection.
+    let slave_args = base_client_args(port, &user, &id_path, &kh);
+    let slave = Command::new(&slave_args[0])
+        .args(&slave_args[1..])
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg(&ctl_arg)
+        .arg("127.0.0.1")
+        .arg("echo reused-master")
+        .output()
+        .expect("run slave through master");
+    assert!(
+        slave.status.success(),
+        "slave failed: stderr={}",
+        String::from_utf8_lossy(&slave.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&slave.stdout).contains("reused-master"),
+        "slave did not get command output: {}",
+        String::from_utf8_lossy(&slave.stdout)
+    );
+
+    // `-O exit` must terminate the master and free the socket.
+    let exit_args = base_client_args(port, &user, &id_path, &kh);
+    let exit = Command::new(&exit_args[0])
+        .args(&exit_args[1..])
+        .arg("-o")
+        .arg(&ctl_arg)
+        .arg("-O")
+        .arg("exit")
+        .arg("127.0.0.1")
+        .output()
+        .expect("run -O exit");
+    assert!(
+        exit.status.success(),
+        "-O exit failed: stderr={}",
+        String::from_utf8_lossy(&exit.stderr)
+    );
+
+    // Master must terminate on its own after the exit command (poll try_wait
+    // so a stuck master cannot hang the test forever).
+    let mut master = master;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut master_done = false;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = master.try_wait() {
+            master_done = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(master_done, "control master did not exit after -O exit");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S11: remote stderr must be delivered separately from stdout via
+/// SSH_MSG_CHANNEL_EXTENDED_DATA (type 1) and written to the local stderr,
+/// never mixed into stdout.
+#[test]
+fn remote_stderr_is_separated_from_stdout() {
+    let dir = temp_dir("stderr");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_test_server(&dir, port);
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("127.0.0.1")
+        .arg("echo out-marker; echo err-marker 1>&2")
+        .output()
+        .expect("run stderr client");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "client failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("out-marker"), "stdout missing marker: {stdout}");
+    assert!(
+        stderr.contains("err-marker"),
+        "stderr should carry the remote stderr, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("err-marker"),
+        "remote stderr leaked into stdout: {stdout}"
+    );
+}

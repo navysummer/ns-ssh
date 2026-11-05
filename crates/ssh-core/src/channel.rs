@@ -691,4 +691,17 @@ mod tests {
         assert_eq!(m.find_by_remote_id(0).map(|c| c.local_id), Some(1));
         assert_eq!(m.reply_recipient(7), None);
     }
+
+    /// X11 `single_connection` flag: `-Y` (trusted) must encode as 1, `-X`
+    /// (untrusted) as 0, and the cookie/protocol must follow.
+    #[test]
+    fn x11_request_trusted_flag_and_cookie() {
+        let trusted = build_x11_request(true, "MIT-MAGIC-COOKIE-1", "deadbeef", 0);
+        assert_eq!(trusted[0], 1, "trusted (-Y) must set single_connection");
+        let untrusted = build_x11_request(false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0);
+        assert_eq!(untrusted[0], 0, "untrusted (-X) must clear single_connection");
+        assert_eq!(untrusted.len(), trusted.len());
+        assert_eq!(&untrusted[1..], &trusted[1..], "cookie/protocol identical");
+    }
 }
+
