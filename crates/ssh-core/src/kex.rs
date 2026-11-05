@@ -260,6 +260,7 @@ impl ModpKex {
 }
 
 /// A group selected for a `diffie-hellman-group-exchange-*` negotiation.
+#[derive(Clone, Debug)]
 pub struct GexGroup {
     pub p: num_bigint::BigUint,
     pub g: num_bigint::BigUint,
@@ -304,6 +305,72 @@ pub fn select_gex_group(min: u32, nbits: u32, max: u32) -> Option<GexGroup> {
     let p = num_bigint::BigUint::from_str_radix(hex, 16).expect("valid hex");
     let g = num_bigint::BigUint::from(2u32);
     Some(GexGroup { p, g, exp_bytes })
+}
+
+/// Parse an OpenSSH `moduli` file, returning the usable DH-GEX groups.
+///
+/// Each data line has seven whitespace-separated fields:
+/// `date type tests tries size generator modulus`, where `size` is the prime
+/// length in bits and `modulus` is hex. Comment and malformed lines are
+/// skipped (OpenSSH's `moduli` has a `# Time Type ...` header comment).
+pub fn parse_moduli(content: &str) -> Vec<GexGroup> {
+    let mut groups = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let Ok(bits) = fields[4].parse::<u32>() else { continue };
+        let Ok(g) = num_bigint::BigUint::from_str_radix(fields[5], 10) else { continue };
+        let Ok(p) = num_bigint::BigUint::from_str_radix(fields[6], 16) else { continue };
+        if bits == 0 || p.bits() != u64::from(bits) || g < 2u32.into() {
+            continue;
+        }
+        groups.push(GexGroup { p, g, exp_bytes: (bits as usize + 7) / 8 });
+    }
+    groups
+}
+
+/// Like [`select_gex_group`], but prefer the groups supplied by `ModuliFile`.
+/// When `candidates` is empty, the built-in RFC 3526 groups are used.
+pub fn select_gex_group_with(
+    min: u32,
+    nbits: u32,
+    max: u32,
+    candidates: &[GexGroup],
+) -> Option<GexGroup> {
+    if candidates.is_empty() {
+        return select_gex_group(min, nbits, max);
+    }
+    let lo = min.max(1024);
+    if max < lo {
+        return None;
+    }
+    let target = u64::from(nbits).clamp(u64::from(lo), u64::from(max));
+    let mut best: Option<(u64, u64, &GexGroup)> = None;
+    for group in candidates {
+        let bits = group.p.bits();
+        if bits < u64::from(lo) || bits > u64::from(max) {
+            continue;
+        }
+        let distance = bits.abs_diff(target);
+        let better = match best {
+            None => true,
+            // Closer to the preferred size wins; on a tie the larger group is
+            // the more conservative choice (matching the built-in selection).
+            Some((best_distance, best_bits, _)) => {
+                distance < best_distance || (distance == best_distance && bits > best_bits)
+            }
+        };
+        if better {
+            best = Some((distance, bits, group));
+        }
+    }
+    best.map(|(_, _, group)| group.clone())
 }
 
 pub fn compute_gex_exchange_hash(
@@ -668,6 +735,35 @@ mod tests {
 
         // nbits outside [min, max] is clamped before choosing.
         assert_eq!(select_gex_group(2048, 16, 2048).unwrap().p.bits(), 2048);
+    }
+
+    #[test]
+    fn moduli_file_groups_are_parsed_and_selected() {
+        let content = format!(
+            "# Time Type Tests Tries Size Generator Modulus\n\
+             20200101 2 6 100 2048 2 {}\n\
+             wrong fields\n\
+             nothex 2 6 100 2048 2 ZZZZ\n",
+            GROUP14_P
+        );
+        let groups = parse_moduli(&content);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].p.bits(), 2048);
+        assert_eq!(groups[0].exp_bytes, 256);
+        assert_eq!(groups[0].g, num_bigint::BigUint::from(2u32));
+
+        // A file group inside the requested window is selected.
+        assert_eq!(
+            select_gex_group_with(2048, 2048, 2048, &groups).unwrap().p.bits(),
+            2048
+        );
+        // No candidate in range -> no group (no silent built-in fallback).
+        assert!(select_gex_group_with(4096, 4096, 8192, &groups).is_none());
+        // Empty list falls back to the built-in RFC 3526 groups.
+        assert_eq!(
+            select_gex_group_with(2048, 3072, 8192, &[]).unwrap().p.bits(),
+            4096
+        );
     }
 
     #[test]

@@ -572,6 +572,57 @@ fn rekey_mid_transfer_server_initiated() {
 }
 
 #[test]
+fn server_moduli_file_supplies_gex_group() {
+    let dir = temp_dir("moduli");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    // A one-line moduli file with the RFC 3526 2048-bit safe prime.
+    let moduli_path = dir.join("moduli");
+    std::fs::write(
+        &moduli_path,
+        format!("20200101 2 6 100 2048 2 {}\n", ssh_core::kex::GROUP14_P),
+    )
+    .unwrap();
+
+    let moduli_arg = format!("modulifile={}", moduli_path.display());
+    let (server, id_path, kh) = launch_test_server_extra(
+        &dir,
+        port,
+        &[
+            "-o",
+            &moduli_arg,
+            "-o",
+            "kexalgorithms=diffie-hellman-group-exchange-sha256",
+        ],
+    );
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("kexalgorithms=diffie-hellman-group-exchange-sha256")
+        .arg("127.0.0.1")
+        .arg("echo moduli-ok")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "client failed: status={:?}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "moduli-ok");
+}
+
+#[test]
 fn exec_round_trip_authorized_keys_command() {
     let server_bin = workspace_target_dir();
     if !server_bin.exists() {

@@ -106,6 +106,9 @@ fn main() {
                     config.ca_signature_algorithms =
                         parse_ca_signature_algorithms(value).unwrap_or_default();
                 }
+                "modulifile" | "moduli_file" => {
+                    config.moduli_file = Some(value.to_string());
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();

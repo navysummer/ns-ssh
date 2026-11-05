@@ -67,6 +67,19 @@ impl SshServer {
             self.auth.lock().await.load_revoked_keys(path)?;
         }
 
+        if let Some(path) = self.config.moduli_file.clone() {
+            let content = std::fs::read_to_string(&path).map_err(SshError::Io)?;
+            let groups = ssh_core::kex::parse_moduli(&content);
+            if groups.is_empty() {
+                return Err(SshError::Config(format!(
+                    "ModuliFile {} contains no usable DH-GEX groups",
+                    path
+                )));
+            }
+            tracing::info!("loaded {} DH-GEX groups from {}", groups.len(), path);
+            self.config.gex_groups = std::sync::Arc::new(groups);
+        }
+
         Ok(())
     }
 
@@ -422,9 +435,10 @@ async fn handle_connection(
                     _ => return Err(SshError::Protocol("expected gex request".into())),
                 };
                 // RFC 4419 §3: answer with a group inside [min, max], closest
-                // to the client's preferred size. Our supported groups are the
-                // RFC 3526 2048/4096/8192-bit safe primes.
-                let group = ssh_core::kex::select_gex_group(min, nbits, max)
+                // to the client's preferred size. Candidates come from
+                // ModuliFile when configured, otherwise the built-in RFC 3526
+                // 2048/4096/8192-bit safe primes.
+                let group = ssh_core::kex::select_gex_group_with(min, nbits, max, &config.gex_groups)
                     .ok_or_else(|| SshError::KexFailed(format!(
                         "no supported group-exchange modulus in requested range [{}, {}]",
                         min, max
@@ -4348,7 +4362,7 @@ fn rekey_disconnect_guard(packet: &[u8]) -> Result<()> {
 async fn perform_rekey_server(
     stream: &mut TcpStream,
     transport: &mut SshTransport,
-    _config: &ServerConfig,
+    config: &ServerConfig,
     host_keys: &Arc<Mutex<HostKeyManager>>,
     pre_received_client_kex: Option<Vec<u8>>,
     kex_sent: bool,
@@ -4415,7 +4429,7 @@ async fn perform_rekey_server(
             } else {
                 "diffie-hellman-group-exchange-sha1"
             };
-            let group = ssh_core::kex::select_gex_group(min, nbits, max)
+            let group = ssh_core::kex::select_gex_group_with(min, nbits, max, &config.gex_groups)
                 .ok_or_else(|| SshError::KexFailed(format!(
                     "no supported group-exchange modulus in requested range [{}, {}]",
                     min, max

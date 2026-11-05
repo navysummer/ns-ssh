@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::Deserialize;
 use ssh_core::error::{SshError, Result};
+use ssh_core::kex::GexGroup;
 
 /// Match a glob pattern (supports `*` and `?`) against text. Used for `Include` globs.
 fn simple_glob_match(pattern: &str, text: &str) -> bool {
@@ -346,6 +348,15 @@ pub struct ServerConfig {
     /// CASignatureAlgorithms: CA key types allowed to sign user certificates.
     #[serde(default)]
     pub ca_signature_algorithms: Vec<String>,
+
+    /// ModuliFile: path to the OpenSSH moduli file used for DH-GEX groups.
+    /// `None` keeps the built-in RFC 3526 groups.
+    #[serde(default)]
+    pub moduli_file: Option<String>,
+
+    /// Groups parsed from `moduli_file` at startup (empty = use built-ins).
+    #[serde(skip, default)]
+    pub gex_groups: Arc<Vec<GexGroup>>,
 
     /// Match blocks from sshd_config, evaluated per-connection.
     #[serde(skip, default)]
@@ -1231,6 +1242,8 @@ impl Default for ServerConfig {
             pubkey_accepted_algorithms: None,
             pubkey_auth_options: Vec::new(),
             ca_signature_algorithms: Vec::new(),
+            moduli_file: None,
+            gex_groups: Arc::new(Vec::new()),
             compression: false,
             password_auth: default_true(),
             kbd_interactive_auth: default_true(),
@@ -1540,6 +1553,9 @@ impl ServerConfig {
                 "casignaturealgorithms" | "ca_signature_algorithms" => {
                     config.ca_signature_algorithms = parse_ca_signature_algorithms(value)?;
                 }
+                "modulifile" | "moduli_file" => {
+                    config.moduli_file = Some(value.to_string());
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();
@@ -1834,7 +1850,6 @@ impl ServerConfig {
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
                 "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
-                | "modulifile" | "moduli_file"
                 | "rdomain"
                 | "sshdsessionpath" | "sshd_session_path"
                 | "versionaddendum" | "version_addendum"
@@ -2100,6 +2115,21 @@ Match User alice
         assert_eq!(r.ca_signature_algorithms, vec!["ssh-ed25519".to_string()]);
         let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.ca_signature_algorithms.is_empty());
+    }
+
+    #[test]
+    fn moduli_file_parsing() {
+        // Default: no file, built-in groups.
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.moduli_file.is_none());
+        assert!(cfg.gex_groups.is_empty());
+
+        let cfg = ServerConfig::parse("ModuliFile /etc/ssh/moduli\n").unwrap();
+        assert_eq!(cfg.moduli_file.as_deref(), Some("/etc/ssh/moduli"));
+
+        // ModuliFile is global-only: it must not leak into a Match block.
+        let cfg = ServerConfig::parse("Match User alice\n    ModuliFile /tmp/moduli\n");
+        assert!(cfg.is_err());
     }
 
     #[test]
