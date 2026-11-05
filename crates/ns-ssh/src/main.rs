@@ -1,6 +1,8 @@
 mod config;
 mod agent;
+mod agent_server;
 mod client;
+
 mod control;
 mod scp;
 mod sftp;
@@ -220,6 +222,22 @@ fn main() {
         })
         .unwrap_or(false);
 
+    let invoked_as_ssh_agent = std::env::args_os().next()
+        .map(|a| {
+            let name = std::path::PathBuf::from(a);
+            let base = name.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
+            base == "ssh-agent" || base == "ns-ssh-agent"
+        })
+        .unwrap_or(false);
+
+    let invoked_as_ssh_copy_id = std::env::args_os().next()
+        .map(|a| {
+            let name = std::path::PathBuf::from(a);
+            let base = name.file_name().map(|b| b.to_string_lossy().into_owned()).unwrap_or_default();
+            base == "ssh-copy-id" || base == "ns-ssh-copy-id"
+        })
+        .unwrap_or(false);
+
     // Logging is initialized after config resolution so `-v`/LogLevel can apply.
 
     // If invoked as "scp" or "ns-scp", route to the SCP subcommand with
@@ -250,6 +268,18 @@ fn main() {
     // If invoked as "ssh-add" or "ns-ssh-add", route to ssh-add.
     if invoked_as_ssh_add {
         let code = run_ssh_add_mode();
+        std::process::exit(code);
+    }
+
+    // If invoked as "ssh-agent" or "ns-ssh-agent", route to the agent daemon.
+    if invoked_as_ssh_agent {
+        let code = run_ssh_agent_mode();
+        std::process::exit(code);
+    }
+
+    // If invoked as "ssh-copy-id" or "ns-ssh-copy-id", route to copy-id.
+    if invoked_as_ssh_copy_id {
+        let code = run_ssh_copy_id_mode();
         std::process::exit(code);
     }
 
@@ -1705,6 +1735,354 @@ fn run_ssh_add_mode() -> i32 {
                 }
             }
             if ok { 0 } else { 1 }
+        }
+    })
+}
+
+/// `ns-ssh-agent` / `ssh-agent`: hold private keys and serve the agent
+/// protocol over a UNIX socket. Supports `-D` (foreground), `-a <socket>`
+/// (bind path), `-k` (kill the running agent), and the `command [args]`
+/// form that execs a command with `SSH_AUTH_SOCK`/`SSH_AGENT_PID` exported.
+fn run_ssh_agent_mode() -> i32 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut foreground = false;
+    let mut kill = false;
+    let mut socket: Option<String> = None;
+    let mut command: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-D" => foreground = true,
+            "-d" => foreground = true,
+            "-k" => kill = true,
+            "-a" => {
+                i += 1;
+                if i < args.len() { socket = Some(args[i].clone()); }
+            }
+            "-c" | "-s" | "-E" | "-O" | "-P" | "-t" => {
+                // Shell-mode selector, fingerprint hash, options, allowed
+                // providers and lifetime are accepted but not required for a
+                // pure-Rust agent; consume a value where the option takes one.
+                if a == "-E" || a == "-O" || a == "-P" || a == "-t" {
+                    i += 1;
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: ns-ssh-agent [-D] [-a bind_address] [-k] [command [arg ...]]"
+                );
+                return 1;
+            }
+            _ => {
+                if a.starts_with('-') {
+                    eprintln!("ns-ssh-agent: unknown option {}", a);
+                    return 1;
+                }
+                command = args[i..].to_vec();
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    // `ssh-agent -k`: terminate the agent whose PID is in $SSH_AGENT_PID.
+    if kill {
+        if let Ok(pid_str) = std::env::var("SSH_AGENT_PID") {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                return 0;
+            }
+        }
+        eprintln!("ns-ssh-agent: could not find agent to kill (is SSH_AGENT_PID set?)");
+        return 1;
+    }
+
+    let socket_path = socket
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(agent_server::default_socket_path);
+    if let Err(e) = agent_server::prepare_socket_dir(&socket_path) {
+        eprintln!("ns-ssh-agent: prepare socket dir: {}", e);
+        return 1;
+    }
+
+    // `ssh-agent <command> [args]`: start a background agent, wait for its
+    // socket, export SSH_AUTH_SOCK/SSH_AGENT_PID, run the command, then tear
+    // the agent down when the command exits (mirrors OpenSSH ssh-agent).
+    if !command.is_empty() {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            eprintln!("ns-ssh-agent: fork failed");
+            return 1;
+        }
+        if child == 0 {
+            // Detached agent process: serve the socket forever.
+            unsafe { libc::setsid(); }
+            let path = socket_path.clone();
+            let _ = agent_server::run_agent_foreground(&path);
+            std::process::exit(0);
+        }
+        // Parent: wait for the socket to appear, then run the command.
+        let mut appeared = false;
+        for _ in 0..100 {
+            if socket_path.exists() {
+                appeared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !appeared {
+            unsafe { libc::kill(child, libc::SIGKILL); }
+            eprintln!("ns-ssh-agent: socket did not appear");
+            return 1;
+        }
+        let status = {
+            let mut cmd = std::process::Command::new(&command[0]);
+            cmd.args(&command[1..]);
+            cmd.env("SSH_AUTH_SOCK", &socket_path);
+            cmd.env("SSH_AGENT_PID", child.to_string());
+            cmd.status()
+        };
+        // Tear the agent down when the command finishes.
+        unsafe { libc::kill(child, libc::SIGTERM); }
+        let _ = std::fs::remove_file(&socket_path);
+        return status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+    }
+
+    // Foreground (`-D`) or default background mode.
+    if foreground {
+        if let Err(e) = agent_server::run_agent_foreground(&socket_path) {
+            eprintln!("ns-ssh-agent: {}", e);
+            return 1;
+        }
+        return 0;
+    }
+
+    // Default: fork to background, print env exports.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("ns-ssh-agent: fork failed");
+            return 1;
+        }
+        if pid > 0 {
+            // Parent: print the env and return to the shell.
+            println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", socket_path.display());
+            println!("SSH_AGENT_PID={}; export SSH_AGENT_PID;", pid);
+            return 0;
+        }
+        // Child: detach and serve.
+        libc::setsid();
+    }
+    if let Err(e) = agent_server::run_agent_foreground(&socket_path) {
+        eprintln!("ns-ssh-agent: {}", e);
+        return 1;
+    }
+    0
+}
+
+/// `ns-ssh-copy-id` / `ssh-copy-id`: install the local public key(s) into the
+/// remote account's `~/.ssh/authorized_keys`. Uses the existing ssh client to
+/// run a remote command that appends the key line.
+fn run_ssh_copy_id_mode() -> i32 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut force = false;
+    let mut dry_run = false;
+    let mut id_file: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut ssh_options: Vec<String> = Vec::new();
+    let mut target: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-f" => force = true,
+            "-n" => dry_run = true,
+            "-i" => {
+                i += 1;
+                if i < args.len() { id_file = Some(args[i].clone()); }
+            }
+            "-p" => {
+                i += 1;
+                if i < args.len() { port = Some(args[i].clone()); }
+            }
+            "-o" => {
+                i += 1;
+                if i < args.len() { ssh_options.push(args[i].clone()); }
+            }
+            "-F" => {
+                i += 1;
+                if i < args.len() { ssh_options.push(format!("-F {}", args[i])); }
+            }
+            "-h" | "-?" | "--help" => {
+                eprintln!("usage: ns-ssh-copy-id [-f] [-n] [-i identity_file] [-p port] [-o option] [user@]hostname");
+                return 1;
+            }
+            _ => {
+                if a.starts_with('-') {
+                    eprintln!("ns-ssh-copy-id: unknown option {}", a);
+                    return 1;
+                }
+                target = Some(a.clone());
+            }
+        }
+        i += 1;
+    }
+
+    let target = match target {
+        Some(t) => t,
+        None => {
+            eprintln!("ns-ssh-copy-id: missing hostname");
+            return 1;
+        }
+    };
+
+    // Determine the public key line(s) to install.
+    let key_lines: Vec<String> = if let Some(id) = &id_file {
+        let pub_path = if id.ends_with(".pub") {
+            id.clone()
+        } else {
+            format!("{}.pub", id)
+        };
+        match std::fs::read_to_string(&pub_path) {
+            Ok(content) => {
+                let line = content.lines().next().unwrap_or("").trim().to_string();
+                if line.is_empty() {
+                    eprintln!("ns-ssh-copy-id: {} is empty", pub_path);
+                    return 1;
+                }
+                vec![line]
+            }
+            Err(e) => {
+                eprintln!("ns-ssh-copy-id: failed to read {}: {}", pub_path, e);
+                return 1;
+            }
+        }
+    } else if let Ok(agent_lines) = load_agent_public_keys() {
+        agent_lines
+    } else {
+        // Fall back to the newest default identity file.
+        let home = dirs::home_dir().unwrap_or_default();
+        let ssh_dir = home.join(".ssh");
+        let mut candidates: Vec<_> = std::fs::read_dir(&ssh_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "pub").unwrap_or(false))
+            .filter(|e| !e.path().to_string_lossy().contains("-cert.pub"))
+            .map(|e| e.path())
+            .collect();
+        candidates.sort();
+        candidates.into_iter().filter_map(|p| {
+            std::fs::read_to_string(&p).ok().and_then(|c| {
+                c.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
+            })
+        }).collect()
+    };
+
+    if key_lines.is_empty() {
+        eprintln!("ns-ssh-copy-id: no identity file found (use -i)");
+        return 1;
+    }
+
+    // Build the remote command: append each key line to authorized_keys unless
+    // already present (or force).
+    let mut remote_cmd = String::new();
+    remote_cmd.push_str("umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys; ");
+    for line in &key_lines {
+        let escaped = line.replace('\'', "'\\''");
+        if force {
+            remote_cmd.push_str(&format!("echo '{}' >> ~/.ssh/authorized_keys; ", escaped));
+        } else {
+            remote_cmd.push_str(&format!(
+                "grep -qxF '{}' ~/.ssh/authorized_keys 2>/dev/null || echo '{}' >> ~/.ssh/authorized_keys; ",
+                escaped, escaped
+            ));
+        }
+    }
+
+    if dry_run {
+        println!("Would copy {} key(s) to {}", key_lines.len(), target);
+        for l in &key_lines {
+            println!("  {}", l);
+        }
+        return 0;
+    }
+
+    // Invoke the embedded ns-ssh client. `current_exe` may point at a symlink
+    // named `ns-ssh-copy-id`, which would re-enter this mode; canonicalize so
+    // the child dispatches as `ns-ssh` (ssh client mode).
+    let exe = std::fs::canonicalize(std::env::current_exe().unwrap_or_default())
+        .unwrap_or_else(|_| std::env::current_exe().unwrap_or_default());
+    let mut cmd = std::process::Command::new(exe);
+    for opt in &ssh_options {
+        // Each `-o`/`-F` value is stored without its flag; re-attach it.
+        if opt.starts_with("-F ") {
+            cmd.arg("-F").arg(&opt[3..]);
+        } else if opt.starts_with("-o ") {
+            cmd.arg("-o").arg(&opt[3..]);
+        } else if opt.starts_with('-') {
+            cmd.arg(opt);
+        } else {
+            cmd.arg("-o").arg(opt);
+        }
+    }
+    // When `-i <file>` was given, the private key sits at the same path with
+    // `.pub` stripped; hand it to the ssh client so authentication succeeds.
+    if let Some(id) = &id_file {
+        let priv_path = if id.ends_with(".pub") {
+            id.trim_end_matches(".pub").to_string()
+        } else {
+            id.clone()
+        };
+        cmd.arg("-i").arg(&priv_path);
+    }
+    if let Some(p) = &port {
+        cmd.arg("-p").arg(p);
+    }
+    cmd.arg(&target).arg(remote_cmd);
+    let status = cmd.status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("Now try logging into the machine, with: \"ssh {} \"", target);
+            println!("and check to make sure that only the key(s) you wanted were added.");
+            0
+        }
+        Ok(s) => {
+            eprintln!("ns-ssh-copy-id: ssh exited with {}", s.code().unwrap_or(-1));
+            1
+        }
+        Err(e) => {
+            eprintln!("ns-ssh-copy-id: failed to run ssh: {}", e);
+            1
+        }
+    }
+}
+
+/// Read public keys from the agent (`ssh-add -L` equivalent) for copy-id.
+fn load_agent_public_keys() -> Result<Vec<String>, ()> {
+    let agent = agent::SshAgent::new();
+    if !agent.is_available() {
+        return Err(());
+    }
+    let rt = tokio::runtime::Runtime::new().map_err(|_| ())?;
+    rt.block_on(async {
+        match agent.request_identities().await {
+            Ok(ids) => {
+                let mut out = Vec::new();
+                for (_, blob) in &ids {
+                    let alg = agent::blob_algorithm(blob).unwrap_or_else(|| "unknown".to_string());
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(blob);
+                    out.push(format!("{} {}", alg, b64));
+                }
+                Ok(out)
+            }
+            Err(_) => Err(()),
         }
     })
 }

@@ -10,7 +10,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Ciphers: ChaCha20-Poly1305, AES-128/192/256-CTR, AES-128/256-GCM, AES-CBC, 3DES-CBC
 - MAC: HMAC-SHA2-256/512, HMAC-SHA1, UMAC-64/128 (including the ETM variants)
 - Host key algorithms: Ed25519, ECDSA P-256/384/521, RSA (rsa-sha2-256/512)
-- Authentication: Public key, Password, SSH Agent
+- Authentication: Public key, Password, SSH Agent (client + `ns-ssh-agent` daemon)
 - Session management with PTY support
 - Remote command execution
 - Interactive shell
@@ -103,6 +103,38 @@ ns-ssh-server -D
 # Use custom config file
 ns-ssh-server -f /path/to/sshd_config
 ```
+
+
+### Companion tools
+
+The `ns-ssh` binary dispatches by `argv[0]`, so symlink it under the tool name
+to use each one (the `ns-*` prefix is the project-native name; the plain names
+are also accepted):
+
+```bash
+for t in ns-ssh ns-ssh-add ns-ssh-agent ns-ssh-copy-id ns-ssh-keyscan ns-ssh-keygen; do
+  ln -sf "$(command -v ns-ssh)" "$t"
+done
+
+# key generation
+ns-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+
+# agent daemon (holds private keys, exports SSH_AUTH_SOCK/SSH_AGENT_PID)
+eval "$(ns-ssh-agent -s)"
+ns-ssh-add ~/.ssh/id_ed25519
+ns-ssh-add -l          # list identities
+ns-ssh-add -L          # list public keys
+ns-ssh-add -D          # remove all
+
+# copy a public key to a remote account's authorized_keys
+ns-ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
+
+# scan a host's public keys into known_hosts
+ns-ssh-keyscan host > ~/.ssh/known_hosts
+```
+
+All five interoperate with the real OpenSSH tools: `ssh-add`/`ssh` work against
+`ns-ssh-agent`, and `ns-ssh-add`/`ns-ssh` work against a real `ssh-agent`.
 
 ## Configuration
 

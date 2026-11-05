@@ -1871,6 +1871,189 @@ fn ssh_add_adds_identity_to_agent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `ns-ssh-agent` daemon: start it on a private socket, add an identity via
+/// the real system `ssh-add`, then authenticate a real `ssh` connection using
+/// a key held only in the daemon. Exercises REQUEST_IDENTITIES, ADD_IDENTITY
+/// and SIGN_REQUEST against the OpenSSH agent protocol.
+#[test]
+fn ns_ssh_agent_serves_identities_and_signs() {
+    if Command::new("ssh-add").arg("-l").output().is_err() {
+        eprintln!("skipping: system ssh-add not available");
+        return;
+    }
+    if Command::new("ssh").arg("-V").output().is_err() {
+        eprintln!("skipping: system ssh not available");
+        return;
+    }
+
+    let dir = temp_dir("ns-ssh-agent");
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let agent_link = dir.join("ns-ssh-agent");
+    let ssh_add_link = dir.join("ns-ssh-add");
+    let keygen_link = dir.join("ns-ssh-keygen");
+    std::os::unix::fs::symlink(client_bin, &agent_link).unwrap();
+    std::os::unix::fs::symlink(client_bin, &ssh_add_link).unwrap();
+    std::os::unix::fs::symlink(client_bin, &keygen_link).unwrap();
+
+    // Generate a key with our own keygen.
+    let key_path = dir.join("test_key");
+    let out = Command::new(&keygen_link)
+        .arg("-t").arg("ed25519")
+        .arg("-f").arg(&key_path)
+        .arg("-q")
+        .output().expect("run ns-ssh-keygen");
+    assert!(out.status.success(), "keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Start the daemon in the foreground on a private socket.
+    let sock = dir.join("agent.sock");
+    let mut agent = Command::new(&agent_link)
+        .arg("-D")
+        .arg("-a").arg(&sock)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn().expect("spawn ns-ssh-agent");
+    // Wait for the socket to appear.
+    let mut ok = false;
+    for _ in 0..50 {
+        if sock.exists() { ok = true; break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ok, "ns-ssh-agent socket did not appear");
+
+    // Add the key via the real system ssh-add (protocol interop).
+    let out = Command::new("ssh-add")
+        .arg(&key_path)
+        .env("SSH_AUTH_SOCK", &sock)
+        .output().expect("system ssh-add");
+    assert!(
+        out.status.success(),
+        "system ssh-add against ns-ssh-agent failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The real ssh-add must see exactly one identity.
+    let out = Command::new("ssh-add")
+        .arg("-l")
+        .env("SSH_AUTH_SOCK", &sock)
+        .output().expect("system ssh-add -l");
+    let list = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        list.contains("ED25519"),
+        "expected an ED25519 identity from ns-ssh-agent, got: {:?}",
+        list
+    );
+
+    // Now authenticate a real ssh connection using the agent-held key.
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, _id_path, kh) = launch_test_server(&dir, port);
+    let pub_line = std::fs::read_to_string(dir.join("test_key.pub")).unwrap_or_default();
+    let pub_line = pub_line.trim().to_string();
+    // The server's authorized_keys already contains launch_test_server's own
+    // key; add our agent key so the agent-held identity authenticates.
+    let mut auth = std::fs::read_to_string(dir.join("authorized_keys")).unwrap_or_default();
+    auth.push_str(&format!("{}\n", pub_line));
+    std::fs::write(dir.join("authorized_keys"), auth).unwrap();
+
+    let out = Command::new("ssh")
+        .arg("-p").arg(port.to_string())
+        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("BatchMode=yes")
+        .arg(format!("{}@127.0.0.1", user))
+        .arg("echo AGENT_SIGN_OK")
+        .env("SSH_AUTH_SOCK", &sock)
+        .output().expect("real ssh via ns-ssh-agent");
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("AGENT_SIGN_OK"),
+        "real ssh auth via ns-ssh-agent failed: status={:?} stdout={} stderr={}",
+        out.status.code(), stdout, String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ns-ssh-copy-id`: install a public key into the remote authorized_keys via
+/// the embedded client, and verify the key line is appended.
+#[test]
+fn ns_ssh_copy_id_installs_key() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("ns-ssh-copy-id");
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let copy_id_link = dir.join("ns-ssh-copy-id");
+    let keygen_link = dir.join("ns-ssh-keygen");
+    std::os::unix::fs::symlink(client_bin, &copy_id_link).unwrap();
+    std::os::unix::fs::symlink(client_bin, &keygen_link).unwrap();
+
+    let key_path = dir.join("copy_key");
+    let out = Command::new(&keygen_link)
+        .arg("-t").arg("ed25519")
+        .arg("-f").arg(&key_path)
+        .arg("-q")
+        .output().expect("run ns-ssh-keygen");
+    assert!(out.status.success(), "keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, _id_path, kh) = launch_test_server(&dir, port);
+
+    // The server must accept the copy_key public key so the embedded ssh
+    // client authenticates when copy-id runs its remote command.
+    let pub_line = std::fs::read_to_string(dir.join("copy_key.pub"))
+        .unwrap_or_default().trim().to_string();
+    let mut auth = std::fs::read_to_string(dir.join("authorized_keys")).unwrap_or_default();
+    if !auth.contains(&pub_line) {
+        auth.push_str(&format!("{}\n", pub_line));
+        std::fs::write(dir.join("authorized_keys"), auth).unwrap();
+    }
+
+    let run_copy_id = || {
+        Command::new(&copy_id_link)
+            .arg("-i").arg(dir.join("copy_key.pub"))
+            .arg("-p").arg(port.to_string())
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+            .arg("-o").arg("BatchMode=yes")
+            .arg(format!("{}@127.0.0.1", user))
+            .output().expect("run ns-ssh-copy-id")
+    };
+
+    // First run: must succeed and print the confirmation.
+    let out = run_copy_id();
+    assert!(
+        out.status.success(),
+        "ns-ssh-copy-id failed: status={:?} stderr={}",
+        out.status.code(), String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Now try logging into"),
+        "unexpected copy-id output: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Second run: idempotent (key already installed on the remote side).
+    let out2 = run_copy_id();
+    assert!(
+        out2.status.success(),
+        "second ns-ssh-copy-id failed: status={:?} stderr={}",
+        out2.status.code(), String::from_utf8_lossy(&out2.stderr)
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Shared helper: generate a client key + authorized_keys + host key, launch the
 /// test server on `port`, and return `(server_child, id_path, kh_path, dir)`.
 fn launch_test_server(
