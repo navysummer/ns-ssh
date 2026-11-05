@@ -339,6 +339,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub disable_forwarding: bool,
 
+    /// PubkeyAuthOptions: touch-required / verify-required (empty = none).
+    #[serde(default)]
+    pub pubkey_auth_options: Vec<String>,
+
     /// Match blocks from sshd_config, evaluated per-connection.
     #[serde(skip, default)]
     pub match_blocks: Vec<ServerMatch>,
@@ -358,6 +362,7 @@ pub struct MatchOverrides {
     pub permit_root_login_mode: Option<String>,
     pub password_auth: Option<bool>,
     pub pubkey_auth: Option<bool>,
+    pub pubkey_auth_options: Option<Vec<String>>,
     pub kbd_interactive_auth: Option<bool>,
     pub allow_tcp_forwarding_mode: Option<String>,
     pub x11_forwarding: Option<bool>,
@@ -496,6 +501,7 @@ impl ServerMatch {
         }
         if let Some(v) = o.password_auth { cfg.password_auth = v; }
         if let Some(v) = o.pubkey_auth { cfg.pubkey_auth = v; }
+        if let Some(v) = &o.pubkey_auth_options { cfg.pubkey_auth_options = v.clone(); }
         if let Some(v) = o.kbd_interactive_auth { cfg.kbd_interactive_auth = v; }
         if let Some(v) = &o.allow_tcp_forwarding_mode { cfg.allow_tcp_forwarding_mode = v.clone(); }
         if let Some(v) = o.x11_forwarding { cfg.x11_forwarding = v; }
@@ -571,6 +577,9 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "passwordauthentication" | "password_auth" => o.password_auth = Some(value == "yes"),
         "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
             o.pubkey_auth = Some(value == "yes");
+        }
+        "pubkeyauthoptions" | "pubkey_auth_options" => {
+            o.pubkey_auth_options = Some(parse_pubkey_auth_options(value)?);
         }
         "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
         | "challengeresponseauthentication" | "challenge_response_authentication"
@@ -701,7 +710,6 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
         "casignaturealgorithms" | "ca_signature_algorithms"
         | "hostcertificate" | "host_certificate"
-        | "pubkeyauthoptions" | "pubkey_auth_options"
         | "requiredrsasize" | "required_rsa_size"
         | "disableforwarding" | "disable_forwarding"
         | "permittunnel" | "permit_tunnel"
@@ -831,6 +839,28 @@ pub fn parse_time_suffix(tok: &str) -> Option<u64> {
         _ => return None,
     };
     digits.parse::<u64>().ok().map(|n| n.saturating_mul(mult))
+}
+
+/// Parse an OpenSSH `PubkeyAuthOptions` value: a comma-separated set of
+/// `touch-required` and `verify-required`.
+pub fn parse_pubkey_auth_options(value: &str) -> Result<Vec<String>> {
+    let mut opts = Vec::new();
+    for raw in value.split(',') {
+        let opt = raw.trim().to_ascii_lowercase();
+        if opt.is_empty() {
+            continue;
+        }
+        match opt.as_str() {
+            "touch-required" | "verify-required" => opts.push(opt),
+            other => {
+                return Err(SshError::Config(format!(
+                    "Invalid PubkeyAuthOptions value '{}'",
+                    other
+                )))
+            }
+        }
+    }
+    Ok(opts)
 }
 
 /// Parse an OpenSSH `AuthenticationMethods` value. Whitespace separates
@@ -1175,6 +1205,7 @@ impl Default for ServerConfig {
             rekey_limit_bytes: default_rekey_bytes(),
             rekey_limit_time: default_rekey_seconds(),
             pubkey_accepted_algorithms: None,
+            pubkey_auth_options: Vec::new(),
             compression: false,
             password_auth: default_true(),
             kbd_interactive_auth: default_true(),
@@ -1478,6 +1509,9 @@ impl ServerConfig {
                 "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
                     config.pubkey_auth = value == "yes";
                 }
+                "pubkeyauthoptions" | "pubkey_auth_options" => {
+                    config.pubkey_auth_options = parse_pubkey_auth_options(value)?;
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();
@@ -1774,7 +1808,6 @@ impl ServerConfig {
                 "casignaturealgorithms" | "ca_signature_algorithms"
                 | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
                 | "modulifile" | "moduli_file"
-                | "pubkeyauthoptions" | "pubkey_auth_options"
                 | "rdomain"
                 | "sshdsessionpath" | "sshd_session_path"
                 | "versionaddendum" | "version_addendum"
@@ -1983,6 +2016,36 @@ Match User alice
         );
         let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.hostbased_accepted_algorithms.is_none());
+    }
+
+    #[test]
+    fn pubkey_auth_options_parsing() {
+        // Default: no restriction.
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.pubkey_auth_options.is_empty());
+
+        // touch-required / verify-required are accepted, comma-separated.
+        let cfg = ServerConfig::parse("PubkeyAuthOptions touch-required\n").unwrap();
+        assert_eq!(cfg.pubkey_auth_options, vec!["touch-required".to_string()]);
+        let cfg = ServerConfig::parse("PubkeyAuthOptions verify-required,touch-required\n")
+            .unwrap();
+        assert_eq!(
+            cfg.pubkey_auth_options,
+            vec!["verify-required".to_string(), "touch-required".to_string()]
+        );
+
+        // Any other value is rejected, as in OpenSSH.
+        assert!(ServerConfig::parse("PubkeyAuthOptions bogus\n").is_err());
+
+        // Match blocks may override it.
+        let cfg = ServerConfig::parse(
+            "Match User alice\n    PubkeyAuthOptions verify-required\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
+        assert_eq!(r.pubkey_auth_options, vec!["verify-required".to_string()]);
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
+        assert!(r.pubkey_auth_options.is_empty());
     }
 
     #[test]

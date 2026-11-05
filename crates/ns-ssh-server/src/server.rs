@@ -993,6 +993,28 @@ async fn handle_authenticated_session(
                         let key_type = SshString::decode(&mut r)?.as_str()?.to_string();
                         let public_key = SshBytes::decode(&mut r)?.0;
 
+                        // PubkeyAuthOptions: touch-required/verify-required
+                        // restrict pubkey authentication to FIDO security keys.
+                        // (ns-ssh has no sk-* signature verification, so an
+                        // accepted security key still fails later at verify;
+                        // the gate's purpose is rejecting non-SK keys.)
+                        if !config.pubkey_auth_options.is_empty()
+                            && !ssh_core::cert::base_key_type_for(&key_type)
+                                .unwrap_or(&key_type)
+                                .starts_with("sk-")
+                        {
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                enabled_auth_methods(&config),
+                            );
+                            send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                            if config.auth_failure_delay > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(config.auth_failure_delay)).await;
+                            }
+                            continue;
+                        }
+
                         // PubkeyAcceptedAlgorithms: reject client algorithms
                         // that are not in the server's allowed set. Certificate
                         // key types are judged by their underlying key type.

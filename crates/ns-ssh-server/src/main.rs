@@ -5,6 +5,7 @@ mod session;
 mod server;
 
 use config::ServerConfig;
+use config::parse_pubkey_auth_options;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -95,6 +96,10 @@ fn main() {
                 }
                 "pubkeyauthentication" | "pubkey_auth" | "dsaauthentication" => {
                     config.pubkey_auth = value == "yes";
+                }
+                "pubkeyauthoptions" | "pubkey_auth_options" => {
+                    config.pubkey_auth_options =
+                        parse_pubkey_auth_options(value).unwrap_or_default();
                 }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
