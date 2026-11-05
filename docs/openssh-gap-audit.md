@@ -309,6 +309,10 @@ exit code：0
 | D7 | CLI 与服务端兼容 | L01、L02、L04、L05、L06、L07、V01、V03、V05、V06 | `ssh -h`/`sshd -h`/`-Q help` 差异有清单；未知指令行为与 OpenSSH 一致；失败退出码 255 |
 | D8 | 测试与门禁 | T01、W04 | 集成测试可并行（或明确标记 serial）；零警告门禁可执行 |
 
+**D1 状态（2026-11-05 复核）**：✅ 已完成。P04/P07/P14/P15/P16 的"未提交修复"已随提交 `019714b`、`08f3362` 落地；P10（kex-strict Terrapin 防护）已随 `bbe1679` 实现并有 `strict_kex_*` 单测（transport.rs:1448-1530）；M05/K05/H04 已随 `046f127` 默认列表对齐 OpenSSH 9.9；C06 默认 cipher 顺序于 `8f043f9` 对齐（GCM 首选）。
+完成判据实测：`non_etm_exec_round_trip`/`gcm_exec_round_trip`/`large_upload_to_non_echoing_command_completes`/`sntrup_hybrid_kex_round_trip`/`umac_mac_negotiation_round_trip` 全绿；`ns-ssh -Q cipher` 与 `ssh -G` 逐项一致；OpenSSH 9.9 `ssh -vvv`→ns-ssh-server 协商出 `aes128-gcm@openssh.com` + `ssh-ed25519` host key；ns-ssh 客户端→OpenSSH 9.9 sshd 双向互通。
+**残留（不属于 D1 判据，归入 D2）**：KEX 默认列表仍缺 OpenSSH 9.9 第 4 位 `mlkem768x25519-sha256`（ML-KEM-768 混合 KEX）；全仓无 mlkem 实现、无可用 `ml-kem` 纯 Rust crate（2026-11-05 网络不可达 crates.io，本地 cargo 缓存无 ml-kem crate），外部依赖不可得，按 §19.2 需产品决策。
+
 ## 19. 需要产品决策的选型（先确认再实现）
 
 1. **PAM / GSSAPI / 证书**：OpenSSH 的这些能力依赖系统库（PAM、GSSAPI）或新增纯 Rust 依赖，与原始“零第三方依赖”约束冲突。需要确认是否允许新增依赖或改为平台条件编译。
