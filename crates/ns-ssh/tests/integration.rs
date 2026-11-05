@@ -623,6 +623,35 @@ fn server_moduli_file_supplies_gex_group() {
 }
 
 #[test]
+fn tunnel_mode_is_rejected_with_clear_error() {
+    let dir = temp_dir("tunnel-reject");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let id_path = dir.join("id_ed25519");
+    let kh = dir.join("known_hosts");
+    std::fs::write(&kh, "").unwrap();
+
+    let args = base_client_args(port, &user, &id_path, &kh);
+    let output = Command::new(&args[0])
+        .args(&args[1..])
+        .arg("-o")
+        .arg("Tunnel=yes")
+        .arg("127.0.0.1")
+        .arg("echo hi")
+        .output()
+        .expect("run client");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Tunnel yes is not supported"),
+        "unexpected stderr: {}",
+        stderr
+    );
+}
+
+#[test]
 fn exec_round_trip_authorized_keys_command() {
     let server_bin = workspace_target_dir();
     if !server_bin.exists() {

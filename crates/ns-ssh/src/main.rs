@@ -1612,6 +1612,12 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(v) = &h.bind_interface {
             resolved.bind_interface = Some(v.clone());
         }
+        if let Some(v) = &h.tunnel {
+            resolved.tunnel = Some(v.clone());
+        }
+        if let Some(v) = &h.tunnel_device {
+            resolved.tunnel_device = Some(v.clone());
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1806,6 +1812,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = &host_config.bind_interface {
                 resolved.bind_interface = Some(v.clone());
+            }
+            if let Some(v) = &host_config.tunnel {
+                resolved.tunnel = Some(v.clone());
+            }
+            if let Some(v) = &host_config.tunnel_device {
+                resolved.tunnel_device = Some(v.clone());
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2112,6 +2124,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &mc.bind_interface {
                 resolved.bind_interface = Some(v.clone());
             }
+            if let Some(v) = &mc.tunnel {
+                resolved.tunnel = Some(v.clone());
+            }
+            if let Some(v) = &mc.tunnel_device {
+                resolved.tunnel_device = Some(v.clone());
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2362,6 +2380,17 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
             } else {
                 Some(value.to_string())
             };
+        }
+        "tunnel" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(v.as_str(), "no" | "yes" | "point-to-point" | "ethernet") {
+                resolved.tunnel = Some(v);
+            }
+        }
+        "tunneldevice" | "tunnel_device" => {
+            if crate::config::parse_tunnel_device(value).is_some() {
+                resolved.tunnel_device = Some(value.to_string());
+            }
         }
         "connecttimeout" | "connect_timeout" => {
             if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }

@@ -687,6 +687,16 @@ impl SshClient {
         // CanonicalizeHostname rewrites the target before any resolution or
         // host-key lookup, matching OpenSSH's ordering.
         self.config.apply_canonicalization()?;
+        if let Some(mode) = self.config.tunnel.as_deref() {
+            if mode != "no" {
+                return Err(SshError::Config(format!(
+                    "Tunnel {} is not supported by this build: \
+                     tun device forwarding requires a tun-capable server and \
+                     kernel privileges, neither of which ns-ssh provides",
+                    mode
+                )));
+            }
+        }
         let target_host = self.config.hostname.clone();
         let target_port = self.config.port;
         let connect_timeout = self.config.connect_timeout;
@@ -5235,8 +5245,11 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
                 }
             }
             // Become the master: establish a connection, then serve.
-            if client.connect().await.is_err() {
-                eprintln!("ns-ssh: connect to {}:{} failed", config.hostname, config.port);
+            if let Err(e) = client.connect().await {
+                eprintln!(
+                    "ns-ssh: connect to {}:{} failed: {}",
+                    config.hostname, config.port, e
+                );
                 return 255;
             }
             if client.handshake().await.is_err() {
@@ -5253,8 +5266,11 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
             return client.run_control_master(&path, config.control_persist).await.unwrap_or(255);
         }
 
-        if client.connect().await.is_err() {
-            eprintln!("ns-ssh: connect to {}:{} failed", config.hostname, config.port);
+        if let Err(e) = client.connect().await {
+            eprintln!(
+                "ns-ssh: connect to {}:{} failed: {}",
+                config.hostname, config.port, e
+            );
             return 255;
         }
         if let Err(e) = client.handshake().await {

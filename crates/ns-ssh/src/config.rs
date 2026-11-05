@@ -96,6 +96,12 @@ pub struct HostConfig {
     /// BindInterface: restrict the outgoing connection to this interface.
     #[serde(default)]
     pub bind_interface: Option<String>,
+    /// Tunnel: request tun device forwarding (no/yes/point-to-point/ethernet).
+    #[serde(default)]
+    pub tunnel: Option<String>,
+    /// TunnelDevice: `local:remote` tun unit numbers (each `any` or an int).
+    #[serde(default)]
+    pub tunnel_device: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -440,6 +446,10 @@ pub struct ResolvedConfig {
     pub ca_signature_algorithms: Option<Vec<String>>,
     /// BindInterface: restrict the outgoing connection to this interface.
     pub bind_interface: Option<String>,
+    /// Tunnel: tun device forwarding mode (None/`no` = disabled).
+    pub tunnel: Option<String>,
+    /// TunnelDevice: raw `local:remote` specification.
+    pub tunnel_device: Option<String>,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -573,6 +583,8 @@ impl ResolvedConfig {
             revoked_host_keys: None,
             ca_signature_algorithms: None,
             bind_interface: None,
+            tunnel: None,
+            tunnel_device: None,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -961,6 +973,8 @@ impl SshConfig {
         let mut revoked_host_keys = None;
         let mut ca_signature_algorithms = None;
         let mut bind_interface = None;
+        let mut tunnel = None;
+        let mut tunnel_device = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1054,6 +1068,8 @@ impl SshConfig {
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
                             bind_interface: bind_interface.take(),
+                            tunnel: tunnel.take(),
+                            tunnel_device: tunnel_device.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1164,6 +1180,8 @@ impl SshConfig {
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
                             bind_interface: bind_interface.take(),
+                            tunnel: tunnel.take(),
+                            tunnel_device: tunnel_device.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1254,6 +1272,8 @@ impl SshConfig {
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
                             bind_interface: bind_interface.take(),
+                            tunnel: tunnel.take(),
+                            tunnel_device: tunnel_device.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1501,6 +1521,19 @@ impl SshConfig {
                         Some(value.to_string())
                     };
                 }
+                "tunnel" => {
+                    let v = value.to_ascii_lowercase();
+                    if !matches!(v.as_str(), "no" | "yes" | "point-to-point" | "ethernet") {
+                        return Err(SshError::Config(format!("bad Tunnel value: {}", value)));
+                    }
+                    tunnel = Some(v);
+                }
+                "tunneldevice" | "tunnel_device" => {
+                    if parse_tunnel_device(value).is_none() {
+                        return Err(SshError::Config(format!("Bad TunnelDevice: {}", value)));
+                    }
+                    tunnel_device = Some(value.to_string());
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
@@ -1514,7 +1547,6 @@ impl SshConfig {
                 | "forkafterauthentication" | "fork_after_authentication"
                 | "obscurekeystroketiming" | "obscure_keystroke_timing"
                 | "proxyusefdpass" | "proxy_use_fdpass"
-                | "tunneldevice" | "tunnel_device"
                 | "nohostauthenticationforproxycommand" | "no_host_authentication_for_proxy_command"
                 // Deprecated/obsolete OpenSSH directive names: accepted and
                 // ignored, matching OpenSSH's oDeprecated/oUnsupported/oIgnore
@@ -1600,6 +1632,8 @@ impl SshConfig {
                 revoked_host_keys: revoked_host_keys.clone(),
                 ca_signature_algorithms: ca_signature_algorithms.clone(),
                 bind_interface: bind_interface.clone(),
+                tunnel: tunnel.clone(),
+                tunnel_device: tunnel_device.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
@@ -1901,6 +1935,26 @@ pub fn parse_streamlocal_forward(spec: &str) -> Option<(String, String)> {
         return None;
     }
     Some((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Parse `TunnelDevice local:remote`, where each part is `any` or a tun unit
+/// number (0..0xffffff, OpenSSH's SSH_TUNID_MAX). A missing/empty remote part
+/// mirrors the local one, as `a2tun()` does.
+pub fn parse_tunnel_device(spec: &str) -> Option<(String, String)> {
+    let (local, remote) = match spec.split_once(':') {
+        Some((l, r)) => (l, if r.is_empty() { l } else { r }),
+        None => (spec, spec),
+    };
+    for part in [local, remote] {
+        if part == "any" {
+            continue;
+        }
+        match part.parse::<u32>() {
+            Ok(n) if n <= 0xff_ffff => {}
+            _ => return None,
+        }
+    }
+    Some((local.to_string(), remote.to_string()))
 }
 
 pub fn parse_stdio_forward(spec: &str) -> std::result::Result<(String, u16), String> {
@@ -2348,6 +2402,30 @@ Match tagged !jump
         // `none` clears the interface (OpenSSH semantics).
         let cfg = SshConfig::parse("Host example\n  BindInterface none\n").unwrap();
         assert!(cfg.hosts[0].bind_interface.is_none());
+    }
+
+    #[test]
+    fn tunnel_directive_parsing() {
+        let cfg = SshConfig::parse("Host example\n  Tunnel point-to-point\n  TunnelDevice 0:1\n")
+            .unwrap();
+        assert_eq!(cfg.hosts[0].tunnel.as_deref(), Some("point-to-point"));
+        assert_eq!(cfg.hosts[0].tunnel_device.as_deref(), Some("0:1"));
+
+        // Only OpenSSH's four modes are accepted; device parts are `any` or a
+        // tun unit number.
+        assert!(SshConfig::parse("Host example\n  Tunnel bogus\n").is_err());
+        assert!(SshConfig::parse("Host example\n  TunnelDevice x\n").is_err());
+        assert!(SshConfig::parse("Host example\n  TunnelDevice 16777216\n").is_err());
+
+        assert_eq!(parse_tunnel_device("any"), Some(("any".to_string(), "any".to_string())));
+        assert_eq!(parse_tunnel_device("any:any"), Some(("any".to_string(), "any".to_string())));
+        assert_eq!(parse_tunnel_device("5:3"), Some(("5".to_string(), "3".to_string())));
+        // Missing/empty remote part mirrors the local one.
+        assert_eq!(parse_tunnel_device("5"), Some(("5".to_string(), "5".to_string())));
+        assert_eq!(parse_tunnel_device("5:"), Some(("5".to_string(), "5".to_string())));
+        assert_eq!(parse_tunnel_device("16777215"), Some(("16777215".to_string(), "16777215".to_string())));
+        assert_eq!(parse_tunnel_device("16777216"), None);
+        assert_eq!(parse_tunnel_device("1:y"), None);
     }
 
     #[test]
