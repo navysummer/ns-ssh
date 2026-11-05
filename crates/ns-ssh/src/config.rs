@@ -1961,7 +1961,7 @@ fn glob_match_recursive(pattern: &[char], text: &[char]) -> bool {
 }
 
 /// Match a glob pattern (supports `*` and `?`) against text. Used for `Include` globs.
-fn simple_glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);

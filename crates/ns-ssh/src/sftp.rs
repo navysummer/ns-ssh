@@ -755,9 +755,32 @@ impl SftpSession {
                     println!("usage: mget remote-path...");
                 } else {
                     for p in &parts[1..] {
-                        match self.cmd_get(p, None).await {
-                            Ok(_) => println!("Fetching {} to .", p),
-                            Err(e) => println!("{}", e),
+                        if p.contains('*') || p.contains('?') {
+                            // OpenSSH expands globs against the remote cwd;
+                            // only files (not . / ..) are fetched.
+                            match self.cmd_ls(None).await {
+                                Ok(entries) => {
+                                    let mut matched = false;
+                                    for name in &entries {
+                                        if crate::config::simple_glob_match(p, name) {
+                                            matched = true;
+                                            match self.cmd_get(name, None).await {
+                                                Ok(_) => println!("Fetching {} to .", name),
+                                                Err(e) => println!("{}", e),
+                                            }
+                                        }
+                                    }
+                                    if !matched {
+                                        println!("No matching files: {}", p);
+                                    }
+                                }
+                                Err(e) => println!("{}", e),
+                            }
+                        } else {
+                            match self.cmd_get(p, None).await {
+                                Ok(_) => println!("Fetching {} to .", p),
+                                Err(e) => println!("{}", e),
+                            }
                         }
                     }
                 }
@@ -767,9 +790,29 @@ impl SftpSession {
                     println!("usage: mput local-path...");
                 } else {
                     for p in &parts[1..] {
-                        match self.cmd_put(p, None).await {
-                            Ok(_) => println!("Uploading {} to .", p),
-                            Err(e) => println!("{}", e),
+                        if p.contains('*') || p.contains('?') {
+                            // OpenSSH expands globs against the local cwd.
+                            let mut matched = false;
+                            if let Ok(rd) = std::fs::read_dir(&self.local_cwd) {
+                                for e in rd.flatten() {
+                                    let name = e.file_name().to_string_lossy().into_owned();
+                                    if crate::config::simple_glob_match(p, &name) {
+                                        matched = true;
+                                        match self.cmd_put(&name, None).await {
+                                            Ok(_) => println!("Uploading {} to .", name),
+                                            Err(e) => println!("{}", e),
+                                        }
+                                    }
+                                }
+                            }
+                            if !matched {
+                                println!("No matching files: {}", p);
+                            }
+                        } else {
+                            match self.cmd_put(p, None).await {
+                                Ok(_) => println!("Uploading {} to .", p),
+                                Err(e) => println!("{}", e),
+                            }
                         }
                     }
                 }

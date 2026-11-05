@@ -520,3 +520,126 @@ fn sftp_parity_directory_listing() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// sftp parity: `mget`/`mput` with glob patterns expand against the remote
+/// cwd / local cwd and transfer only the matching files (Q07).
+#[test]
+fn sftp_parity_glob_mget_mput() {
+    let dir = temp_dir("sftp-glob");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_server(&dir, port);
+
+    // Local sources: two .txt files and one .log (must be excluded by *.txt).
+    let local_src = dir.join("local");
+    std::fs::create_dir_all(&local_src).unwrap();
+    std::fs::write(local_src.join("a.txt"), b"alpha\n").unwrap();
+    std::fs::write(local_src.join("b.txt"), b"beta\n").unwrap();
+    std::fs::write(local_src.join("c.log"), b"log\n").unwrap();
+
+    let remote_base = dir.join("remote");
+    std::fs::create_dir_all(&remote_base).unwrap();
+    let sftp = ns_tool(&dir, "ns-sftp");
+
+    let batch = dir.join("batch.txt");
+    std::fs::write(
+        &batch,
+        format!(
+            "lcd {}\ncd {}\nmput *.txt\nls\n",
+            local_src.display(), remote_base.display()
+        ),
+    )
+    .unwrap();
+
+    let run_sftp = |tool: &Path| {
+        Command::new(tool)
+            .arg("-P").arg(port.to_string())
+            .arg("-i").arg(&id_path)
+            .arg("-F").arg("/dev/null")
+            .arg("-o").arg(format!("User={}", user))
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+            .arg("-b").arg(&batch)
+            .arg("127.0.0.1")
+            .output()
+            .expect("run sftp glob")
+    };
+
+    // Reference: OpenSSH sftp.
+    let out_ref = run_sftp(Path::new("/usr/bin/sftp"));
+    let tree_ref = collect_tree(&remote_base);
+
+    // Reset remote dir for ns-sftp.
+    let _ = std::fs::remove_dir_all(&remote_base);
+    std::fs::create_dir_all(&remote_base).unwrap();
+    let out_ns = run_sftp(&sftp);
+    let tree_ns = collect_tree(&remote_base);
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    assert_eq!(
+        out_ref.status.success(),
+        out_ns.status.success(),
+        "sftp glob exit mismatch: ref={:?} ns={:?}\nref_err={}\nns_err={}",
+        out_ref.status.code(), out_ns.status.code(),
+        String::from_utf8_lossy(&out_ref.stderr),
+        String::from_utf8_lossy(&out_ns.stderr)
+    );
+    assert_trees_equal(&tree_ref, &tree_ns, "sftp mput glob");
+    // Only the two .txt files must be uploaded; c.log excluded by *.txt.
+    let names: Vec<String> = tree_ns.iter().map(|(n, _)| n.clone()).collect();
+    assert!(names.contains(&"a.txt".to_string()), "a.txt missing: {names:?}");
+    assert!(names.contains(&"b.txt".to_string()), "b.txt missing: {names:?}");
+    assert!(!names.contains(&"c.log".to_string()), "c.log must be excluded: {names:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// scp parity: `scp -p` preserves the source mtime across upload and download.
+/// The ns-scp client and the ns-ssh-server `scp -t -p` subsystem must round-trip
+/// the `T` timestamp header so the downloaded file's mtime matches the source.
+#[test]
+fn scp_parity_preserve_times() {
+    let dir = temp_dir("scp-times");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_server(&dir, port);
+
+    let src = dir.join("src.txt");
+    std::fs::write(&src, b"preserve me\n").unwrap();
+    // Set a fixed mtime ~1 day ago (whole seconds to avoid FS rounding).
+    let fixed = std::time::SystemTime::now() - std::time::Duration::from_secs(86400);
+    let ft = std::fs::FileTimes::new().set_modified(fixed);
+    let f = std::fs::File::options().write(true).open(&src).unwrap();
+    f.set_times(ft).unwrap();
+    let src_mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+
+    let remote_base = dir.join("remote");
+    std::fs::create_dir_all(&remote_base).unwrap();
+    let base = base_client_args(port, &id_path, &kh);
+    let remote = format!("{}@127.0.0.1:{}/", user, remote_base.display());
+    let scp = ns_tool(&dir, "scp");
+
+    // Upload with -p, then download with -p.
+    let up = Command::new(&scp)
+        .args(&base).arg("-p").arg(&src).arg(&remote)
+        .output().expect("ns-scp -p upload");
+    assert!(up.status.success(), "upload failed: {}", String::from_utf8_lossy(&up.stderr));
+    let down = dir.join("down.txt");
+    let down_remote = format!("{}@127.0.0.1:{}/src.txt", user, remote_base.display());
+    let dl = Command::new(&scp)
+        .args(&base).arg("-p").arg(&down_remote).arg(&down)
+        .output().expect("ns-scp -p download");
+    assert!(dl.status.success(), "download failed: {}", String::from_utf8_lossy(&dl.stderr));
+    let _ = server.kill();
+    let _ = server.wait();
+
+    let down_mtime = std::fs::metadata(&down).unwrap().modified().unwrap();
+    let diff = down_mtime.duration_since(src_mtime).unwrap_or_default();
+    assert!(
+        diff.as_secs() < 2,
+        "scp -p did not preserve mtime: src={src_mtime:?} down={down_mtime:?} diff={diff:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

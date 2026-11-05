@@ -6,6 +6,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Timestamps carried by an SCP `T` header: (mtime_sec, mtime_usec,
+/// atime_sec, atime_usec). OpenSSH emits all four fields so `scp -p` can
+/// restore both modification and access times.
+type ScpTimes = (i64, i64, i64, i64);
+
 async fn new_scp_client(config: &ResolvedConfig) -> Result<SshClient> {
     let mut client = SshClient::new(config.clone());
     client.connect().await?;
@@ -98,19 +103,8 @@ pub async fn scp_upload(config: &ResolvedConfig, local_path: &Path, remote_path:
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
 
-    // Send timestamp-preservation header (requires -p on the remote).
-    if let Ok(mtime) = metadata.modified() {
-        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-            let secs = dur.as_secs();
-            let usecs = dur.subsec_micros();
-            let tmsg = format!("T{} 0 {} 0\n", secs, usecs);
-            client.send_channel_data(local_id, tmsg.as_bytes()).await?;
-            let t_ack = recv_byte(&mut client, local_id).await?;
-            if t_ack != 0 {
-                return Err(SshError::Protocol("SCP rejected timestamp".into()));
-            }
-        }
-    }
+    // Send timestamp-preservation header (mtime + atime, requires -p remote).
+    send_timestamp(&mut client, local_id, &metadata).await?;
 
     let control_msg = format!("C{} {} {}\n", mode, size, fname);
 
@@ -389,7 +383,7 @@ pub async fn scp_download_multi(
     Ok(())
 }
 /// Read one control header, transparently skipping an optional T timestamp header.
-async fn read_first_control(client: &mut SshClient, local_id: ChannelId) -> Result<(String, Option<(i64, i64)>)> {
+async fn read_first_control(client: &mut SshClient, local_id: ChannelId) -> Result<(String, Option<ScpTimes>)> {
     let mut control = recv_control_line(client, local_id).await?;
     let mut mtime = None;
     if control.starts_with('T') {
@@ -400,42 +394,45 @@ async fn read_first_control(client: &mut SshClient, local_id: ChannelId) -> Resu
     Ok((control, mtime))
 }
 
-/// Parse a T<mtime> 0 <usec> 0 timestamp header into (sec, usec).
-fn parse_timestamp(line: &str) -> Option<(i64, i64)> {
+/// Parse a `T<mtime_sec> <mtime_usec> <atime_sec> <atime_usec>` timestamp
+/// header into (mtime_sec, mtime_usec, atime_sec, atime_usec). OpenSSH emits
+/// all four fields so `scp -p` can restore both mtime and atime.
+fn parse_timestamp(line: &str) -> Option<ScpTimes> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() >= 4 && parts[0].starts_with('T') {
-        let sec: i64 = parts[0][1..].parse().ok()?;
-        let usec: i64 = parts[2].parse().ok()?;
-        Some((sec, usec))
+        let msec: i64 = parts[0][1..].parse().ok()?;
+        let musec: i64 = parts[1].parse().ok()?;
+        let asec: i64 = parts[2].parse().ok()?;
+        let ausec: i64 = parts[3].parse().ok()?;
+        Some((msec, musec, asec, ausec))
     } else {
         None
     }
 }
 
-/// Apply a file mode and mtime to `dest` after transfer.
-fn apply_file_meta(dest: &Path, mode: Option<u32>, mtime: Option<(i64, i64)>) -> Result<()> {
+/// Apply a file mode, mtime and atime to `dest` after transfer.
+fn apply_file_meta(dest: &Path, mode: Option<u32>, times: Option<ScpTimes>) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Some(m) = mode {
             let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(m & 0o7777));
         }
-        if let Some((sec, usec)) = mtime {
-            let nsec = usec * 1000;
-            let times = [
-                libc::timespec { tv_sec: sec, tv_nsec: nsec },
-                libc::timespec { tv_sec: sec, tv_nsec: nsec },
-            ];
+        if let Some((msec, musec, asec, ausec)) = times {
+            let mt = libc::timespec { tv_sec: msec, tv_nsec: musec * 1000 };
+            let at = libc::timespec { tv_sec: asec, tv_nsec: ausec * 1000 };
+            // utimensat expects [atime, mtime] in that order.
+            let ts = [at, mt];
             if let Ok(cpath) = std::ffi::CString::new(dest.as_os_str().as_encoded_bytes()) {
                 unsafe {
-                    libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0);
+                    libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), ts.as_ptr(), 0);
                 }
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (dest, mode, mtime);
+        let _ = (dest, mode, times);
     }
     Ok(())
 }
@@ -465,7 +462,7 @@ async fn recv_scp_file(
     dest: &Path,
     mode: Option<u32>,
     size: u64,
-    mtime: Option<(i64, i64)>,
+    times: Option<ScpTimes>,
 ) -> Result<Vec<u8>> {
     let mut file = tokio::fs::File::create(dest).await.map_err(|e| SshError::Io(e))?;
     let mut remaining = size;
@@ -511,7 +508,7 @@ async fn recv_scp_file(
         }
     }
     send_byte(client, local_id, 0).await?;
-    apply_file_meta(dest, mode, mtime)?;
+    apply_file_meta(dest, mode, times)?;
     Ok(leftover)
 }
 
@@ -579,14 +576,18 @@ async fn recv_control_line_opt(client: &mut SshClient, local_id: ChannelId) -> R
 }
 
 async fn send_timestamp(client: &mut SshClient, local_id: ChannelId, meta: &std::fs::Metadata) -> Result<()> {
-    if let Ok(mtime) = meta.modified() {
-        if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
-            let tmsg = format!("T{} 0 {} 0\n", dur.as_secs(), dur.subsec_micros());
-            client.send_channel_data(local_id, tmsg.as_bytes()).await?;
-            let ack = recv_byte(client, local_id).await?;
-            if ack != 0 {
-                return Err(SshError::Protocol("SCP rejected timestamp".into()));
-            }
+    // OpenSSH T header: T<mtime_sec> <mtime_usec> <atime_sec> <atime_usec>.
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let atime = meta.accessed().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    if let (Some(m), Some(a)) = (mtime, atime) {
+        let tmsg = format!(
+            "T{} {} {} {}\n",
+            m.as_secs(), m.subsec_micros(), a.as_secs(), a.subsec_micros()
+        );
+        client.send_channel_data(local_id, tmsg.as_bytes()).await?;
+        let ack = recv_byte(client, local_id).await?;
+        if ack != 0 {
+            return Err(SshError::Protocol("SCP rejected timestamp".into()));
         }
     }
     Ok(())
