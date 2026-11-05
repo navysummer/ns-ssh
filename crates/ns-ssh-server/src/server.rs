@@ -1222,7 +1222,33 @@ async fn handle_authenticated_session(
 
                         let algo_ok = config.hostbased_accepted_algorithms.as_ref()
                             .map_or(true, |list| list.iter().any(|a| a == &key_type));
-                        let ok = config.hostbased_auth && algo_ok && {
+                        // HostbasedUsesNameFromPacketOnly: unless set, the
+                        // client host name in the request must match the peer
+                        // address (reverse-resolved when UseDNS is enabled),
+                        // mirroring OpenSSH's auth2-hostbased check.
+                        let hostname_ok = if config.hostbased_uses_name_from_packet_only {
+                            true
+                        } else {
+                            let remote = if config.use_dns {
+                                stream
+                                    .peer_addr()
+                                    .ok()
+                                    .map(|a| a.ip())
+                                    .and_then(reverse_dns)
+                                    .unwrap_or_else(|| match_addr.clone())
+                            } else {
+                                match_addr.clone()
+                            };
+                            if !host_name_matches(&client_host, &remote) {
+                                tracing::debug!(
+                                    "hostbased: client host name {} does not match peer {}",
+                                    client_host,
+                                    remote
+                                );
+                            }
+                            host_name_matches(&client_host, &remote)
+                        };
+                        let ok = config.hostbased_auth && algo_ok && hostname_ok && {
                             let auth = auth.lock().await;
                             auth.verify_hostbased(
                                 &session_id, &username, &key_type, &public_key,
@@ -1490,6 +1516,16 @@ fn reverse_dns(ip: std::net::IpAddr) -> Option<String> {
 #[cfg(not(unix))]
 fn reverse_dns(_ip: std::net::IpAddr) -> Option<String> {
     None
+}
+
+/// Compare a hostbased client host name with the peer name/address, ignoring
+/// case and a trailing root label, as OpenSSH's hostbased check effectively
+/// requires.
+fn host_name_matches(packet_host: &str, remote_host: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.trim_end_matches('.').to_ascii_lowercase()
+    }
+    norm(packet_host) == norm(remote_host)
 }
 
 fn forward_policy_allows_direct(

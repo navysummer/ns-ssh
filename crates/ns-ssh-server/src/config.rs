@@ -158,6 +158,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub hostbased_accepted_algorithms: Option<Vec<String>>,
 
+    /// HostbasedUsesNameFromPacketOnly: trust the client host name carried in
+    /// the hostbased request instead of verifying it against the peer address.
+    #[serde(default)]
+    pub hostbased_uses_name_from_packet_only: bool,
+
     #[serde(default = "default_true")]
     pub print_last_log: bool,
 
@@ -438,6 +443,7 @@ pub struct MatchOverrides {
     pub log_level: Option<String>,
     pub hostbased_auth: Option<bool>,
     pub hostbased_accepted_algorithms: Option<Vec<String>>,
+    pub hostbased_uses_name_from_packet_only: Option<bool>,
     pub ignore_rhosts: Option<bool>,
     pub authentication_methods: Option<Vec<Vec<String>>>,
     pub channel_timeouts: Option<Vec<(String, u64)>>,
@@ -596,6 +602,7 @@ impl ServerMatch {
         if let Some(v) = &o.log_level { cfg.log_level = Some(v.clone()); }
         if let Some(v) = o.hostbased_auth { cfg.hostbased_auth = v; }
         if let Some(v) = &o.hostbased_accepted_algorithms { cfg.hostbased_accepted_algorithms = Some(v.clone()); }
+        if let Some(v) = o.hostbased_uses_name_from_packet_only { cfg.hostbased_uses_name_from_packet_only = v; }
         if let Some(v) = o.ignore_rhosts { cfg.ignore_rhosts = v; }
         if let Some(v) = &o.authentication_methods { cfg.authentication_methods = v.clone(); }
         if let Some(v) = &o.channel_timeouts { cfg.channel_timeouts = v.clone(); }
@@ -714,6 +721,9 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
             o.hostbased_accepted_algorithms = Some(
                 value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
             );
+        }
+        "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only" => {
+            o.hostbased_uses_name_from_packet_only = Some(value == "yes")
         }
         "ignorerhosts" | "ignore_rhosts" => o.ignore_rhosts = Some(value == "yes"),
         "authenticationmethods" | "authentication_methods" => {
@@ -1306,6 +1316,7 @@ impl Default for ServerConfig {
             ignore_rhosts: default_true(),
             hostbased_auth: false,
             hostbased_accepted_algorithms: None,
+            hostbased_uses_name_from_packet_only: false,
             print_last_log: default_true(),
             tcp_keep_alive: default_true(),
             ip_qos_interactive: default_ip_qos_interactive(),
@@ -1829,6 +1840,9 @@ impl ServerConfig {
                         value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
                     );
                 }
+                "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only" => {
+                    config.hostbased_uses_name_from_packet_only = value == "yes";
+                }
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }
@@ -1894,8 +1908,10 @@ impl ServerConfig {
                 // Known OpenSSH directives accepted but not enforced. Accepting
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
-                "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
-                | "sshdsessionpath" | "sshd_session_path"
+                // SshdSessionPath names the separate session binary used by
+                // OpenSSH; this server is monolithic, so it is accepted as a
+                // no-op.
+                "sshdsessionpath" | "sshd_session_path"
                 // Deprecated/obsolete OpenSSH directive names: accepted and
                 // ignored, matching OpenSSH's sDeprecated/sUnsupported/sIgnore
                 // handling so old sshd_config files keep loading.
@@ -2491,6 +2507,22 @@ Match Invalid-User
         )
         .unwrap();
         assert_eq!(c.match_blocks[0].overrides.x11_use_localhost, Some(false));
+    }
+
+    #[test]
+    fn hostbased_uses_name_from_packet_only_is_parsed() {
+        let c = ServerConfig::parse("HostbasedUsesNameFromPacketOnly yes\n").unwrap();
+        assert!(c.hostbased_uses_name_from_packet_only);
+
+        // Available inside Match blocks too.
+        let c = ServerConfig::parse(
+            "Match User alice\n    HostbasedUsesNameFromPacketOnly yes\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.match_blocks[0].overrides.hostbased_uses_name_from_packet_only,
+            Some(true)
+        );
     }
 
     #[test]

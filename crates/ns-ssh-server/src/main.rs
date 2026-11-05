@@ -213,6 +213,9 @@ fn main() {
                         value.split([',', ' ']).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
                     );
                 }
+                "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only" => {
+                    config.hostbased_uses_name_from_packet_only = value == "yes";
+                }
                 "printlastlog" | "print_last_log" => {
                     config.print_last_log = value == "yes";
                 }
