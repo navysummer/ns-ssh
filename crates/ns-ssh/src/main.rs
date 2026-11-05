@@ -1609,6 +1609,9 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
                 v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             );
         }
+        if let Some(v) = &h.bind_interface {
+            resolved.bind_interface = Some(v.clone());
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1800,6 +1803,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
                 resolved.ca_signature_algorithms = Some(
                     v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
                 );
+            }
+            if let Some(v) = &host_config.bind_interface {
+                resolved.bind_interface = Some(v.clone());
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2103,6 +2109,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
                     v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
                 );
             }
+            if let Some(v) = &mc.bind_interface {
+                resolved.bind_interface = Some(v.clone());
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2346,6 +2355,13 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
             resolved.ca_signature_algorithms = Some(
                 value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
             );
+        }
+        "bindinterface" | "bind_interface" => {
+            resolved.bind_interface = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         "connecttimeout" | "connect_timeout" => {
             if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }

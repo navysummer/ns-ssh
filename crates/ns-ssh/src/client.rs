@@ -741,9 +741,20 @@ impl SshClient {
             return Err(SshError::Protocol("cannot resolve target (no address matching AddressFamily)".into()));
         }
 
-        let stream = if let Some(bind) = self.config.bind_address.clone() {
-            let bind_addr = format!("{}:0", bind);
-            let bind_addr: std::net::SocketAddr = bind_addr.parse().map_err(|_| SshError::Protocol("invalid BindAddress".into()))?;
+        // BindAddress / BindInterface both require configuring the socket
+        // before connect(), so always build it explicitly.
+        let socket_bind_addr = match self.config.bind_address.as_deref() {
+            Some(bind) => {
+                let bind_addr = format!("{}:0", bind);
+                Some(bind_addr.parse::<std::net::SocketAddr>().map_err(|_| {
+                    SshError::Protocol("invalid BindAddress".into())
+                })?)
+            }
+            None => None,
+        };
+        let bind_interface = self.config.bind_interface.clone();
+
+        let stream = {
             let mut last_err: Option<SshError> = None;
             let mut connected = None;
             for target_addr in addrs {
@@ -752,7 +763,29 @@ impl SshClient {
                 } else {
                     tokio::net::TcpSocket::new_v4().map_err(SshError::Io)?
                 };
-                if socket.bind(bind_addr).is_err() { continue; }
+                if let Some(bind_addr) = socket_bind_addr {
+                    if socket.bind(bind_addr).is_err() { continue; }
+                }
+                if let Some(ifname) = bind_interface.as_deref() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        if let Err(e) = bind_interface_socket(
+                            socket.as_raw_fd(), ifname, target_addr.is_ipv6(),
+                        ) {
+                            last_err = Some(SshError::Io(e));
+                            continue;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = ifname;
+                        last_err = Some(SshError::Protocol(
+                            "BindInterface is not supported on this platform".into(),
+                        ));
+                        continue;
+                    }
+                }
                 let res = if let Some(timeout) = connect_dur {
                     tokio::time::timeout(timeout, socket.connect(target_addr))
                         .await
@@ -760,26 +793,6 @@ impl SshClient {
                         .and_then(|r| r.map_err(SshError::Io))
                 } else {
                     socket.connect(target_addr).await.map_err(SshError::Io)
-                };
-                match res {
-                    Ok(s) => { connected = Some(s); break; }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            connected.ok_or_else(|| last_err.unwrap_or_else(|| {
-                SshError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "all connection attempts failed"))
-            }))?
-        } else {
-            let mut last_err: Option<SshError> = None;
-            let mut connected = None;
-            for target_addr in addrs {
-                let res = if let Some(timeout) = connect_dur {
-                    tokio::time::timeout(timeout, TcpStream::connect(target_addr))
-                        .await
-                        .map_err(|_| SshError::Timeout)
-                        .and_then(|r| r.map_err(SshError::Io))
-                } else {
-                    TcpStream::connect(target_addr).await.map_err(SshError::Io)
                 };
                 match res {
                     Ok(s) => { connected = Some(s); break; }
@@ -3867,6 +3880,67 @@ fn pump_socket_with_channel<S>(
             }
         }
     });
+}
+
+/// Restrict an outbound socket to a named network interface (`BindInterface`).
+/// macOS uses IP_BOUND_IF/IPV6_BOUND_IF; Linux uses SO_BINDTODEVICE.
+#[cfg(unix)]
+fn bind_interface_socket(
+    fd: std::os::unix::io::RawFd,
+    ifname: &str,
+    is_ipv6: bool,
+) -> std::io::Result<()> {
+    let cname = std::ffi::CString::new(ifname).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid interface name")
+    })?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // IP_BOUND_IF / IPV6_BOUND_IF are not exported by the libc crate.
+        const IP_BOUND_IF: libc::c_int = 25;
+        const IPV6_BOUND_IF: libc::c_int = 125;
+        let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if index == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opt = index as libc::c_int;
+        let (level, name) = if is_ipv6 {
+            (libc::IPPROTO_IPV6, IPV6_BOUND_IF)
+        } else {
+            (libc::IPPROTO_IP, IP_BOUND_IF)
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &opt as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = is_ipv6;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                cname.as_ptr() as *const libc::c_void,
+                (ifname.len() + 1) as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 async fn connect_agent_socket(override_path: Option<&str>) -> Result<tokio::net::UnixStream> {

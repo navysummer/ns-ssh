@@ -93,6 +93,9 @@ pub struct HostConfig {
     /// CASignatureAlgorithms: CA key types allowed to certify host keys.
     #[serde(default)]
     pub ca_signature_algorithms: Option<String>,
+    /// BindInterface: restrict the outgoing connection to this interface.
+    #[serde(default)]
+    pub bind_interface: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -435,6 +438,8 @@ pub struct ResolvedConfig {
     pub revoked_host_keys: Option<PathBuf>,
     /// CASignatureAlgorithms: allowed CA key types (None = OpenSSH default).
     pub ca_signature_algorithms: Option<Vec<String>>,
+    /// BindInterface: restrict the outgoing connection to this interface.
+    pub bind_interface: Option<String>,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -567,6 +572,7 @@ impl ResolvedConfig {
             global_known_hosts_file: None,
             revoked_host_keys: None,
             ca_signature_algorithms: None,
+            bind_interface: None,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -954,6 +960,7 @@ impl SshConfig {
         let mut global_known_hosts_file = None;
         let mut revoked_host_keys = None;
         let mut ca_signature_algorithms = None;
+        let mut bind_interface = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1046,6 +1053,7 @@ impl SshConfig {
                             global_known_hosts_file: global_known_hosts_file.take(),
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
+                            bind_interface: bind_interface.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1155,6 +1163,7 @@ impl SshConfig {
                             global_known_hosts_file: global_known_hosts_file.take(),
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
+                            bind_interface: bind_interface.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1244,6 +1253,7 @@ impl SshConfig {
                             global_known_hosts_file: global_known_hosts_file.take(),
                             revoked_host_keys: revoked_host_keys.take(),
                             ca_signature_algorithms: ca_signature_algorithms.take(),
+                            bind_interface: bind_interface.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1484,11 +1494,17 @@ impl SshConfig {
                 "casignaturealgorithms" | "ca_signature_algorithms" => {
                     ca_signature_algorithms = Some(value.to_string());
                 }
+                "bindinterface" | "bind_interface" => {
+                    bind_interface = if value.eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
-                "bindinterface" | "bind_interface"
-                | "kbdinteractivedevices" | "kbd_interactive_devices"
+                "kbdinteractivedevices" | "kbd_interactive_devices"
                 | "syslogfacility" | "syslog_facility"
                 | "xauthlocation" | "xauth_location"
                 | "stdinnull" | "stdin_null"
@@ -1583,6 +1599,7 @@ impl SshConfig {
                 global_known_hosts_file: global_known_hosts_file.clone(),
                 revoked_host_keys: revoked_host_keys.clone(),
                 ca_signature_algorithms: ca_signature_algorithms.clone(),
+                bind_interface: bind_interface.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
@@ -2322,6 +2339,15 @@ Match tagged !jump
     fn ipqos_directive_in_config() {
         let cfg = SshConfig::parse("Host example\n  IPQoS lowdelay cs1\n").unwrap();
         assert_eq!(cfg.hosts[0].ip_qos.as_deref(), Some("lowdelay cs1"));
+    }
+
+    #[test]
+    fn bind_interface_directive_in_config() {
+        let cfg = SshConfig::parse("Host example\n  BindInterface en0\n").unwrap();
+        assert_eq!(cfg.hosts[0].bind_interface.as_deref(), Some("en0"));
+        // `none` clears the interface (OpenSSH semantics).
+        let cfg = SshConfig::parse("Host example\n  BindInterface none\n").unwrap();
+        assert!(cfg.hosts[0].bind_interface.is_none());
     }
 
     #[test]
