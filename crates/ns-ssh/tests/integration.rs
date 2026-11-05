@@ -4054,3 +4054,47 @@ fn server_expose_auth_info_sets_ssh_user_auth() {
         stdout
     );
 }
+
+/// A `@revoked` known_hosts entry refuses the host key unconditionally, even
+/// with `StrictHostKeyChecking=no` (OpenSSH behavior).
+#[test]
+fn revoked_known_hosts_entry_refuses_connection() {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let dir = temp_dir("revoked-kh");
+    let port = free_port();
+    let (server, id_path, kh) = launch_test_server(&dir, port);
+
+    // First connect with StrictHostKeyChecking=no: the key is auto-added to
+    // known_hosts (Unknown -> add).
+    let (ok_first, _, _) =
+        run_client_echo(&user, port, &id_path, &kh, &[], "echo first-ok");
+    assert!(ok_first, "first connection should succeed and record the key");
+
+    // Rewrite the recorded host key line with an `@revoked` marker.
+    let content = std::fs::read_to_string(&kh).unwrap();
+    let revoked_content: String = content
+        .lines()
+        .map(|line| format!("@revoked {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&kh, revoked_content).unwrap();
+
+    // With the key revoked, the connection must be refused regardless of
+    // StrictHostKeyChecking=no.
+    let (ok_second, _, stderr_second) =
+        run_client_echo(&user, port, &id_path, &kh, &[], "echo should-not-run");
+
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !ok_second,
+        "revoked host key must be refused: stderr={stderr_second}"
+    );
+    assert!(
+        stderr_second.contains("revoked"),
+        "stderr should report the revoked key, got: {stderr_second}"
+    );
+}

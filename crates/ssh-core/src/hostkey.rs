@@ -700,6 +700,145 @@ impl HostKeyVerifier for RsaHostKey {
     }
 }
 
+/// OpenSSH FIDO2 security-key host key (`sk-ssh-ed25519@openssh.com`,
+/// `sk-ecdsa-sha2-nistp256@openssh.com`).
+///
+/// The public-key blob is
+///   `string key_type || string underlying_type || string pk || string application`
+/// where `pk` is the ordinary ed25519/ecdsa public key the FIDO2 authenticator
+/// attests. Signatures are ordinary ed25519/ecdsa signatures over the data,
+/// wrapped as `string key_type || string signature`; verification therefore
+/// reduces to verifying with the underlying plain key. Hardware signing is
+/// done by the authenticator and is out of scope here (no FIDO2 transport),
+/// so only the verifier half is implemented.
+pub struct SkHostKey {
+    key_type: String,
+    underlying: String,
+    pk: Vec<u8>,
+    /// The full public-key blob (`string key_type || ... || string application`).
+    blob: Vec<u8>,
+}
+
+impl SkHostKey {
+    /// Parse an SK public-key blob (the `string key_type || ...` layout).
+    pub fn from_blob(blob: &[u8]) -> Result<Self> {
+        let mut r = blob;
+        let key_type = SshString::decode(&mut r)?.as_str()?.to_string();
+        if key_type != "sk-ssh-ed25519@openssh.com"
+            && key_type != "sk-ecdsa-sha2-nistp256@openssh.com"
+        {
+            return Err(SshError::InvalidKey(format!("not an SK key: {}", key_type)));
+        }
+        let underlying = SshString::decode(&mut r)?.as_str()?.to_string();
+        // `pk` for ed25519 is a raw 32-byte string; for ecdsa it is
+        // `string curve_name || string Q`. Keep the trailing `application`
+        // string after `pk`.
+        let pk = if underlying == "ssh-ed25519" {
+            SshBytes::decode(&mut r)?.0
+        } else if underlying.starts_with("ecdsa-sha2-nistp") {
+            let _curve = SshString::decode(&mut r)?;
+            SshBytes::decode(&mut r)?.0
+        } else {
+            return Err(SshError::InvalidKey(format!("unsupported SK underlying type: {}", underlying)));
+        };
+        Ok(SkHostKey {
+            key_type,
+            underlying,
+            pk,
+            blob: blob.to_vec(),
+        })
+    }
+
+    /// The plain key type this SK key wraps (`ssh-ed25519`, `ecdsa-sha2-nistp256`).
+    pub fn underlying_type(&self) -> &str {
+        &self.underlying
+    }
+}
+
+impl HostKeyVerifier for SkHostKey {
+    fn algorithm_name(&self) -> &str {
+        &self.key_type
+    }
+
+    fn key_type(&self) -> &str {
+        &self.key_type
+    }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        self.pk.clone()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        // The SK signature blob is `string key_type || string signature`; the
+        // inner signature is a plain ed25519/ecdsa signature over `data`.
+        let mut r = signature;
+        let _sig_type = SshString::decode(&mut r)?;
+        let inner = SshBytes::decode(&mut r)?.0;
+        match self.underlying.as_str() {
+            "ssh-ed25519" => {
+                let pk: [u8; 32] = self.pk.as_slice().try_into()
+                    .map_err(|_| SshError::InvalidKey("SK ed25519 pubkey length".into()))?;
+                let verifying = VerifyingKey::from_bytes(&pk)
+                    .map_err(|e| SshError::InvalidKey(format!("SK ed25519 pubkey: {}", e)))?;
+                let sig = Signature::from_slice(&inner)
+                    .map_err(|e| SshError::InvalidKey(format!("SK ed25519 sig: {}", e)))?;
+                Ok(verifying.verify(data, &sig).is_ok())
+            }
+            "ecdsa-sha2-nistp256" => {
+                // `inner` is the SSH ECDSA signature layout (`string r, string s`).
+                let flat = decode_ecdsa_signature(&inner, 32)?;
+                let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&self.pk)
+                    .map_err(|e| SshError::InvalidKey(format!("SK ecdsa pubkey: {}", e)))?;
+                let sig = p256::ecdsa::Signature::from_slice(&flat)
+                    .map_err(|e| SshError::InvalidKey(format!("SK ecdsa sig: {}", e)))?;
+                use p256::ecdsa::signature::Verifier as _;
+                Ok(verifying.verify(data, &sig).is_ok())
+            }
+            other => Err(SshError::InvalidKey(format!(
+                "unsupported SK underlying type for verify: {}",
+                other
+            ))),
+        }
+    }
+}
+
+impl HostKeySigner for SkHostKey {
+    fn algorithm_name(&self) -> &str {
+        &self.key_type
+    }
+
+    fn key_type(&self) -> &str {
+        &self.key_type
+    }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        self.blob.clone()
+    }
+
+    fn sign(&self, _data: &[u8]) -> Result<Vec<u8>> {
+        Err(SshError::InvalidKey(
+            "SK signing requires a FIDO2 authenticator, which is not wired up".into(),
+        ))
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<bool> {
+        HostKeyVerifier::verify(self, data, signature)
+    }
+
+    fn clone_box(&self) -> Box<dyn HostKeySigner> {
+        Box::new(SkHostKey {
+            key_type: self.key_type.clone(),
+            underlying: self.underlying.clone(),
+            pk: self.pk.clone(),
+            blob: self.blob.clone(),
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 pub fn get_supported_host_key_algorithms() -> Vec<&'static str> {
     vec![
         "ssh-ed25519",
@@ -709,6 +848,8 @@ pub fn get_supported_host_key_algorithms() -> Vec<&'static str> {
         "rsa-sha2-256",
         "rsa-sha2-512",
         "ssh-rsa",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
     ]
 }
 
@@ -794,5 +935,43 @@ mod tests {
 
         let wrong = Sha256::digest(data);
         assert!(key.verifying_key.verify_prehash(&wrong, &parsed).is_err());
+    }
+
+    /// An SK host key's public blob embeds the underlying plain key; the
+    /// verifier must recover it and verify a plain ed25519 signature wrapped
+    /// in the SK signature layout.
+    #[test]
+    fn sk_ed25519_host_key_parses_and_verifies() {
+        let base = Ed25519HostKey::generate().unwrap();
+        let pk = HostKeySigner::public_key_bytes(&base);
+        // `pk` from public_key_bytes() is `string "ssh-ed25519" || string pk`.
+        let mut r: &[u8] = &pk;
+        let _ty = SshString::decode(&mut r).unwrap();
+        let raw_pk = SshBytes::decode(&mut r).unwrap().0;
+
+        let mut blob = Vec::new();
+        SshString::new("sk-ssh-ed25519@openssh.com").encode(&mut blob).unwrap();
+        SshString::new("ssh-ed25519").encode(&mut blob).unwrap();
+        SshBytes(raw_pk.clone()).encode(&mut blob).unwrap();
+        SshString::new("ssh:").encode(&mut blob).unwrap();
+
+        let sk = SkHostKey::from_blob(&blob).unwrap();
+        assert_eq!(HostKeySigner::key_type(&sk), "sk-ssh-ed25519@openssh.com");
+        assert_eq!(sk.underlying_type(), "ssh-ed25519");
+        // HostKeyVerifier::public_key_bytes returns the underlying plain key.
+        assert_eq!(HostKeyVerifier::public_key_bytes(&sk), raw_pk);
+
+        // Sign with the underlying software key and wrap in the SK layout.
+        let data = b"kex exchange hash";
+        let plain_sig = base.sign(data).unwrap();
+        let mut r: &[u8] = &plain_sig;
+        let _ty = SshString::decode(&mut r).unwrap();
+        let raw_sig = SshBytes::decode(&mut r).unwrap().0;
+        let mut sk_sig = Vec::new();
+        SshString::new("sk-ssh-ed25519@openssh.com").encode(&mut sk_sig).unwrap();
+        SshBytes(raw_sig).encode(&mut sk_sig).unwrap();
+
+        assert!(HostKeyVerifier::verify(&sk, data, &sk_sig).unwrap());
+        assert!(!HostKeyVerifier::verify(&sk, b"tampered", &sk_sig).unwrap());
     }
 }

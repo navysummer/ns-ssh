@@ -12,6 +12,9 @@ pub struct KnownHostEntry {
     /// `@cert-authority`: this key is a CA trusted to sign host certificates
     /// for the listed hosts, not a host key itself.
     pub cert_authority: bool,
+    /// `@revoked`: this key is revoked; a matching server key must be
+    /// refused even if it was previously trusted.
+    pub revoked: bool,
     /// OpenSSH hashed-host fields: `|1|base64(salt)|base64(HMAC-SHA1)`.
     pub host_salt: Option<Vec<u8>>,
     pub host_hash: Option<Vec<u8>>,
@@ -93,12 +96,13 @@ impl KnownHosts {
         } else {
             (None, first)
         };
-        let cert_authority = match marker {
-            Some("@cert-authority") => true,
-            // `@revoked` and other markers are not supported; ignore the line
-            // rather than misreading it as a regular host key entry.
+        let (cert_authority, revoked) = match marker {
+            Some("@cert-authority") => (true, false),
+            Some("@revoked") => (false, true),
+            // Other markers are not supported; ignore the line rather than
+            // misreading it as a regular host key entry.
             Some(_) => return None,
-            None => false,
+            None => (false, false),
         };
         let key_type = parts.next()?;
         let key_b64 = parts.next()?;
@@ -136,6 +140,7 @@ impl KnownHosts {
             public_key: key_bytes,
             comment,
             cert_authority,
+            revoked,
             host_salt,
             host_hash,
         })
@@ -186,6 +191,18 @@ impl KnownHosts {
     }
 
     pub fn check(&self, hostname: &str, port: u16, key_type: &str, public_key: &[u8]) -> HostKeyStatus {
+        // `@revoked` entries take priority over everything else: a key listed
+        // as revoked for this host must be refused even if the same key also
+        // appears in a plain (or `@cert-authority`) entry.
+        for entry in &self.entries {
+            if entry.revoked
+                && entry.key_type == key_type
+                && entry.public_key == public_key
+                && self.entry_matches(entry, hostname, port)
+            {
+                return HostKeyStatus::Revoked;
+            }
+        }
         for entry in &self.entries {
             // `@cert-authority` entries hold CA keys, not host keys.
             if entry.cert_authority {
@@ -258,6 +275,7 @@ impl KnownHosts {
                 public_key: public_key.to_vec(),
                 comment: None,
                 cert_authority: false,
+                revoked: false,
                 host_salt: salt_out,
                 host_hash: hash_out,
             });
@@ -268,6 +286,7 @@ impl KnownHosts {
                 public_key: public_key.to_vec(),
                 comment: None,
                 cert_authority: false,
+                revoked: false,
                 host_salt: None,
                 host_hash: None,
             });
@@ -312,6 +331,8 @@ impl KnownHosts {
             };
             let marker = if entry.cert_authority {
                 "@cert-authority "
+            } else if entry.revoked {
+                "@revoked "
             } else {
                 ""
             };
@@ -465,12 +486,23 @@ mod tests {
         // The wildcard @cert-authority line applies to subdomains only.
         assert_eq!(kh.cert_authorities_for("a.example.com", 22).len(), 1);
         assert!(kh.cert_authorities_for("plain.other.org", 22).is_empty());
-        // @revoked entries are ignored rather than parsed as host keys.
-        assert!(!kh.entries.iter().any(|e| e.hosts.iter().any(|h| h == "bad.example.com")));
+        // `@revoked` entries are now parsed and tracked as revoked.
+        assert!(kh.entries.iter().any(|e| e.revoked));
         // A CA entry must not be treated as a host key by `check`.
         assert_eq!(
             kh.check("a.example.com", 22, "ssh-ed25519", &ca),
             HostKeyStatus::Unknown
+        );
+        // The revoked key for bad.example.com is refused. Decode the exact
+        // key listed on the `@revoked` line to assert a real match.
+        let revoked_key = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            "AAAAC3NzaC1lZDI1NTE5",
+        )
+        .unwrap();
+        assert_eq!(
+            kh.check("bad.example.com", 22, "ssh-ed25519", &revoked_key),
+            HostKeyStatus::Revoked
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -527,6 +559,8 @@ fn host_pattern_matches(pattern: &str, text: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKeyStatus {
     Known,
+    /// The key is listed under `@revoked` for this host and must be refused.
+    Revoked,
     Unknown,
     Changed,
 }

@@ -237,11 +237,13 @@ fn check_host_status(
     match user_status {
         HostKeyStatus::Known => HostKeyStatus::Known,
         HostKeyStatus::Changed => HostKeyStatus::Changed,
+        HostKeyStatus::Revoked => HostKeyStatus::Revoked,
         HostKeyStatus::Unknown => {
-            if global_kh.check(host, port, key_type, key_blob) == HostKeyStatus::Known {
-                HostKeyStatus::Known
-            } else {
-                HostKeyStatus::Unknown
+            // A `@revoked` entry in the global file must also refuse the key.
+            match global_kh.check(host, port, key_type, key_blob) {
+                HostKeyStatus::Known => HostKeyStatus::Known,
+                HostKeyStatus::Revoked => HostKeyStatus::Revoked,
+                _ => HostKeyStatus::Unknown,
             }
         }
     }
@@ -1309,8 +1311,14 @@ impl SshClient {
                         return Err(SshError::HostKeyVerificationFailed);
                     }
                 }
+                // A `@revoked` known_hosts entry always refuses the key,
+                // regardless of StrictHostKeyChecking (OpenSSH behavior).
+                HostKeyStatus::Revoked => {
+                    eprintln!("Host key for {} is revoked", lookup_host);
+                    return Err(SshError::HostKeyVerificationFailed);
+                }
             }
-            }
+        }
         }
 
         // The exchange-hash signature is made by the host's private key, so a
@@ -1351,6 +1359,10 @@ impl SshClient {
                         .unwrap_or_else(|| host_key_type.clone())
                 };
                 HostKeyVerifier::verify_with(&verifier, &sig_alg, &exchange_hash, &server_signature_blob)?
+            }
+            "sk-ssh-ed25519@openssh.com" | "sk-ecdsa-sha2-nistp256@openssh.com" => {
+                let verifier = SkHostKey::from_blob(&server_host_key_blob)?;
+                HostKeyVerifier::verify(&verifier, &exchange_hash, &server_signature_blob)?
             }
             other => {
                 eprintln!("Warning: unsupported host key type {} for signature verification", other);

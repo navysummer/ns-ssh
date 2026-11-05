@@ -723,6 +723,10 @@ impl ServerAuth {
                 Some(Box::new(ssh_core::hostkey::RsaHostKey::new(None, public_key, bits))
                     as Box<dyn ssh_core::hostkey::HostKeySigner>)
             }
+            "sk-ssh-ed25519@openssh.com" | "sk-ecdsa-sha2-nistp256@openssh.com" => {
+                let signer = ssh_core::hostkey::SkHostKey::from_blob(public_key).ok()?;
+                Some(Box::new(signer) as Box<dyn ssh_core::hostkey::HostKeySigner>)
+            }
             _ => None,
         }
     }
