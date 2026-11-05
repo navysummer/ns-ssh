@@ -1554,7 +1554,14 @@ async fn validate_user_certificate(
         if g.is_revoked_cert(&cert) {
             return None;
         }
-        if !cert.verify_ca_signature(None) {
+        // CASignatureAlgorithms: only the configured (or OpenSSH default)
+        // CA key types may sign user certificates.
+        let ca_algs = if config.ca_signature_algorithms.is_empty() {
+            ssh_core::cert::default_ca_signature_algorithms()
+        } else {
+            config.ca_signature_algorithms.clone()
+        };
+        if !cert.verify_ca_signature(Some(&ca_algs)) {
             return None;
         }
         principals = g.authorized_principals(

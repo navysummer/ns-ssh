@@ -255,10 +255,11 @@ fn host_cert_status(
     host: &str,
     port: u16,
     cert: &Certificate,
+    allowed_ca_algorithms: &[String],
 ) -> HostKeyStatus {
     let mut trusted_cas = user_kh.cert_authorities_for(host, port);
     trusted_cas.extend(global_kh.cert_authorities_for(host, port));
-    host_cert_status_with_cas(host, cert, &trusted_cas)
+    host_cert_status_with_cas(host, cert, &trusted_cas, allowed_ca_algorithms)
 }
 
 /// Verify a host certificate against an explicit list of trusted CA keys
@@ -267,6 +268,7 @@ fn host_cert_status_with_cas(
     host: &str,
     cert: &Certificate,
     trusted_cas: &[Vec<u8>],
+    allowed_ca_algorithms: &[String],
 ) -> HostKeyStatus {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -281,7 +283,7 @@ fn host_cert_status_with_cas(
     if trusted_cas.is_empty() {
         return HostKeyStatus::Unknown;
     }
-    if !cert.verify_ca_signature(None) {
+    if !cert.verify_ca_signature(Some(allowed_ca_algorithms)) {
         return HostKeyStatus::Changed;
     }
     if !trusted_cas.iter().any(|ca| ca == &cert.signature_key) {
@@ -1060,6 +1062,14 @@ impl SshClient {
                 &host_key_type, &server_host_key_blob,
             );
 
+            // CASignatureAlgorithms: which CA key types may certify host keys
+            // (unset means OpenSSH's default list, which excludes ssh-rsa).
+            let ca_algs: Vec<String> = self
+                .config
+                .ca_signature_algorithms
+                .clone()
+                .unwrap_or_else(ssh_core::cert::default_ca_signature_algorithms);
+
             // A certified host key is trusted through a `@cert-authority`
             // known_hosts marker instead of a plain host key entry.
             if status != HostKeyStatus::Known {
@@ -1070,6 +1080,7 @@ impl SshClient {
                         &lookup_host,
                         self.config.port,
                         cert,
+                        &ca_algs,
                     );
                 }
             }
@@ -1099,7 +1110,7 @@ impl SshClient {
                                     let trusted =
                                         cmd_kh.cert_authorities_for(&lookup_host, self.config.port);
                                     cmd_status =
-                                        host_cert_status_with_cas(&lookup_host, cert, &trusted);
+                                        host_cert_status_with_cas(&lookup_host, cert, &trusted, &ca_algs);
                                 }
                             }
                             if cmd_status != HostKeyStatus::Unknown {

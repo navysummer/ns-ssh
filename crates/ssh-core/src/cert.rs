@@ -41,6 +41,22 @@ pub fn is_certificate_key_type(key_type: &str) -> bool {
     key_type.ends_with("-cert-v01@openssh.com")
 }
 
+/// OpenSSH's default `CASignatureAlgorithms`: CA keys may only be of these
+/// types (notably ssh-rsa and DSA are excluded).
+pub fn default_ca_signature_algorithms() -> Vec<String> {
+    [
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Map a certificate key type to the plain key type it wraps.
 pub fn base_key_type_for(key_type: &str) -> Option<&'static str> {
     match key_type {
@@ -367,6 +383,15 @@ impl HostKeySigner for CertificateSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_ca_algorithms_exclude_rsa_and_dsa() {
+        let algs = default_ca_signature_algorithms();
+        assert!(algs.iter().any(|a| a == "ssh-ed25519"));
+        assert!(algs.iter().any(|a| a == "ecdsa-sha2-nistp256"));
+        assert!(!algs.iter().any(|a| a == "ssh-rsa"));
+        assert!(!algs.iter().any(|a| a == "ssh-dss"));
+    }
 
     fn build_user_cert(principals: &[&str], valid_after: u64, valid_before: u64, signer: &dyn HostKeySigner) -> Vec<u8> {
         let mut cert = Vec::new();

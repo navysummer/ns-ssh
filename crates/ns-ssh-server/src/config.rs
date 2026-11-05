@@ -343,6 +343,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub pubkey_auth_options: Vec<String>,
 
+    /// CASignatureAlgorithms: CA key types allowed to sign user certificates.
+    #[serde(default)]
+    pub ca_signature_algorithms: Vec<String>,
+
     /// Match blocks from sshd_config, evaluated per-connection.
     #[serde(skip, default)]
     pub match_blocks: Vec<ServerMatch>,
@@ -363,6 +367,7 @@ pub struct MatchOverrides {
     pub password_auth: Option<bool>,
     pub pubkey_auth: Option<bool>,
     pub pubkey_auth_options: Option<Vec<String>>,
+    pub ca_signature_algorithms: Option<Vec<String>>,
     pub kbd_interactive_auth: Option<bool>,
     pub allow_tcp_forwarding_mode: Option<String>,
     pub x11_forwarding: Option<bool>,
@@ -502,6 +507,7 @@ impl ServerMatch {
         if let Some(v) = o.password_auth { cfg.password_auth = v; }
         if let Some(v) = o.pubkey_auth { cfg.pubkey_auth = v; }
         if let Some(v) = &o.pubkey_auth_options { cfg.pubkey_auth_options = v.clone(); }
+        if let Some(v) = &o.ca_signature_algorithms { cfg.ca_signature_algorithms = v.clone(); }
         if let Some(v) = o.kbd_interactive_auth { cfg.kbd_interactive_auth = v; }
         if let Some(v) = &o.allow_tcp_forwarding_mode { cfg.allow_tcp_forwarding_mode = v.clone(); }
         if let Some(v) = o.x11_forwarding { cfg.x11_forwarding = v; }
@@ -580,6 +586,9 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         }
         "pubkeyauthoptions" | "pubkey_auth_options" => {
             o.pubkey_auth_options = Some(parse_pubkey_auth_options(value)?);
+        }
+        "casignaturealgorithms" | "ca_signature_algorithms" => {
+            o.ca_signature_algorithms = Some(parse_ca_signature_algorithms(value)?);
         }
         "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
         | "challengeresponseauthentication" | "challenge_response_authentication"
@@ -708,8 +717,7 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
             o.authorized_principals_command_user = Some(value.to_string());
         }
         // Known OpenSSH directives accepted inside Match blocks but not enforced.
-        "casignaturealgorithms" | "ca_signature_algorithms"
-        | "hostcertificate" | "host_certificate"
+        "hostcertificate" | "host_certificate"
         | "requiredrsasize" | "required_rsa_size"
         | "disableforwarding" | "disable_forwarding"
         | "permittunnel" | "permit_tunnel"
@@ -861,6 +869,22 @@ pub fn parse_pubkey_auth_options(value: &str) -> Result<Vec<String>> {
         }
     }
     Ok(opts)
+}
+
+/// Parse an OpenSSH `CASignatureAlgorithms` value: a comma-separated list of
+/// key types permitted for CA keys. An empty list is rejected, as in OpenSSH.
+pub fn parse_ca_signature_algorithms(value: &str) -> Result<Vec<String>> {
+    let algs: Vec<String> = value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if algs.is_empty() {
+        return Err(SshError::Config(
+            "CASignatureAlgorithms requires at least one algorithm".to_string(),
+        ));
+    }
+    Ok(algs)
 }
 
 /// Parse an OpenSSH `AuthenticationMethods` value. Whitespace separates
@@ -1206,6 +1230,7 @@ impl Default for ServerConfig {
             rekey_limit_time: default_rekey_seconds(),
             pubkey_accepted_algorithms: None,
             pubkey_auth_options: Vec::new(),
+            ca_signature_algorithms: Vec::new(),
             compression: false,
             password_auth: default_true(),
             kbd_interactive_auth: default_true(),
@@ -1512,6 +1537,9 @@ impl ServerConfig {
                 "pubkeyauthoptions" | "pubkey_auth_options" => {
                     config.pubkey_auth_options = parse_pubkey_auth_options(value)?;
                 }
+                "casignaturealgorithms" | "ca_signature_algorithms" => {
+                    config.ca_signature_algorithms = parse_ca_signature_algorithms(value)?;
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();
@@ -1805,8 +1833,7 @@ impl ServerConfig {
                 // Known OpenSSH directives accepted but not enforced. Accepting
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
-                "casignaturealgorithms" | "ca_signature_algorithms"
-                | "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
+                "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
                 | "modulifile" | "moduli_file"
                 | "rdomain"
                 | "sshdsessionpath" | "sshd_session_path"
@@ -2046,6 +2073,33 @@ Match User alice
         assert_eq!(r.pubkey_auth_options, vec!["verify-required".to_string()]);
         let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.pubkey_auth_options.is_empty());
+    }
+
+    #[test]
+    fn ca_signature_algorithms_parsing() {
+        // Default: empty (OpenSSH default list applies at verification time).
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.ca_signature_algorithms.is_empty());
+
+        let cfg = ServerConfig::parse("CASignatureAlgorithms ssh-ed25519,ecdsa-sha2-nistp256\n")
+            .unwrap();
+        assert_eq!(
+            cfg.ca_signature_algorithms,
+            vec!["ssh-ed25519".to_string(), "ecdsa-sha2-nistp256".to_string()]
+        );
+
+        // An empty algorithm list is rejected, as in OpenSSH.
+        assert!(ServerConfig::parse("CASignatureAlgorithms \n").is_err());
+
+        // Match blocks may override it.
+        let cfg = ServerConfig::parse(
+            "Match User alice\n    CASignatureAlgorithms ssh-ed25519\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
+        assert_eq!(r.ca_signature_algorithms, vec!["ssh-ed25519".to_string()]);
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
+        assert!(r.ca_signature_algorithms.is_empty());
     }
 
     #[test]

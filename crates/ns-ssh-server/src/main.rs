@@ -6,6 +6,7 @@ mod server;
 
 use config::ServerConfig;
 use config::parse_pubkey_auth_options;
+use config::parse_ca_signature_algorithms;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -100,6 +101,10 @@ fn main() {
                 "pubkeyauthoptions" | "pubkey_auth_options" => {
                     config.pubkey_auth_options =
                         parse_pubkey_auth_options(value).unwrap_or_default();
+                }
+                "casignaturealgorithms" | "ca_signature_algorithms" => {
+                    config.ca_signature_algorithms =
+                        parse_ca_signature_algorithms(value).unwrap_or_default();
                 }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
