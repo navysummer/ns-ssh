@@ -109,6 +109,16 @@ pub struct HostConfig {
     /// AUTH/LOCAL0..LOCAL7); `None` keeps stderr/file logging.
     #[serde(default)]
     pub syslog_facility: Option<String>,
+    /// SessionType: none/subsystem/default.
+    #[serde(default)]
+    pub session_type: Option<String>,
+    /// StdinNull: do not read local stdin for the session.
+    #[serde(default)]
+    pub stdin_null: Option<bool>,
+    /// KbdInteractiveDevices: submethods name-list sent in the
+    /// keyboard-interactive USERAUTH_REQUEST.
+    #[serde(default)]
+    pub kbd_interactive_devices: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -461,6 +471,12 @@ pub struct ResolvedConfig {
     pub xauth_location: Option<String>,
     /// SyslogFacility: syslog facility for client diagnostics.
     pub syslog_facility: Option<String>,
+    /// SessionType: none/subsystem/default (None = default).
+    pub session_type: Option<String>,
+    /// StdinNull: do not read local stdin.
+    pub stdin_null: bool,
+    /// KbdInteractiveDevices: keyboard-interactive submethods.
+    pub kbd_interactive_devices: Option<String>,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -598,6 +614,9 @@ impl ResolvedConfig {
             tunnel_device: None,
             xauth_location: None,
             syslog_facility: None,
+            session_type: None,
+            stdin_null: false,
+            kbd_interactive_devices: None,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -990,6 +1009,9 @@ impl SshConfig {
         let mut tunnel_device = None;
         let mut xauth_location = None;
         let mut syslog_facility = None;
+        let mut session_type = None;
+        let mut stdin_null = None;
+        let mut kbd_interactive_devices = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1087,6 +1109,9 @@ impl SshConfig {
                             tunnel_device: tunnel_device.take(),
                             xauth_location: xauth_location.take(),
                             syslog_facility: syslog_facility.take(),
+                            session_type: session_type.take(),
+                            stdin_null: stdin_null.take(),
+                            kbd_interactive_devices: kbd_interactive_devices.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1201,6 +1226,9 @@ impl SshConfig {
                             tunnel_device: tunnel_device.take(),
                             xauth_location: xauth_location.take(),
                             syslog_facility: syslog_facility.take(),
+                            session_type: session_type.take(),
+                            stdin_null: stdin_null.take(),
+                            kbd_interactive_devices: kbd_interactive_devices.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1295,6 +1323,9 @@ impl SshConfig {
                             tunnel_device: tunnel_device.take(),
                             xauth_location: xauth_location.take(),
                             syslog_facility: syslog_facility.take(),
+                            session_type: session_type.take(),
+                            stdin_null: stdin_null.take(),
+                            kbd_interactive_devices: kbd_interactive_devices.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1561,12 +1592,22 @@ impl SshConfig {
                 "syslogfacility" | "syslog_facility" => {
                     syslog_facility = Some(parse_syslog_facility(value)?);
                 }
+                "sessiontype" | "session_type" => {
+                    let v = value.to_ascii_lowercase();
+                    if !matches!(v.as_str(), "none" | "subsystem" | "default") {
+                        return Err(SshError::Config(format!("bad SessionType: {}", value)));
+                    }
+                    session_type = Some(v);
+                }
+                "stdinnull" | "stdin_null" => {
+                    stdin_null = Some(yes(value));
+                }
+                "kbdinteractivedevices" | "kbd_interactive_devices" => {
+                    kbd_interactive_devices = Some(value.to_string());
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
-                "kbdinteractivedevices" | "kbd_interactive_devices"
-                | "stdinnull" | "stdin_null"
-                | "sessiontype" | "session_type"
                 | "enableescapecommandline" | "enable_escape_commandline"
                 | "enablesshkeysign" | "enable_ssh_keysign"
                 | "forkafterauthentication" | "fork_after_authentication"
@@ -1661,6 +1702,9 @@ impl SshConfig {
                 tunnel_device: tunnel_device.clone(),
                 xauth_location: xauth_location.clone(),
                 syslog_facility: syslog_facility.clone(),
+                session_type: session_type.clone(),
+                stdin_null: stdin_null.clone(),
+                kbd_interactive_devices: kbd_interactive_devices.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
@@ -2485,6 +2529,22 @@ Match tagged !jump
 
         // Only OpenSSH's documented facilities are accepted.
         assert!(SshConfig::parse("Host example\n  SyslogFacility bogus\n").is_err());
+    }
+
+    #[test]
+    fn session_type_stdin_null_and_kbd_devices() {
+        let cfg = SshConfig::parse(
+            "Host example\n  SessionType none\n  StdinNull yes\n  KbdInteractiveDevices pam,skey\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.hosts[0].session_type.as_deref(), Some("none"));
+        assert_eq!(cfg.hosts[0].stdin_null, Some(true));
+        assert_eq!(
+            cfg.hosts[0].kbd_interactive_devices.as_deref(),
+            Some("pam,skey")
+        );
+
+        assert!(SshConfig::parse("Host example\n  SessionType bogus\n").is_err());
     }
 
     #[test]

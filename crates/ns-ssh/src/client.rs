@@ -1594,7 +1594,13 @@ impl SshClient {
                     if self.config.batch_mode {
                         continue;
                     }
-                    let kbd_method = AuthMethod::KeyboardInteractive(Vec::new());
+                    let submethods = self
+                        .config
+                        .kbd_interactive_devices
+                        .clone()
+                        .unwrap_or_default()
+                        .into_bytes();
+                    let kbd_method = AuthMethod::KeyboardInteractive(submethods);
                     let kbd_msg = build_userauth_request_with_session(
                         &username,
                         msg::SSH_SERVICE_NAME_CONNECTION,
@@ -1856,7 +1862,8 @@ impl SshClient {
         let aead = self.is_aead();
         let mut exit_code: i32 = 0;
         let mut should_exit = false;
-        let mut stdin_active = true;
+        // StdinNull: never read local stdin for this session.
+        let mut stdin_active = !self.config.stdin_null;
 
         // OpenSSH-style escape characters are processed only when stdin is a
         // terminal (interactive session), matching `ssh` behavior. Setting
@@ -1870,20 +1877,22 @@ impl SshClient {
         let mut escape_state = EscapeState::new();
 
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            loop {
-                let n = tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    let mut buf = [0u8; 4096];
-                    match std::io::stdin().read(&mut buf) {
-                        Ok(n) => (n, buf),
-                        Err(_) => (0, [0u8; 4096]),
-                    }
-                }).await.unwrap_or((0, [0u8; 4096]));
-                if n.0 == 0 { break; }
-                if stdin_tx.send(n.1[..n.0].to_vec()).is_err() { break; }
-            }
-        });
+        if !self.config.stdin_null {
+            tokio::spawn(async move {
+                loop {
+                    let n = tokio::task::spawn_blocking(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 4096];
+                        match std::io::stdin().read(&mut buf) {
+                            Ok(n) => (n, buf),
+                            Err(_) => (0, [0u8; 4096]),
+                        }
+                    }).await.unwrap_or((0, [0u8; 4096]));
+                    if n.0 == 0 { break; }
+                    if stdin_tx.send(n.1[..n.0].to_vec()).is_err() { break; }
+                }
+            });
+        }
 
         let (to_ssh_tx, mut to_ssh_rx) = mpsc::unbounded_channel::<(ChannelId, Vec<u8>)>();
 
@@ -5322,7 +5331,14 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
         let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
         let final_cmd = config.remote_command.clone().or(cmd);
 
-        let has_session = !config.no_remote_command && config.stdio_forward.is_none();
+        let session_type = config.session_type.as_deref().unwrap_or("default");
+        if session_type == "subsystem" && config.subsystem.is_none() {
+            eprintln!("ns-ssh: SessionType=subsystem requires a subsystem name (-s)");
+            return 255;
+        }
+        let has_session = !config.no_remote_command
+            && config.stdio_forward.is_none()
+            && session_type != "none";
 
         // Set up terminal raw mode for interactive sessions
         let _term_guard = if use_pty && has_session {
@@ -5333,6 +5349,10 @@ pub fn run_client(config: crate::config::ResolvedConfig, cmd: Option<String>, fo
 
         // -s subsystem request
         if let Some(ref sub) = config.subsystem {
+            if session_type == "none" {
+                eprintln!("ns-ssh: SessionType=none conflicts with a subsystem request");
+                return 255;
+            }
             let sid = match client.request_session_subsystem(sub).await {
                 Ok(sid) => sid,
                 Err(e) => { eprintln!("ns-ssh: subsystem request failed: {}", e); return 255; }

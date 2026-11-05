@@ -6,7 +6,8 @@ use crate::hostkey::HostKeySigner;
 pub enum AuthMethod {
     Password(String),
     PublicKey(Box<dyn HostKeySigner>),
-    KeyboardInteractive(Vec<(String, String)>),
+    /// Payload is the `submethods` name-list (KbdInteractiveDevices).
+    KeyboardInteractive(Vec<u8>),
     None,
 }
 
@@ -37,10 +38,10 @@ pub fn build_userauth_request(
             let signature = signer.sign(&sign_data).unwrap_or_default();
             SshBytes(signature).encode(&mut payload).unwrap();
         }
-        AuthMethod::KeyboardInteractive(_) => {
+        AuthMethod::KeyboardInteractive(submethods) => {
             SshString::new("keyboard-interactive").encode(&mut payload).unwrap();
             SshString::new("").encode(&mut payload).unwrap();
-            SshString::new("").encode(&mut payload).unwrap();
+            SshBytes(submethods.clone()).encode(&mut payload).unwrap();
         }
         AuthMethod::None => {
             SshString::new("none").encode(&mut payload).unwrap();
@@ -150,10 +151,10 @@ pub fn build_userauth_request_with_session(
             let signature = signer.sign(&sign_data).unwrap_or_default();
             SshBytes(signature).encode(&mut payload).unwrap();
         }
-        AuthMethod::KeyboardInteractive(_) => {
+        AuthMethod::KeyboardInteractive(submethods) => {
             SshString::new("keyboard-interactive").encode(&mut payload).unwrap();
             SshString::new("").encode(&mut payload).unwrap();
-            SshString::new("").encode(&mut payload).unwrap();
+            SshBytes(submethods.clone()).encode(&mut payload).unwrap();
         }
         AuthMethod::None => {
             SshString::new("none").encode(&mut payload).unwrap();

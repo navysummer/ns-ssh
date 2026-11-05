@@ -1699,6 +1699,15 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(v) = &h.syslog_facility {
             resolved.syslog_facility = Some(v.clone());
         }
+        if let Some(v) = &h.session_type {
+            resolved.session_type = Some(v.clone());
+        }
+        if let Some(v) = h.stdin_null {
+            resolved.stdin_null = v;
+        }
+        if let Some(v) = &h.kbd_interactive_devices {
+            resolved.kbd_interactive_devices = Some(v.clone());
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1905,6 +1914,15 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = &host_config.syslog_facility {
                 resolved.syslog_facility = Some(v.clone());
+            }
+            if let Some(v) = &host_config.session_type {
+                resolved.session_type = Some(v.clone());
+            }
+            if let Some(v) = host_config.stdin_null {
+                resolved.stdin_null = v;
+            }
+            if let Some(v) = &host_config.kbd_interactive_devices {
+                resolved.kbd_interactive_devices = Some(v.clone());
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2223,6 +2241,15 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(v) = &mc.syslog_facility {
                 resolved.syslog_facility = Some(v.clone());
             }
+            if let Some(v) = &mc.session_type {
+                resolved.session_type = Some(v.clone());
+            }
+            if let Some(v) = mc.stdin_null {
+                resolved.stdin_null = v;
+            }
+            if let Some(v) = &mc.kbd_interactive_devices {
+                resolved.kbd_interactive_devices = Some(v.clone());
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2490,6 +2517,16 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
             if let Ok(v) = crate::config::parse_syslog_facility(value) {
                 resolved.syslog_facility = Some(v);
             }
+        }
+        "sessiontype" | "session_type" => {
+            let v = value.to_ascii_lowercase();
+            if matches!(v.as_str(), "none" | "subsystem" | "default") {
+                resolved.session_type = Some(v);
+            }
+        }
+        "stdinnull" | "stdin_null" => resolved.stdin_null = value == "yes",
+        "kbdinteractivedevices" | "kbd_interactive_devices" => {
+            resolved.kbd_interactive_devices = Some(value.to_string());
         }
         "connecttimeout" | "connect_timeout" => {
             if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }
