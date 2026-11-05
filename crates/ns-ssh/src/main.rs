@@ -1601,6 +1601,9 @@ fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[Str
         if let Some(hk) = &h.global_known_hosts_file {
             resolved.global_known_hosts_file = Some(std::path::PathBuf::from(hk));
         }
+        if let Some(p) = &h.revoked_host_keys {
+            resolved.revoked_host_keys = Some(std::path::PathBuf::from(p));
+        }
         if let Some(v) = h.hash_known_hosts {
             resolved.hash_known_hosts = v;
         }
@@ -1784,6 +1787,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(p) = &host_config.global_known_hosts_file {
                 resolved.global_known_hosts_file = Some(std::path::PathBuf::from(p));
+            }
+            if let Some(p) = &host_config.revoked_host_keys {
+                resolved.revoked_host_keys = Some(std::path::PathBuf::from(p));
             }
             if let Some(v) = host_config.connect_timeout {
                 resolved.connect_timeout = Some(v);
@@ -2079,6 +2085,9 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             if let Some(p) = &mc.global_known_hosts_file {
                 resolved.global_known_hosts_file = Some(std::path::PathBuf::from(p));
             }
+            if let Some(p) = &mc.revoked_host_keys {
+                resolved.revoked_host_keys = Some(std::path::PathBuf::from(p));
+            }
             if let Some(v) = mc.connect_timeout {
                 resolved.connect_timeout = Some(v);
             }
@@ -2314,6 +2323,9 @@ fn apply_ssh_option(resolved: &mut ResolvedConfig, key: &str, value: &str) {
         }
         "globalknownhostsfile" | "global_known_hosts_file" => {
             resolved.global_known_hosts_file = Some(std::path::PathBuf::from(value));
+        }
+        "revokedhostkeys" | "revoked_host_keys" => {
+            resolved.revoked_host_keys = Some(std::path::PathBuf::from(value));
         }
         "connecttimeout" | "connect_timeout" => {
             if let Ok(v) = value.parse::<u32>() { resolved.connect_timeout = Some(v); }

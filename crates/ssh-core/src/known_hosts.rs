@@ -365,6 +365,38 @@ mod tests {
     }
 
     #[test]
+    fn revoked_host_keys_file_detects_listed_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ns-ssh-revoked-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revoked_keys");
+
+        let listed: Vec<u8> = b"ssh-ed25519-key-blob".to_vec();
+        let other: Vec<u8> = b"ssh-rsa-key-blob".to_vec();
+        let listed_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &listed,
+        );
+        std::fs::write(
+            &path,
+            format!("# comment line\nssh-ed25519 {}\n", listed_b64),
+        )
+        .unwrap();
+
+        assert!(key_is_revoked(&path, "ssh-ed25519", &listed));
+        // Same type, different key blob: not revoked.
+        assert!(!key_is_revoked(&path, "ssh-ed25519", &other));
+        // Same blob under a different type: not revoked.
+        assert!(!key_is_revoked(&path, "ssh-rsa", &listed));
+        // Missing file revokes nothing.
+        assert!(!key_is_revoked(&dir.join("absent"), "ssh-ed25519", &listed));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn hash_hostname_matches_openssh_format() {
         // Known vector: openssl kdf or openssh-computed value.
         let salt = [0x4du8; 16];
@@ -526,4 +558,35 @@ pub fn hash_host_key(hostname: &str, port: u16, key_type: &str, public_key: &[u8
         let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
         format!("{}:{}", key_type, hex)
     }
+}
+
+/// Whether `key_type`/`public_key` appears in an OpenSSH `RevokedHostKeys`
+/// file. Such files list plain `keytype base64 [comment]` lines (no host
+/// names); a matching key must never be accepted, regardless of the host.
+/// A missing or unreadable file revokes nothing.
+pub fn key_is_revoked(path: &Path, key_type: &str, public_key: &[u8]) -> bool {
+    let Ok(content) = fs::read_to_string(path) else { return false };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(line_key_type), Some(key_b64)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if line_key_type != key_type {
+            continue;
+        }
+        let Ok(bytes) = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            key_b64,
+        ) else {
+            continue;
+        };
+        if bytes == public_key {
+            return true;
+        }
+    }
+    false
 }

@@ -1038,6 +1038,22 @@ impl SshClient {
             {
                 tracing::debug!("skipping host-key verification for localhost");
             } else {
+            // RevokedHostKeys: a key listed in this file is refused outright,
+            // before any known_hosts status is considered (OpenSSH behavior).
+            if let Some(revoked_path) = &self.config.revoked_host_keys {
+                let revoked = ssh_core::known_hosts::key_is_revoked(
+                    revoked_path, &host_key_type, &server_host_key_blob,
+                ) || host_cert.as_ref().map_or(false, |c| {
+                    ssh_core::known_hosts::key_is_revoked(
+                        revoked_path, &c.key_type, &c.raw_key_blob,
+                    )
+                });
+                if revoked {
+                    eprintln!("Host key for {} is revoked", lookup_host);
+                    return Err(SshError::HostKeyVerificationFailed);
+                }
+            }
+
             let mut status = check_host_status(
                 &user_kh, &global_kh,
                 &lookup_host, self.config.port,

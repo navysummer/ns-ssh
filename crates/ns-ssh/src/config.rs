@@ -87,6 +87,9 @@ pub struct HostConfig {
     pub user_known_hosts_file: Option<String>,
     #[serde(default)]
     pub global_known_hosts_file: Option<String>,
+    /// RevokedHostKeys: file listing host keys that must never be accepted.
+    #[serde(default)]
+    pub revoked_host_keys: Option<String>,
     #[serde(default)]
     pub connect_timeout: Option<u32>,
     #[serde(default)]
@@ -425,6 +428,8 @@ pub struct ResolvedConfig {
     pub hash_known_hosts: bool,
     pub user_known_hosts_file: Option<PathBuf>,
     pub global_known_hosts_file: Option<PathBuf>,
+    /// RevokedHostKeys: keys listed here are refused outright.
+    pub revoked_host_keys: Option<PathBuf>,
     pub connect_timeout: Option<u32>,
     pub server_alive_interval: Option<u32>,
     pub server_alive_count_max: Option<u32>,
@@ -555,6 +560,7 @@ impl ResolvedConfig {
             hash_known_hosts: false,
             user_known_hosts_file: None,
             global_known_hosts_file: None,
+            revoked_host_keys: None,
             connect_timeout: None,
             server_alive_interval: None,
             server_alive_count_max: None,
@@ -940,6 +946,7 @@ impl SshConfig {
         let mut hash_known_hosts = None;
         let mut user_known_hosts_file = None;
         let mut global_known_hosts_file = None;
+        let mut revoked_host_keys = None;
         let mut connect_timeout = None;
         let mut server_alive_interval = None;
         let mut server_alive_count_max = None;
@@ -1030,6 +1037,7 @@ impl SshConfig {
                             hash_known_hosts: hash_known_hosts.take(),
                             user_known_hosts_file: user_known_hosts_file.take(),
                             global_known_hosts_file: global_known_hosts_file.take(),
+                            revoked_host_keys: revoked_host_keys.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1137,6 +1145,7 @@ impl SshConfig {
                             hash_known_hosts: hash_known_hosts.take(),
                             user_known_hosts_file: user_known_hosts_file.take(),
                             global_known_hosts_file: global_known_hosts_file.take(),
+                            revoked_host_keys: revoked_host_keys.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1224,6 +1233,7 @@ impl SshConfig {
                             hash_known_hosts: hash_known_hosts.take(),
                             user_known_hosts_file: user_known_hosts_file.take(),
                             global_known_hosts_file: global_known_hosts_file.take(),
+                            revoked_host_keys: revoked_host_keys.take(),
                             connect_timeout: connect_timeout.take(),
                             server_alive_interval: server_alive_interval.take(),
                             server_alive_count_max: server_alive_count_max.take(),
@@ -1458,6 +1468,9 @@ impl SshConfig {
                 "hostbasedacceptedalgorithms" | "hostbased_accepted_algorithms" | "hostbasedkeytypes" => {
                     hostbased_accepted_algorithms = Some(value.to_string());
                 }
+                "revokedhostkeys" | "revoked_host_keys" => {
+                    revoked_host_keys = Some(value.to_string());
+                }
                 // Known OpenSSH directives that we accept but do not enforce.
                 // Accepting them keeps real-world configs loadable; enforcement
                 // is tracked separately (see docs/openssh-gap-audit.md).
@@ -1468,7 +1481,6 @@ impl SshConfig {
                 | "casignaturealgorithms" | "ca_signature_algorithms"
                 | "stdinnull" | "stdin_null"
                 | "sessiontype" | "session_type"
-                | "revokedhostkeys" | "revoked_host_keys"
                 | "enableescapecommandline" | "enable_escape_commandline"
                 | "enablesshkeysign" | "enable_ssh_keysign"
                 | "forkafterauthentication" | "fork_after_authentication"
@@ -1557,6 +1569,7 @@ impl SshConfig {
                 hash_known_hosts,
                 user_known_hosts_file: user_known_hosts_file.clone(),
                 global_known_hosts_file: global_known_hosts_file.clone(),
+                revoked_host_keys: revoked_host_keys.clone(),
                 connect_timeout,
                 server_alive_interval,
                 server_alive_count_max,
