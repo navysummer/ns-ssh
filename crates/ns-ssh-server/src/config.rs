@@ -358,6 +358,12 @@ pub struct ServerConfig {
     #[serde(skip, default)]
     pub gex_groups: Arc<Vec<GexGroup>>,
 
+    /// RDomain: routing domain for the session. Only `none`/`%D` (inherit the
+    /// listener's domain, which is always none here) is usable on this
+    /// platform; any other value is rejected at startup.
+    #[serde(default)]
+    pub routing_domain: Option<String>,
+
     /// Match blocks from sshd_config, evaluated per-connection.
     #[serde(skip, default)]
     pub match_blocks: Vec<ServerMatch>,
@@ -379,6 +385,7 @@ pub struct MatchOverrides {
     pub pubkey_auth: Option<bool>,
     pub pubkey_auth_options: Option<Vec<String>>,
     pub ca_signature_algorithms: Option<Vec<String>>,
+    pub routing_domain: Option<String>,
     pub kbd_interactive_auth: Option<bool>,
     pub allow_tcp_forwarding_mode: Option<String>,
     pub x11_forwarding: Option<bool>,
@@ -519,6 +526,13 @@ impl ServerMatch {
         if let Some(v) = o.pubkey_auth { cfg.pubkey_auth = v; }
         if let Some(v) = &o.pubkey_auth_options { cfg.pubkey_auth_options = v.clone(); }
         if let Some(v) = &o.ca_signature_algorithms { cfg.ca_signature_algorithms = v.clone(); }
+        if let Some(v) = &o.routing_domain {
+            cfg.routing_domain = if v.eq_ignore_ascii_case("none") || v == "%D" {
+                None
+            } else {
+                Some(v.clone())
+            };
+        }
         if let Some(v) = o.kbd_interactive_auth { cfg.kbd_interactive_auth = v; }
         if let Some(v) = &o.allow_tcp_forwarding_mode { cfg.allow_tcp_forwarding_mode = v.clone(); }
         if let Some(v) = o.x11_forwarding { cfg.x11_forwarding = v; }
@@ -601,6 +615,7 @@ fn apply_match_override(o: &mut MatchOverrides, key: &str, value: &str) -> Resul
         "casignaturealgorithms" | "ca_signature_algorithms" => {
             o.ca_signature_algorithms = Some(parse_ca_signature_algorithms(value)?);
         }
+        "rdomain" => o.routing_domain = Some(value.to_string()),
         "kbdinteractiveauthentication" | "keyboardinteractive" | "kbd_interactive_auth"
         | "challengeresponseauthentication" | "challenge_response_authentication"
         | "skeyauthentication" => {
@@ -1244,6 +1259,7 @@ impl Default for ServerConfig {
             ca_signature_algorithms: Vec::new(),
             moduli_file: None,
             gex_groups: Arc::new(Vec::new()),
+            routing_domain: None,
             compression: false,
             password_auth: default_true(),
             kbd_interactive_auth: default_true(),
@@ -1556,6 +1572,13 @@ impl ServerConfig {
                 "modulifile" | "moduli_file" => {
                     config.moduli_file = Some(value.to_string());
                 }
+                "rdomain" => {
+                    config.routing_domain = if value.eq_ignore_ascii_case("none") || value == "%D" {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();
@@ -1850,7 +1873,6 @@ impl ServerConfig {
                 // them keeps real-world sshd_config files loadable; enforcement
                 // is tracked in docs/openssh-gap-audit.md.
                 "hostbasedusesnamefrompacketonly" | "hostbased_uses_name_from_packet_only"
-                | "rdomain"
                 | "sshdsessionpath" | "sshd_session_path"
                 | "versionaddendum" | "version_addendum"
                 | "xauthlocation" | "xauth_location"
@@ -2115,6 +2137,30 @@ Match User alice
         assert_eq!(r.ca_signature_algorithms, vec!["ssh-ed25519".to_string()]);
         let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
         assert!(r.ca_signature_algorithms.is_empty());
+    }
+
+    #[test]
+    fn rdomain_parsing() {
+        // Default: no routing domain.
+        let cfg = ServerConfig::parse("").unwrap();
+        assert!(cfg.routing_domain.is_none());
+
+        // "none" and "%D" (inherit the listener's domain) both mean none here.
+        let cfg = ServerConfig::parse("RDomain none\n").unwrap();
+        assert!(cfg.routing_domain.is_none());
+        let cfg = ServerConfig::parse("RDomain %D\n").unwrap();
+        assert!(cfg.routing_domain.is_none());
+
+        // A named domain is stored and rejected at startup on this platform.
+        let cfg = ServerConfig::parse("RDomain vpn0\n").unwrap();
+        assert_eq!(cfg.routing_domain.as_deref(), Some("vpn0"));
+
+        // Match blocks may set it as well.
+        let cfg = ServerConfig::parse("Match User alice\n    RDomain vpn1\n").unwrap();
+        let r = cfg.resolve_for_match(&test_ctx("alice", &[], "srv", "10.0.0.5"));
+        assert_eq!(r.routing_domain.as_deref(), Some("vpn1"));
+        let r = cfg.resolve_for_match(&test_ctx("bob", &[], "srv", "10.0.0.5"));
+        assert!(r.routing_domain.is_none());
     }
 
     #[test]

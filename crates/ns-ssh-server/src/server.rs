@@ -67,6 +67,13 @@ impl SshServer {
             self.auth.lock().await.load_revoked_keys(path)?;
         }
 
+        if let Some(ref domain) = self.config.routing_domain {
+            return Err(SshError::Config(format!(
+                "RDomain {} is not supported on this platform",
+                domain
+            )));
+        }
+
         if let Some(path) = self.config.moduli_file.clone() {
             let content = std::fs::read_to_string(&path).map_err(SshError::Io)?;
             let groups = ssh_core::kex::parse_moduli(&content);
@@ -289,6 +296,15 @@ async fn handle_connection(
         user_valid: None,
     };
     let config = base_config.resolve_for_match(&match_ctx);
+
+    // A Match block may set RDomain; reject it like OpenSSH does on platforms
+    // without routing-domain support.
+    if let Some(ref domain) = config.routing_domain {
+        return Err(SshError::Config(format!(
+            "RDomain {} is not supported on this platform",
+            domain
+        )));
+    }
 
     let mut transport = SshTransport::new();
     // Apply RekeyLimit so server-initiated rekeying follows the configured thresholds.

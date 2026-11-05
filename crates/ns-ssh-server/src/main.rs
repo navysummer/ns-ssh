@@ -109,6 +109,13 @@ fn main() {
                 "modulifile" | "moduli_file" => {
                     config.moduli_file = Some(value.to_string());
                 }
+                "rdomain" => {
+                    config.routing_domain = if value.eq_ignore_ascii_case("none") || value == "%D" {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "permitrootlogin" | "permit_root_login" => {
                     let v = value.to_lowercase();
                     config.permit_root_login_mode = v.clone();
