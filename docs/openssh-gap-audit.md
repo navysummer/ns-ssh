@@ -319,6 +319,9 @@ exit code：0
 
 **D3 状态（2026-11-05 复核）**：✅ 判据达成。H05（证书 host key）已实现（`5aa3511`），`client_accepts_host_certificate_via_cert_authority` 集成测试通过：CA 签发 host cert 经 `@cert-authority` 可连接，无 marker 则拒绝。H08（`@cert-authority`/`@revoked`）完整实现：`@cert-authority` 由上述测试覆盖；`@revoked` 于 `bd45d51` 新增（`KnownHostEntry.revoked`、`check` 撤销优先、客户端无条件拒绝），`revoked_known_hosts_entry_refuses_connection` 集成测试通过（`StrictHostKeyChecking=no` 下仍拒绝）。H06（SK host key）于 `bd45d51` 实现验签（`SkHostKey`：解析 `sk-ssh-ed25519`/`sk-ecdsa-sha2-nistp256` blob、提取底层公钥验签、服务端 `create_signer_for_key` 支持 SK 用户认证验签），`sk_ed25519_host_key_parses_and_verifies` 单测通过；硬件签名需 FIDO2 传输，按指示暂不验证（签名路径返回"需 FIDO2 硬件"错误）。
 
+**D4 状态（2026-11-05 复核）**：✅ 判据达成（A06/A07 为环境依赖不支持项，见 §21）。A02（bcrypt/yescrypt/SHA-crypt/明文密码）已实现（`verify_unix_password` 分支 + `verify_unix_password_supports_bcrypt`/`..._yescrypt`/`md5_crypt_known_vector`/`sha512_crypt_known_vector`/`sha256_crypt_known_vector`/`plaintext_password` 单测）。A03（多轮 keyboard-interactive）已实现（`kbd_should_reprompt` + `kbd_should_reprompt_respects_round_cap` 单测）。A05（用户证书）已实现（`0f1e58d`，`server_accepts_user_certificate_from_trusted_ca` 集成测试）。A08（hostbased）已实现（`901a815`）。A09（SK 认证）于 `bd45d51` 实现验签、`7ed0c7f` 补服务端 `create_signer_accepts_sk_key_and_verifies` 单测（底层软件密钥验签、无硬件签名返回错误）。A15（AuthenticationMethods 多因素）已实现（`authentication_methods_chain_is_enforced` 集成测试）。A13（Match LocalAddress/LocalPort/RDomain）已实现（`46f0f58`）。
+**A06（PAM）/ A07（GSSAPI/Kerberos）**：显式标注为不支持（config.rs:1863-1880 接受指令但不执行逻辑，依赖系统库 PAM/GSSAPI），按 §19.1 需产品决策是否新增依赖或平台条件编译。
+
 ## 19. 需要产品决策的选型（先确认再实现）
 
 1. **PAM / GSSAPI / 证书**：OpenSSH 的这些能力依赖系统库（PAM、GSSAPI）或新增纯 Rust 依赖，与原始“零第三方依赖”约束冲突。需要确认是否允许新增依赖或改为平台条件编译。
