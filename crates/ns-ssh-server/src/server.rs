@@ -1360,8 +1360,41 @@ async fn handle_authenticated_session(
 
                         // PermitEmptyPasswords: reject empty passwords unless enabled.
                         let empty_ok = config.permit_empty_passwords || !password.is_empty();
-                        if config.password_auth && empty_ok
-                            && auth.lock().await.verify_password(&username, &password) {
+                        // Only invoke the password verifier (PAM or /etc/shadow)
+                        // when the attempt is admissible; otherwise a PAM stack
+                        // would be invoked needlessly and the attempt would
+                        // count against the user's lockout budget.
+                        let pw_ok = if config.password_auth && empty_ok {
+                            if config.use_pam {
+                                match crate::pam::verify_pam_password(
+                                    &username,
+                                    &password,
+                                    &config.pam_service_name,
+                                ) {
+                                    Some(ok) => ok,
+                                    None => {
+                                        tracing::warn!(
+                                            "UsePAM yes but libpam unavailable; falling back to /etc/shadow for {}",
+                                            username
+                                        );
+                                        auth.lock().await.verify_password(&username, &password)
+                                    }
+                                }
+                            } else {
+                                auth.lock().await.verify_password(&username, &password)
+                            }
+                        } else {
+                            false
+                        };
+                        if config.use_pam {
+                            tracing::debug!(
+                                "password attempt for {}: pam={:?} accepted={}",
+                                username,
+                                crate::pam::pam_available(),
+                                pw_ok
+                            );
+                        }
+                        if config.password_auth && empty_ok && pw_ok {
                             if config.print_last_log {
                                 tracing::info!("Accepted password for {} from {}", username, match_addr);
                             }

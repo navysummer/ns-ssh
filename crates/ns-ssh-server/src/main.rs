@@ -3,6 +3,7 @@ mod hostkey;
 mod auth;
 mod session;
 mod server;
+mod pam;
 
 use config::ServerConfig;
 use config::parse_pubkey_auth_options;

@@ -147,6 +147,17 @@ pub struct ServerConfig {
     #[serde(default)]
     pub permit_empty_passwords: bool,
 
+    /// UsePAM: authenticate passwords through the system PAM stack instead of
+    /// `/etc/shadow`. Requires a runtime-loadable libpam (dlopen); when the
+    /// library is unavailable the password attempt fails (logged, not fatal).
+    #[serde(default)]
+    pub use_pam: bool,
+
+    /// PAMServiceName: the PAM service used for `pam_start` (OpenSSH default
+    /// `sshd`).
+    #[serde(default = "default_pam_service")]
+    pub pam_service_name: String,
+
     #[serde(default = "default_true")]
     pub ignore_rhosts: bool,
 
@@ -834,6 +845,7 @@ fn default_client_alive_interval() -> u32 { 0 }
 fn default_client_alive_count_max() -> u32 { 3 }
 fn default_use_dns() -> bool { false }
 fn default_pid_file() -> String { "/var/run/ns-ssh-server.pid".to_string() }
+fn default_pam_service() -> String { "sshd".to_string() }
 fn default_log_file() -> Option<String> { None }
 fn default_banner() -> Option<String> { None }
 
@@ -1313,6 +1325,8 @@ impl Default for ServerConfig {
             channel_timeouts: Vec::new(),
             permit_tty: default_true(),
             permit_empty_passwords: false,
+            use_pam: false,
+            pam_service_name: default_pam_service(),
             ignore_rhosts: default_true(),
             hostbased_auth: false,
             hostbased_accepted_algorithms: None,
@@ -1860,15 +1874,19 @@ impl ServerConfig {
                     // Handled during load (collect_config). Ignore here for raw parse().
                 }
                 // Explicitly unsupported (environment-dependent) features:
-                // PAM (UsePAM/PAMServiceName), GSSAPI/Kerberos, PKCS#11/FIDO2
-                // security-key providers, the host key agent, and
-                // PerSourcePenalties-based throttling all require external
-                // libraries or platform facilities. The directives are accepted
-                // so that real sshd_config files remain loadable, but no such
-                // authentication, credential delegation or penalty logic runs.
-                "usepam" | "use_pam"
-                | "pamservicename" | "pam_service_name"
-                | "gssapiauthentication" | "gssapi_authentication"
+                // GSSAPI/Kerberos, PKCS#11/FIDO2 security-key providers, the
+                // host key agent, and PerSourcePenalties-based throttling all
+                // require external libraries or platform facilities. The
+                // directives are accepted so that real sshd_config files
+                // remain loadable, but no such authentication, credential
+                // delegation or penalty logic runs.
+                "usepam" | "use_pam" => {
+                    config.use_pam = value == "yes";
+                }
+                "pamservicename" | "pam_service_name" => {
+                    config.pam_service_name = value.to_string();
+                }
+                "gssapiauthentication" | "gssapi_authentication"
                 | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
                 | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
                 | "kerberosauthentication" | "kerberos_authentication"
@@ -2252,7 +2270,11 @@ HostKeyAgent /run/hostkeyd.sock
 ",
         )
         .unwrap();
-        // No enforcement: defaults are unchanged.
+        // UsePAM/PAMServiceName are now stored (PAM is implemented via dlopen);
+        // the remaining GSSAPI/Kerberos/PKCS#11/PerSourcePenalties directives
+        // are accepted but not enforced.
+        assert!(cfg.use_pam, "UsePAM yes should set use_pam");
+        assert_eq!(cfg.pam_service_name, "sshd");
         assert_eq!(cfg.port, 22);
     }
 

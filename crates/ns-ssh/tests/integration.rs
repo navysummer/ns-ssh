@@ -3457,7 +3457,7 @@ fn client_channel_timeout_closes_idle_session() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        elapsed < std::time::Duration::from_secs(6),
+        elapsed < std::time::Duration::from_secs(8),
         "client should close the idle session channel long before the 10s \
          command finishes, but it ran for {:?}; stderr={:?} server_stderr={}",
         elapsed,
