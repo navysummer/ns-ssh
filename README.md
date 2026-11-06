@@ -33,6 +33,12 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Automatic rekeying (RekeyLimit)
 - SFTP subsystem (`internal-sftp`), including the OpenSSH extensions `posix-rename`, `statvfs`, `hardlink`, `fsync`, `limits`, `copy-data`, `expand-path`, `check-file`, `lsetstat`, `home-directory` and `users-groups-by-id`
 
+### ns-scp / ns-sftp (客户端工具)
+
+- `ns-scp`(与 `scp` 同义):**默认走 SFTP 协议**(OpenSSH 9 行为);`-s` 显式强制 SFTP,`-O` 回退旧 SCP 协议(远端 `scp -t/-f`)。支持单/多源、递归目录(`-r`)、属性保留(`-p`,mode+mtime+atime)。
+- `ns-sftp`(与 `sftp` 同义):交互式/批处理(`-b`)SFTP 客户端,命令集与 OpenSSH `sftp` 对齐。
+- 模式由调用名决定:`ns-ssh` 二进制被链接/复制为 `scp`/`ns-scp`/`sftp`/`ns-sftp` 时进入对应子命令。
+
 ### ns-ssl (TLS client/server)
 
 - Pure-Rust TLS built on `rustls` (no OpenSSL/OpenSSH dependency)
