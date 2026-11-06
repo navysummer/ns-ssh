@@ -905,7 +905,13 @@ fn run_scp_mode() -> i32 {
         config.identity_file = Some(std::path::PathBuf::from(id));
     }
     if let Some(ref path) = config_file {
-        let ssh_cfg = config::SshConfig::load_from(std::path::Path::new(path));
+        let ssh_cfg = match config::SshConfig::load_from(std::path::Path::new(path)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ns-scp: {}", e);
+                std::process::exit(255);
+            }
+        };
         apply_scp_ssh_config(&ssh_cfg, &mut config);
     }
     for opt in &options {
@@ -2088,10 +2094,16 @@ fn load_agent_public_keys() -> Result<Vec<String>, ()> {
 }
 
 fn load_config_for_sftp(host: &str, config_file: &Option<String>, options: &[String]) -> ResolvedConfig {
-    let ssh_config = if let Some(path) = config_file {
+    let ssh_config = match if let Some(path) = config_file {
         config::SshConfig::load_from(std::path::Path::new(path))
     } else {
         config::SshConfig::load()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ns-sftp: {}", e);
+            std::process::exit(255);
+        }
     };
 
     let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
@@ -2288,10 +2300,16 @@ fn parse_scp_remote(s: &str) -> ScpTarget {
 }
 
 fn load_config(args: &SshArgs) -> ResolvedConfig {
-    let ssh_config = if let Some(ref path) = args.config_file {
+    let ssh_config = match if let Some(ref path) = args.config_file {
         config::SshConfig::load_from(std::path::Path::new(path))
     } else {
         config::SshConfig::load()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ns-ssh: {}", e);
+            std::process::exit(255);
+        }
     };
 
     let default_user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());

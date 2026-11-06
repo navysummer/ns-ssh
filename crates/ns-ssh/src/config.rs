@@ -878,7 +878,7 @@ fn glob_capture<'a>(pattern: &str, text: &'a str) -> Option<Option<&'a str>> {
 }
 
 impl SshConfig {
-    pub fn load() -> Self {
+    pub fn load() -> Result<Self> {
         let config_path = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".ssh")
@@ -887,14 +887,14 @@ impl SshConfig {
         Self::load_from(&config_path)
     }
 
-    pub fn load_from(path: &Path) -> Self {
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return SshConfig { hosts: Vec::new(), match_blocks: Vec::new() };
+            return Ok(SshConfig { hosts: Vec::new(), match_blocks: Vec::new() });
         }
 
         let mut seen: Vec<PathBuf> = Vec::new();
         let content = Self::collect_config(path, 0, &mut seen);
-        Self::parse(&content).expect("failed to parse client config")
+        Self::parse(&content)
     }
 
     /// Recursively read a config file, expanding `Include` directives. Returns the
@@ -2730,7 +2730,7 @@ Match tagged !jump
         )
         .unwrap();
 
-        let cfg = SshConfig::load_from(&dir.join("config"));
+        let cfg = SshConfig::load_from(&dir.join("config")).unwrap();
         assert!(cfg.hosts.iter().any(|h| h.host == "main"));
         assert!(cfg.hosts.iter().any(|h| h.host == "inc-a"));
         let _ = fs::remove_dir_all(&dir);
@@ -2744,7 +2744,7 @@ Match tagged !jump
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config");
         fs::write(&path, "Host testhost\n  HostName 127.0.0.1\n  Port 2222\n  User alice\n").unwrap();
-        let cfg = SshConfig::load_from(&path);
+        let cfg = SshConfig::load_from(&path).unwrap();
         assert_eq!(cfg.hosts.len(), 1);
         assert_eq!(cfg.hosts[0].host, "testhost");
         assert_eq!(cfg.hosts[0].hostname.as_deref(), Some("127.0.0.1"));

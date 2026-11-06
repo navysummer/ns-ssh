@@ -54,10 +54,16 @@ struct SshdArgs {
 fn main() {
     let args = SshdArgs::parse();
 
-    let mut config = if let Some(ref path) = args.config_path.or(args.config_file) {
+    let mut config = match if let Some(ref path) = args.config_path.or(args.config_file) {
         ServerConfig::load_from(std::path::Path::new(path))
     } else {
         ServerConfig::load()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ns-ssh-server: {}", e);
+            std::process::exit(255);
+        }
     };
 
     if let Some(port) = args.port {

@@ -1382,7 +1382,7 @@ impl ServerConfig {
         cfg
     }
 
-    pub fn load() -> Self {
+    pub fn load() -> Result<Self> {
         let paths = [
             "/etc/ssh/sshd_config",
             "/etc/ns-ssh/sshd_config",
@@ -1394,16 +1394,16 @@ impl ServerConfig {
             }
         }
 
-        Self::default()
+        Ok(Self::default())
     }
 
-    pub fn load_from(path: &Path) -> Self {
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
         let mut seen: Vec<PathBuf> = Vec::new();
         let content = Self::collect_config(path, 0, &mut seen);
-        Self::parse(&content).expect("failed to parse server config")
+        Self::parse(&content)
     }
 
     /// Recursively read a config file, expanding `Include` directives (with glob
