@@ -91,14 +91,14 @@ impl SftpFileAttr {
         if let Some(size) = self.size {
             buf.extend(size.to_be_bytes());
         }
-        if self.flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
+        if flags & SSH_FILEXFER_ATTR_UIDGID != 0 {
             buf.extend(self.uid.unwrap_or(0).to_be_bytes());
             buf.extend(self.gid.unwrap_or(0).to_be_bytes());
         }
-        if self.flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
+        if flags & SSH_FILEXFER_ATTR_PERMISSIONS != 0 {
             buf.extend(self.permissions.unwrap_or(0).to_be_bytes());
         }
-        if self.flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
+        if flags & SSH_FILEXFER_ATTR_ACMODTIME != 0 {
             buf.extend(self.atime.unwrap_or(0).to_be_bytes());
             buf.extend(self.mtime.unwrap_or(0).to_be_bytes());
         }

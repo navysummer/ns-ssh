@@ -772,6 +772,10 @@ fn run_scp_mode() -> i32 {
     let raw: Vec<String> = std::env::args().skip(1).collect();
 
     let mut _recursive = false;
+    let mut _preserve = false;
+    // Protocol: true = SFTP (OpenSSH 9 default), false = old SCP `-t/-f`.
+    // `-s` forces SFTP, `-O` forces the legacy SCP protocol.
+    let mut _sftp_mode = true;
     let mut port = None;
     let mut identity = None;
     let mut options: Vec<String> = Vec::new();
@@ -785,7 +789,11 @@ fn run_scp_mode() -> i32 {
         if arg == "-r" {
             _recursive = true;
         } else if arg == "-p" {
-            // preserve times/mode (the remote scp -t/-f already runs with -p)
+            _preserve = true;
+        } else if arg == "-s" {
+            _sftp_mode = true;
+        } else if arg == "-O" {
+            _sftp_mode = false;
         } else if arg == "-v" || arg == "-q" || arg == "-t" || arg == "-f" {
             // verbose / quiet / remote-side mode flags
         } else if let Some(v) = arg.strip_prefix("-P") {
@@ -926,7 +934,15 @@ fn run_scp_mode() -> i32 {
         let locals: Vec<std::path::PathBuf> =
             sources.iter().map(|s| std::path::PathBuf::from(s)).collect();
         return rt.block_on(async move {
-            if locals.len() > 1 {
+            if _sftp_mode {
+                match scp::scp_upload_sftp(&config, &locals, &remote_path, _recursive, _preserve).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: upload failed: {}", e);
+                        1
+                    }
+                }
+            } else if locals.len() > 1 {
                 match scp::scp_upload_multi(&config, &locals, &remote_path, _recursive).await {
                     Ok(_) => 0,
                     Err(e) => {
@@ -951,7 +967,15 @@ fn run_scp_mode() -> i32 {
         let remote_sources: Vec<String> =
             sources.iter().filter(|s| contains_scp_remote(s)).cloned().collect();
         return rt.block_on(async move {
-            if remote_sources.len() > 1 {
+            if _sftp_mode {
+                match scp::scp_download_sftp(&config, &remote_sources, std::path::Path::new(&local), _recursive, _preserve).await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        eprintln!("ns-scp: download failed: {}", e);
+                        1
+                    }
+                }
+            } else if remote_sources.len() > 1 {
                 match scp::scp_download_multi(&config, &remote_sources, std::path::Path::new(&local), _recursive).await {
                     Ok(_) => 0,
                     Err(e) => {

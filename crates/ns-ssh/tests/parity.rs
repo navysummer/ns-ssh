@@ -643,3 +643,98 @@ fn scp_parity_preserve_times() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// scp parity: `-O` forces the legacy SCP protocol (remote `scp -t/-f`).
+/// ns-scp -O must produce the same remote tree as the system scp -O.
+#[test]
+fn scp_parity_legacy_o_protocol() {
+    let dir = temp_dir("scp-legacy-O");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_server(&dir, port);
+
+    let local = dir.join("f.txt");
+    std::fs::write(&local, b"legacy O\n").unwrap();
+    let remote_base = dir.join("remote");
+    std::fs::create_dir_all(&remote_base).unwrap();
+
+    let base = base_client_args(port, &id_path, &kh);
+    let remote = format!("{}@127.0.0.1:{}/", user, remote_base.display());
+    let scp = ns_tool(&dir, "scp");
+    let sys_scp = "/usr/bin/scp";
+
+    let out_ref = Command::new(sys_scp)
+        .args(&base).arg("-O").arg(&local).arg(&remote)
+        .output().expect("system scp -O");
+    let tree_ref = collect_tree(&remote_base);
+
+    let _ = std::fs::remove_dir_all(&remote_base);
+    std::fs::create_dir_all(&remote_base).unwrap();
+    let out_ns = Command::new(&scp)
+        .args(&base).arg("-O").arg(&local).arg(&remote)
+        .output().expect("ns-scp -O");
+    let tree_ns = collect_tree(&remote_base);
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    assert_eq!(
+        out_ref.status.success(),
+        out_ns.status.success(),
+        "scp -O vs ns-scp -O exit mismatch: ref={:?} ns={:?}\nref_err={}\nns_err={}",
+        out_ref.status.code(), out_ns.status.code(),
+        String::from_utf8_lossy(&out_ref.stderr),
+        String::from_utf8_lossy(&out_ns.stderr)
+    );
+    assert_trees_equal(&tree_ref, &tree_ns, "scp -O legacy protocol upload");
+    assert!(!tree_ns.is_empty(), "ns-scp -O produced no files");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// scp parity: `-s` forces the SFTP protocol explicitly (the new default).
+/// ns-scp -s must match the system scp (which defaults to SFTP on OpenSSH 9).
+#[test]
+fn scp_parity_sftp_s_flag() {
+    let dir = temp_dir("scp-sftp-s");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let (mut server, id_path, kh) = launch_server(&dir, port);
+
+    let local = dir.join("f.txt");
+    std::fs::write(&local, b"sftp flag\n").unwrap();
+    let remote_base = dir.join("remote");
+    std::fs::create_dir_all(&remote_base).unwrap();
+
+    let base = base_client_args(port, &id_path, &kh);
+    let remote = format!("{}@127.0.0.1:{}/", user, remote_base.display());
+    let scp = ns_tool(&dir, "scp");
+    let sys_scp = "/usr/bin/scp";
+
+    // System scp on OpenSSH 9 defaults to SFTP; use -s to be explicit.
+    let out_ref = Command::new(sys_scp)
+        .args(&base).arg("-s").arg(&local).arg(&remote)
+        .output().expect("system scp -s");
+    let tree_ref = collect_tree(&remote_base);
+
+    let _ = std::fs::remove_dir_all(&remote_base);
+    std::fs::create_dir_all(&remote_base).unwrap();
+    let out_ns = Command::new(&scp)
+        .args(&base).arg("-s").arg(&local).arg(&remote)
+        .output().expect("ns-scp -s");
+    let tree_ns = collect_tree(&remote_base);
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    assert_eq!(
+        out_ref.status.success(),
+        out_ns.status.success(),
+        "scp -s vs ns-scp -s exit mismatch: ref={:?} ns={:?}\nref_err={}\nns_err={}",
+        out_ref.status.code(), out_ns.status.code(),
+        String::from_utf8_lossy(&out_ref.stderr),
+        String::from_utf8_lossy(&out_ns.stderr)
+    );
+    assert_trees_equal(&tree_ref, &tree_ns, "scp -s SFTP protocol upload");
+    assert!(!tree_ns.is_empty(), "ns-scp -s produced no files");
+    let _ = std::fs::remove_dir_all(&dir);
+}

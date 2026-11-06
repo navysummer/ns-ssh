@@ -4,6 +4,9 @@ use ssh_core::channel::ChannelId;
 use ssh_core::error::{Result, SshError};
 use ssh_core::sftp::*;
 use std::path::PathBuf;
+use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 pub struct SftpSession {
     client: SshClient,
@@ -13,7 +16,9 @@ pub struct SftpSession {
     local_cwd: PathBuf,
 }
 
-async fn new_sftp_client(config: &ResolvedConfig) -> Result<SftpSession> {
+/// Establish an SFTP session over a new SSH connection. Shared by the
+/// interactive/batch SFTP client and the scp SFTP protocol backend.
+pub async fn connect(config: &ResolvedConfig) -> Result<SftpSession> {
     let mut client = SshClient::new(config.clone());
     client.connect().await?;
     client.handshake().await?;
@@ -345,6 +350,22 @@ impl SftpSession {
         Ok(())
     }
 
+    /// Return the raw attributes of a remote path (via LSTAT), for the scp
+    /// SFTP backend to decide file vs directory and preserve times.
+    pub async fn cmd_stat_attr(&mut self, path: &str) -> Result<SftpFileAttr> {
+        let target = self.resolve(path);
+        let payload = self.request_id(|id| build_sftp_lstat(id, &target)).await?;
+        parse_sftp_attrs(&payload)
+    }
+
+    /// Set mode / mtime / atime on a remote path via SETSTAT. The scp `-p`
+    /// backend uses this to preserve permissions and timestamps, mirroring the
+    /// old SCP protocol's `T` header handling.
+    pub async fn cmd_setattr(&mut self, path: &str, attrs: &SftpFileAttr) -> Result<()> {
+        let target = self.resolve(path);
+        self.ok_id(|id| build_sftp_setstat(id, &target, attrs)).await
+    }
+
 
     pub async fn cmd_chown(&mut self, uid: &str, gid: &str, path: &str) -> Result<()> {
         let target = self.resolve(path);
@@ -471,7 +492,7 @@ impl SftpSession {
 }
 
 pub async fn run_sftp(config: &ResolvedConfig) -> Result<()> {
-    let mut s = new_sftp_client(config).await?;
+    let mut s = connect(config).await?;
 
     let stdin = tokio::io::stdin();
     use tokio::io::AsyncBufReadExt;
@@ -504,7 +525,7 @@ pub async fn run_sftp(config: &ResolvedConfig) -> Result<()> {
 }
 
 pub async fn run_sftp_batch(config: &ResolvedConfig, content: &str) -> Result<()> {
-    let mut s = new_sftp_client(config).await?;
+    let mut s = connect(config).await?;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -865,6 +886,95 @@ impl SftpSession {
         }
         true
     }
+
+    // ---- scp SFTP protocol backend (OpenSSH 9 default; `scp -O` keeps the
+    // ---- old SCP protocol, `scp -s` forces this SFTP path) ----
+
+    /// Upload one local file to `remote_path` via SFTP. When `preserve` is set,
+    /// copy mode and mtime/atime (mirrors `scp -p`).
+    pub async fn scp_put_file(&mut self, local: &Path, remote: &str, preserve: bool) -> Result<()> {
+        self.cmd_put(&local.to_string_lossy(), Some(remote)).await?;
+        if preserve {
+            let meta = std::fs::metadata(local).map_err(|e| SshError::Io(e))?;
+            let mut attrs = SftpFileAttr::new();
+            attrs.permissions = Some(meta.permissions().mode() & 0o7777);
+            if let Ok(m) = meta.modified() {
+                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                    attrs.mtime = Some(d.as_secs() as u32);
+                }
+            }
+            if let Ok(a) = meta.accessed() {
+                if let Ok(d) = a.duration_since(std::time::UNIX_EPOCH) {
+                    attrs.atime = Some(d.as_secs() as u32);
+                }
+            }
+            let _ = self.cmd_setattr(remote, &attrs).await;
+        }
+        Ok(())
+    }
+
+    /// Recursively upload a local directory tree to `remote_dir` via SFTP.
+    pub(crate) async fn scp_put_dir(&mut self, local_dir: &Path, remote_dir: &str, preserve: bool) -> Result<()> {
+        let _ = self.cmd_mkdir(remote_dir).await;
+        let entries = std::fs::read_dir(local_dir).map_err(|e| SshError::Io(e))?;
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| SshError::Io(e))?;
+            names.push(entry.file_name());
+        }
+        names.sort();
+        for name in names {
+            let full = local_dir.join(&name);
+            let fname = name.to_string_lossy().into_owned();
+            let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), fname);
+            let meta = std::fs::metadata(&full).map_err(|e| SshError::Io(e))?;
+            if meta.is_dir() {
+                Box::pin(self.scp_put_dir(&full, &child_remote, preserve)).await?;
+            } else {
+                self.scp_put_file(&full, &child_remote, preserve).await?;
+            }
+        }
+        if preserve {
+            let meta = std::fs::metadata(local_dir).map_err(|e| SshError::Io(e))?;
+            let mut attrs = SftpFileAttr::new();
+            attrs.permissions = Some(meta.permissions().mode() & 0o7777);
+            let _ = self.cmd_setattr(remote_dir, &attrs).await;
+        }
+        Ok(())
+    }
+
+    /// Download one remote file to `local_path` via SFTP. When `preserve` is
+    /// set, copy mode and mtime/atime from the remote file.
+    pub async fn scp_get_file(&mut self, remote: &str, local: &Path, preserve: bool) -> Result<()> {
+        self.cmd_get(remote, Some(&local.to_string_lossy())).await?;
+        if preserve {
+            let attr = self.cmd_stat_attr(remote).await?;
+            apply_sftp_meta_to_local(local, &attr)?;
+        }
+        Ok(())
+    }
+
+    /// Recursively download a remote directory tree to `local_dir` via SFTP.
+    pub(crate) async fn scp_get_dir(&mut self, remote_dir: &str, local_dir: &Path, preserve: bool) -> Result<()> {
+        std::fs::create_dir_all(local_dir).map_err(|e| SshError::Io(e))?;
+        let entries = self.cmd_ls(Some(remote_dir)).await?;
+        for fname in entries {
+            let child_remote = format!("{}/{}", remote_dir.trim_end_matches('/'), fname);
+            let child_local = local_dir.join(&fname);
+            let attr = self.cmd_stat_attr(&child_remote).await?;
+            let mode = attr.permissions.unwrap_or(0);
+            if mode & 0o170000 == 0o040000 {
+                Box::pin(self.scp_get_dir(&child_remote, &child_local, preserve)).await?;
+            } else {
+                self.scp_get_file(&child_remote, &child_local, preserve).await?;
+            }
+        }
+        if preserve {
+            let attr = self.cmd_stat_attr(remote_dir).await?;
+            apply_sftp_meta_to_local(local_dir, &attr)?;
+        }
+        Ok(())
+    }
 }
 
 /// Render an SFTP permission word (`drwxr-xr-x`) from the mode bits.
@@ -940,4 +1050,27 @@ fn localtime(dt: std::time::SystemTime) -> LocalTime {
     let min = ((secs_in_day % 3600) / 60) as u32;
     let mon = ((days % 12) as usize).min(11);
     LocalTime { mon, day: ((days % 31) as u32) + 1, hour, min }
+}
+
+/// Apply SFTP attributes (permissions, mtime, atime) to a local path. Used by
+/// the scp `-p` SFTP backend to mirror `scp -p` on downloads.
+fn apply_sftp_meta_to_local(path: &Path, attr: &SftpFileAttr) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(perm) = attr.permissions {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(perm & 0o7777));
+        }
+    }
+    if let (Some(m), Some(a)) = (attr.mtime, attr.atime) {
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(m as u64);
+        let atime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(a as u64);
+        let ft = std::fs::FileTimes::new()
+            .set_modified(mtime)
+            .set_accessed(atime);
+        if let Ok(f) = std::fs::File::options().write(true).open(path) {
+            let _ = f.set_times(ft);
+        }
+    }
+    Ok(())
 }

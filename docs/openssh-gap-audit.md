@@ -332,12 +332,12 @@ exit code：0
 
 ## 19. 需要产品决策的选型（先确认再实现）
 
-1. **PAM / GSSAPI / 证书**：OpenSSH 的这些能力依赖系统库（PAM、GSSAPI）或新增纯 Rust 依赖，与原始“零第三方依赖”约束冲突。需要确认是否允许新增依赖或改为平台条件编译。
-2. **后量子 KEX（sntrup761x25519）**：需要引入 sntrup761 的纯 Rust 实现或新依赖；是否接受？
-3. **弱算法默认值**：是否直接对齐 OpenSSH 9.9，默认移除 `ssh-rsa`、`group14-sha1`、CBC、3DES、`none` MAC？这会改变既有用户的显式配置与互通结果。
-4. **UMAC**：OpenSSH 默认 MAC 列表包含 umac-64/128；是否实现（需要 UMAC 算法与相关依赖）？
-5. **scp 协议路线**：OpenSSH 9 默认走 SFTP 协议，`-O` 才用旧 SCP 协议；当前实现走远端 `scp -t/-f` 旧协议。是否切换到 SFTP？
-6. **未知配置指令**：严格报错（OpenSSH 行为）还是仅告警（兼容旧配置）？需要定策略。
+1. **PAM / GSSAPI / 证书**：**决策（2026-11-06）= 引入系统库依赖（FFI，平台条件编译）**。证书已实现（D3/D4）；PAM/GSSAPI/PKCS#11 需链接 libpam/libgssapi，待实现（§21 现显式不支持）。
+2. **后量子 KEX（sntrup761x25519）**：✅ **已完成（D2）**。`sntrup761x25519-sha512` 及 `@openssh.com` 变体在默认 KEX 列表（transport.rs:24-25），`sntrup_hybrid_kex_round_trip` 集成测试全绿。
+3. **弱算法默认值**：✅ **已完成（D1）**。默认 KEX 列表不含 `group14-sha1`，默认 cipher 不含 CBC/3DES/none，默认 MAC 不含 `none`，默认 host key 不含 `ssh-rsa`（transport.rs:22-76）；CBC/3DES/`ssh-rsa`/`none` 仅显式配置可用（SUPPORTED_* 表）。
+4. **UMAC**：✅ **已完成（D2）**。`umac-64/128` 及 ETM 变体在默认 MAC 列表（transport.rs:68-73），`umac_mac_negotiation_round_trip` 单测全绿。
+5. **scp 协议路线**：✅ **已完成（2026-11-06，决策=默认 SFTP + `-O` 旧协议回退）**。`scp.rs` 新增 `scp_upload_sftp`/`scp_download_sftp`（复用 `SftpSession`：cmd_put/get/ls/mkdir/stat_attr/setattr），`main.rs` 加 `-s`（SFTP，默认）/`-O`（旧 `scp -t/-f`）选项；`SftpFileAttr::encode` 修复（用计算 flags 而非 self.flags，原 setstat 声明属性但漏发字段）。验证：`scp_parity_legacy_o_protocol`（`-O` 与系统 scp -O 对比）、`scp_parity_sftp_s_flag`（`-s` 与系统 scp 对比）、`scp_parity_preserve_times`（SFTP `-p` mtime 保留）全绿；全量 241 项测试全绿。
+6. **未知配置指令**：✅ **已决策（D7）= 严格报错（与 OpenSSH 一致）**。客户端/服务端未知指令 `exit(255)`（`a9c94fe`），`load/load_from` 返回 `Result`。
 
 ## 20. 方法与限制
 

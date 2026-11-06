@@ -650,3 +650,108 @@ pub async fn scp_upload_recursive(
 
     Ok(())
 }
+
+/// scp over the SFTP protocol (OpenSSH 9 default; `-O` keeps the old SCP
+/// protocol, `-s` forces SFTP). Upload one or more local sources to a remote
+/// target. `preserve` mirrors `scp -p` (mode + mtime/atime).
+pub async fn scp_upload_sftp(
+    config: &ResolvedConfig,
+    sources: &[std::path::PathBuf],
+    remote_path: &str,
+    recursive: bool,
+    preserve: bool,
+) -> Result<()> {
+    if sources.is_empty() {
+        return Err(SshError::Protocol("no source files".into()));
+    }
+    let mut s = crate::sftp::connect(config).await?;
+    let target_dir = remote_path.trim_end_matches('/').to_string();
+    for src in sources {
+        let meta = std::fs::metadata(src).map_err(|e| SshError::Io(e))?;
+        if meta.is_dir() {
+            if !recursive {
+                return Err(SshError::Protocol(format!(
+                    "{} is a directory (use -r to copy recursively)",
+                    src.display()
+                )));
+            }
+            let dir_name = src.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "scp".to_string());
+            let remote_dir = format!("{}/{}", target_dir, dir_name);
+            Box::pin(s.scp_put_dir(src, &remote_dir, preserve)).await?;
+        } else {
+            // `scp src host:/dir/` (trailing slash → append the basename) or
+            // `scp src host:/path/name` (no slash → target is the exact file).
+            let fname = src.file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            let remote_file = if remote_path.ends_with('/') {
+                format!("{}{}", remote_path, fname)
+            } else if sources.len() == 1 {
+                remote_path.to_string()
+            } else {
+                format!("{}/{}", remote_path.trim_end_matches('/'), fname)
+            };
+            s.scp_put_file(src, &remote_file, preserve).await?;
+        }
+    }
+    Ok(())
+}
+
+/// scp over the SFTP protocol: download one or more remote sources to a local
+/// target. `preserve` mirrors `scp -p`.
+pub async fn scp_download_sftp(
+    config: &ResolvedConfig,
+    sources: &[String],
+    local_path: &Path,
+    recursive: bool,
+    preserve: bool,
+) -> Result<()> {
+    if sources.is_empty() {
+        return Err(SshError::Protocol("no source files".into()));
+    }
+    let mut s = crate::sftp::connect(config).await?;
+    let local_is_dir = local_path.is_dir()
+        || local_path.to_string_lossy().ends_with('/')
+        || sources.len() > 1;
+    let dest_dir = if local_is_dir {
+        if !local_path.exists() {
+            std::fs::create_dir_all(local_path).map_err(|e| SshError::Io(e))?;
+        }
+        local_path.to_path_buf()
+    } else {
+        // Exact file target: `scp host:/f local_name` (no trailing slash).
+        local_path.to_path_buf()
+    };
+    for remote_src in sources {
+        // Strip a leading `host:` spec (already parsed by the caller), leaving
+        // the bare remote path.
+        let rpath = remote_src
+            .rsplit_once(':')
+            .map(|(_, p)| p.to_string())
+            .unwrap_or_else(|| remote_src.clone());
+        let attr = s.cmd_stat_attr(&rpath).await?;
+        let mode = attr.permissions.unwrap_or(0);
+        if mode & 0o170000 == 0o040000 {
+            if !recursive {
+                return Err(SshError::Protocol(format!(
+                    "{} is a directory (use -r to copy recursively)",
+                    rpath
+                )));
+            }
+            let dir_name = rpath.rsplit('/').next().unwrap_or(&rpath).to_string();
+            let child = dest_dir.join(&dir_name);
+            Box::pin(s.scp_get_dir(&rpath, &child, preserve)).await?;
+        } else {
+            let fname = rpath.rsplit('/').next().unwrap_or(&rpath).to_string();
+            let child = if local_is_dir {
+                dest_dir.join(&fname)
+            } else {
+                dest_dir.clone()
+            };
+            s.scp_get_file(&rpath, &child, preserve).await?;
+        }
+    }
+    Ok(())
+}
