@@ -2253,7 +2253,11 @@ fn signal_forwarding_round_trip() {
     let mut child = Command::new(&args[0])
         .args(&args[1..])
         .arg("127.0.0.1")
-        .arg("sleep 30; echo AFTER_SLEEP")
+        // Emit a marker so the test can wait for the session (and thus the
+        // client's signal handler + session_id) to be fully established. A
+        // fixed sleep is racy under parallel test execution, where connection
+        // + auth + session setup can exceed any constant.
+        .arg("echo READY; sleep 30; echo AFTER_SLEEP")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2261,9 +2265,54 @@ fn signal_forwarding_round_trip() {
         .expect("run signal client");
     let pid = child.id();
 
-    // Give the client a moment to connect, authenticate, and start the remote
-    // command, then forward SIGTERM (not ignored for background processes).
-    std::thread::sleep(Duration::from_millis(1500));
+    // Drain stdout on a reader thread so the main thread can poll for READY.
+    let stdout = child.stdout.take().expect("client stdout");
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        let out_buf = out_buf.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut r = stdout;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        out_buf.lock().unwrap().push_str(
+                            std::str::from_utf8(&chunk[..n]).unwrap_or(""),
+                        );
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Poll until the remote command reports READY (session established, signal
+    // handler installed and session_id set). Abort if the client exits first.
+    let ready_start = Instant::now();
+    loop {
+        if out_buf.lock().unwrap().contains("READY") {
+            break;
+        }
+        if let Some(st) = child.try_wait().expect("poll child") {
+            let _ = child.wait();
+            panic!("client exited before session established: {:?}", st);
+        }
+        if ready_start.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut dbg_err = String::new();
+            if let Some(mut se) = child.stderr.take() {
+                use std::io::Read;
+                let _ = se.read_to_string(&mut dbg_err);
+            }
+            panic!("session not established within 10s (no READY on stdout); client stderr={:?}, stdout={:?}", dbg_err, &*out_buf.lock().unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Session is up: forward SIGTERM (not ignored for background processes).
     let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
 
     // Wait up to ~12s for the client to exit after the signal.
@@ -2283,9 +2332,7 @@ fn signal_forwarding_round_trip() {
     let mut out = String::new();
     let mut err = String::new();
     use std::io::Read;
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut out);
-    }
+    out.push_str(&out_buf.lock().unwrap());
     if let Some(mut se) = child.stderr.take() {
         let _ = se.read_to_string(&mut err);
     }

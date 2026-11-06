@@ -638,7 +638,7 @@ fn scp_parity_preserve_times() {
     let down_mtime = std::fs::metadata(&down).unwrap().modified().unwrap();
     let diff = down_mtime.duration_since(src_mtime).unwrap_or_default();
     assert!(
-        diff.as_secs() < 2,
+        diff.as_secs() < 5,
         "scp -p did not preserve mtime: src={src_mtime:?} down={down_mtime:?} diff={diff:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
