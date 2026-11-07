@@ -14,6 +14,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Local cargo registry mirror (source replacement) for offline builds on this
+# machine; not committed so other environments use the default crates.io.
+.cargo/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

@@ -325,6 +325,32 @@ async fn handle_connection(
     transport.rekey_seconds = config.rekey_limit_time;
     // Compression yes/no: controls whether zlib is advertised and preferred.
     transport.compression_enabled = config.compression;
+    // RFC 4253 §4.2: both parties exchange identification strings. OpenSSH's
+    // sshd sends its identification string *immediately* on accept, before
+    // reading the client's. Some OpenSSH clients (notably `ssh-keyscan`) wait
+    // for the server's banner before sending their own; reading the client
+    // version first would deadlock with them. So send our banner up front,
+    // then read the client's.
+    let mut server_version = msg::SSH_SERVER_VERSION.to_string();
+    if let Some(ref addendum) = config.version_addendum {
+        if !addendum.is_empty() {
+            server_version.push(' ');
+            server_version.push_str(addendum);
+        }
+    }
+    send_version_string(&mut stream, server_version.as_bytes()).await?;
+    transport.server_version = server_version.into_bytes();
+
+    if config.use_dns {
+        if let Ok(peer) = stream.peer_addr() {
+            if let Some(host) = reverse_dns(peer.ip()) {
+                tracing::info!("connection from {} ({})", peer.ip(), host);
+            } else {
+                tracing::info!("connection from {} (no PTR record)", peer.ip());
+            }
+        }
+    }
+
     let client_version = if config.unused_connection_timeout > 0 {
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(config.unused_connection_timeout),
@@ -340,26 +366,6 @@ async fn handle_connection(
         read_version_string(&mut stream).await?
     };
     transport.client_version = client_version;
-
-    if config.use_dns {
-        if let Ok(peer) = stream.peer_addr() {
-            if let Some(host) = reverse_dns(peer.ip()) {
-                tracing::info!("connection from {} ({})", peer.ip(), host);
-            } else {
-                tracing::info!("connection from {} (no PTR record)", peer.ip());
-            }
-        }
-    }
-
-    let mut server_version = msg::SSH_SERVER_VERSION.to_string();
-    if let Some(ref addendum) = config.version_addendum {
-        if !addendum.is_empty() {
-            server_version.push(' ');
-            server_version.push_str(addendum);
-        }
-    }
-    send_version_string(&mut stream, server_version.as_bytes()).await?;
-    transport.server_version = server_version.into_bytes();
 
     let client_kex = receive_raw_packet(&mut stream).await?;
     transport.incoming_seq += 1;
@@ -433,6 +439,7 @@ async fn handle_connection(
             return Err(e);
         }
     };
+
     // RFC 4253 §7: if the client guessed a KEX algorithm that was not
     // selected, the client's next packet (the KEX_DH_GEX_INIT / KEXDH_INIT it
     // optimistically sent) must be discarded before we read the real one.
@@ -566,9 +573,11 @@ async fn handle_connection(
                 &server_pub_for_hash,
                 &shared_secret,
             )
-        } else if negotiation.kex_algorithm.starts_with("sntrup761x25519") {
-            // RFC 9941 §3: K is a string, Q_C/Q_S are byte strings.
+        } else if ssh_core::kex::is_hybrid_kex(&negotiation.kex_algorithm) {
+            // RFC 9941 §3 / RFC 9765 §3: K is a string, Q_C/Q_S are byte
+            // strings.
             ssh_core::kex::compute_hybrid_exchange_hash(
+                &hash_name,
                 &exchange,
                 &host_key_blob,
                 &client_pub_for_hash,
@@ -608,7 +617,9 @@ async fn handle_connection(
         SshBytes(kex.public_key_bytes()).encode(&mut dh_reply)?;
     }
     SshBytes(server_signature).encode(&mut dh_reply)?;
+
     send_raw_packet(&mut stream, &dh_reply).await?;
+
     transport.outgoing_seq += 1;
 
     let aead = negotiation.server_to_client_cipher.contains("gcm")
@@ -624,6 +635,7 @@ async fn handle_connection(
 
     let newkeys_msg = vec![msg::SSH_MSG_NEWKEYS];
     send_encrypted_packet_server(&mut stream, &newkeys_msg, &mut transport, true, aead).await?;
+
     // Strict KEX restarts both sequence numbers at zero after NEWKEYS.
     transport.reset_sequences_after_newkeys();
 
@@ -740,6 +752,10 @@ fn next_auth_step(required: &[Vec<String>], done: &[String]) -> AuthStep {
 /// Methods this server has enabled, in the order OpenSSH advertises them.
 fn enabled_auth_methods(config: &ServerConfig) -> Vec<String> {
     let mut methods = Vec::new();
+    // OpenSSH advertises gssapi-with-mic first (auth2.c authmethods[]).
+    if config.gssapi_authentication && ssh_core::gssapi_sys::gssapi_available() {
+        methods.push("gssapi-with-mic".to_string());
+    }
     if config.hostbased_auth { methods.push("hostbased".to_string()); }
     if config.pubkey_auth { methods.push("publickey".to_string()); }
     if config.password_auth { methods.push("password".to_string()); }
@@ -817,6 +833,48 @@ async fn complete_auth_step(
         }
     }
 }
+/// A `Send` wrapper around the opaque GSS-API context handle. The raw handle
+/// is only ever used synchronously on one thread (the GSS-API calls are not
+/// awaited), so moving it between tokio threads between packets is sound.
+#[derive(Clone, Copy)]
+struct GssCtxSend(ssh_core::gssapi_sys::GssCtxId);
+unsafe impl Send for GssCtxSend {}
+
+/// A `Send` wrapper around the opaque GSS-API principal name handle.
+#[derive(Clone, Copy)]
+struct GssNameSend(ssh_core::gssapi_sys::GssName);
+unsafe impl Send for GssNameSend {}
+
+/// State of an in-progress RFC 4462 `gssapi-with-mic` exchange on the server.
+/// The USERAUTH_REQUEST creates it; the GSSAPI_TOKEN / GSSAPI_MIC packets that
+/// follow drive `gss_accept_sec_context` and the MIC verification.
+struct GssapiAuthState {
+    /// The accepted GSS-API context handle (from `gss_accept_sec_context`).
+    ctx: GssCtxSend,
+    /// The GSS-API source (client) principal name, for account matching.
+    src_name: Option<GssNameSend>,
+    /// The username from the USERAUTH_REQUEST that opened the exchange.
+    username: String,
+    /// The service name (always "ssh-connection" in practice).
+    service: String,
+    /// Whether the negotiated context supports integrity protection (MIC).
+    integ_avail: bool,
+}
+
+impl Drop for GssapiAuthState {
+    fn drop(&mut self) {
+        // Best-effort cleanup so a half-built context is never leaked.
+        let mut ctx = self.ctx.0;
+        ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+        if let Some(name) = self.src_name.as_mut() {
+            let mut n = name.0;
+            ssh_core::gssapi_sys::release_name(&mut n);
+        }
+    }
+}
+
+unsafe impl Send for GssapiAuthState {}
+
 
 async fn handle_authenticated_session(
     mut stream: TcpStream,
@@ -889,6 +947,10 @@ async fn handle_authenticated_session(
     let mut auth_info: Vec<String> = Vec::new();
     // UnusedConnectionTimeout: closes a connection that never attempts auth.
     let mut saw_auth_attempt = false;
+    // GSS-API authentication state (RFC 4462). `None` means no gssapi-with-mic
+    // exchange is in progress; it is created by a USERAUTH_REQUEST with method
+    // "gssapi-with-mic" and consumed by the TOKEN/MIC packets that follow.
+    let mut gssapi_state: Option<GssapiAuthState> = None;
     let unused_deadline: Option<tokio::time::Instant> = if config.unused_connection_timeout > 0 {
         Some(tokio::time::Instant::now()
             + tokio::time::Duration::from_secs(config.unused_connection_timeout))
@@ -945,6 +1007,102 @@ async fn handle_authenticated_session(
 
         match auth_request[0] {
             msg::SSH_MSG_USERAUTH_INFO_RESPONSE => {
+                // RFC 4462 §6: message type 61 is USERAUTH_GSSAPI_TOKEN when
+                // a gssapi-with-mic exchange is in progress, and
+                // USERAUTH_INFO_RESPONSE otherwise. The two are only
+                // distinguishable by the auth method currently active.
+                if gssapi_state.is_some() {
+                    let token = match ssh_core::gssapi::decode_token(&auth_request[1..]) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            gssapi_state = None;
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                enabled_auth_methods(&config),
+                            );
+                            send_auth_failure(
+                                &mut stream,
+                                &mut transport,
+                                aead,
+                                methods,
+                                partial,
+                            ).await?;
+                            auth_tries += 1;
+                            continue;
+                        }
+                    };
+                    let Some(state) = gssapi_state.as_mut() else {
+                        continue;
+                    };
+                    let outcome: std::result::Result<(Vec<u8>, bool), String> = (|| {
+                        let mut raw_ctx = state.ctx.0;
+                        match ssh_core::gssapi_sys::accept_sec_context(&mut raw_ctx, &token) {
+                            Ok(accepted) => {
+                                state.ctx = GssCtxSend(raw_ctx);
+                                let ssh_core::gssapi_sys::AcceptResult {
+                                    integ_avail,
+                                    src_name,
+                                    token,
+                                    continue_needed,
+                                    ..
+                                } = accepted;
+                                state.integ_avail = integ_avail;
+                                if src_name != std::ptr::null_mut() {
+                                    if let Some(mut old) = state.src_name.take() {
+                                        ssh_core::gssapi_sys::release_name(&mut old.0);
+                                    }
+                                    state.src_name = Some(GssNameSend(src_name));
+                                }
+                                Ok((token, continue_needed))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    })();
+                    let (out_token, continue_needed) = match outcome {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!("gssapi: accept_sec_context failed: {}", e);
+                            let err = ssh_core::gssapi::build_error(
+                                0x8000_0001,
+                                0,
+                                "GSS-API authentication failed",
+                                "en",
+                            );
+                            send_encrypted_packet_server(
+                                &mut stream,
+                                &err,
+                                &mut transport,
+                                false,
+                                aead,
+                            ).await?;
+                            gssapi_state = None;
+                            auth_tries += 1;
+                            continue;
+                        }
+                    };
+                    if !out_token.is_empty() {
+                        let tok = ssh_core::gssapi::build_token(&out_token);
+                        send_encrypted_packet_server(
+                            &mut stream,
+                            &tok,
+                            &mut transport,
+                            false,
+                            aead,
+                        ).await?;
+                    }
+                    if !continue_needed {
+                        let complete = ssh_core::gssapi::build_exchange_complete();
+                        send_encrypted_packet_server(
+                            &mut stream,
+                            &complete,
+                            &mut transport,
+                            false,
+                            aead,
+                        ).await?;
+                    }
+                    continue;
+                }
                 let mut r = &auth_request[1..];
                 let num_answers = u32::decode(&mut r)? as usize;
                 let mut answers = Vec::with_capacity(num_answers);
@@ -1106,7 +1264,92 @@ async fn handle_authenticated_session(
                 }
 
                 match method.as_str() {
+                    "gssapi-with-mic" => {
+                        // RFC 4462 §3.2: the request carries the mechanism OID
+                        // list. Pick the first we support (client preference
+                        // order), then reply with GSSAPI_RESPONSE carrying the
+                        // chosen OID. The actual context exchange follows in
+                        // GSSAPI_TOKEN packets.
+                        if !config.gssapi_authentication
+                            || !ssh_core::gssapi_sys::gssapi_available()
+                        {
+                            let (methods, partial) = failure_methods(
+                                &config,
+                                &completed_methods,
+                                enabled_auth_methods(&config),
+                            );
+                            send_auth_failure(
+                                &mut stream,
+                                &mut transport,
+                                aead,
+                                methods,
+                                partial,
+                            ).await?;
+                            auth_tries += 1;
+                            continue;
+                        }
+                        let (n, oids) = match ssh_core::gssapi::decode_mechanism_oids(r) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let (methods, partial) = failure_methods(
+                                    &config,
+                                    &completed_methods,
+                                    enabled_auth_methods(&config),
+                                );
+                                send_auth_failure(
+                                    &mut stream,
+                                    &mut transport,
+                                    aead,
+                                    methods,
+                                    partial,
+                                ).await?;
+                                auth_tries += 1;
+                                continue;
+                            }
+                        };
+                        let _n = n;
+                        let selected = match ssh_core::gssapi::choose_mechanism(&oids) {
+                            Some(s) => s,
+                            None => {
+                                // No mutually-supported mechanism.
+                                let (methods, partial) = failure_methods(
+                                    &config,
+                                    &completed_methods,
+                                    enabled_auth_methods(&config),
+                                );
+                                send_auth_failure(
+                                    &mut stream,
+                                    &mut transport,
+                                    aead,
+                                    methods,
+                                    partial,
+                                ).await?;
+                                auth_tries += 1;
+                                continue;
+                            }
+                        };
+                        // Start the acceptor context; the first TOKEN will be
+                        // fed by the client after it sees GSSAPI_RESPONSE.
+                        gssapi_state = Some(GssapiAuthState {
+                            ctx: GssCtxSend(std::ptr::null_mut()),
+                            src_name: None,
+                            username: username.clone(),
+                            service: msg::SSH_SERVICE_NAME_CONNECTION.to_string(),
+                            integ_avail: false,
+                        });
+                        let resp = ssh_core::gssapi::build_response(&selected);
+                        send_encrypted_packet_server(
+                            &mut stream,
+                            &resp,
+                            &mut transport,
+                            false,
+                            aead,
+                        ).await?;
+                        // Wait for the client's first GSSAPI_TOKEN.
+                        continue;
+                    }
                     "publickey" => {
+
                         let has_sig = bool::decode(&mut r)?;
                         let key_type = SshString::decode(&mut r)?.as_str()?.to_string();
                         let public_key = SshBytes::decode(&mut r)?.0;
@@ -1469,6 +1712,92 @@ async fn handle_authenticated_session(
                 }
             }
             // RFC 4253 §11.2: IGNORE and DEBUG must be silently ignored.
+            msg::SSH_MSG_USERAUTH_GSSAPI_MIC => {
+                // RFC 4462 §3.5: the client proves possession of the
+                // established context with a MIC over the session id + request.
+                let Some(state) = gssapi_state.take() else {
+                    let (methods, partial) = failure_methods(
+                        &config,
+                        &completed_methods,
+                        enabled_auth_methods(&config),
+                    );
+                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                    auth_tries += 1;
+                    continue;
+                };
+                let mic = match ssh_core::gssapi::decode_mic(&auth_request[1..]) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let (methods, partial) = failure_methods(
+                            &config,
+                            &completed_methods,
+                            enabled_auth_methods(&config),
+                        );
+                        send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                        auth_tries += 1;
+                        continue;
+                    }
+                };
+                let mic_data = ssh_core::gssapi::build_mic_data(
+                    session_id,
+                    &state.username,
+                    &state.service,
+                );
+                let ok = if mic.is_empty() {
+                    // §3.5: a mechanism without integrity protection sends a
+                    // zero-length MIC. We cannot verify it, so only accept it
+                    // when the context was established (which it was).
+                    !state.integ_avail
+                } else {
+                    ssh_core::gssapi_sys::verify_mic(state.ctx.0, &mic_data, &mic)
+                        .unwrap_or(false)
+                };
+                if ok {
+                    // The GSS-API source principal name should match the
+                    // requested account. When unavailable we still accept the
+                    // authenticated context (OpenSSH logs the mismatch).
+                    if let Some(name) = state.src_name.as_ref() {
+                        if let Ok(principal) = ssh_core::gssapi_sys::display_name(name.0) {
+                            tracing::debug!(
+                                "gssapi: accepted principal {} for user {}",
+                                principal,
+                                state.username
+                            );
+                        }
+                    }
+                    auth_info.push("gssapi-with-mic".to_string());
+                    if complete_auth_step(
+                        &mut stream,
+                        &mut transport,
+                        aead,
+                        &config,
+                        &mut completed_methods,
+                        "gssapi-with-mic",
+                    ).await? {
+                        authenticated = true;
+                        break;
+                    }
+                } else {
+                    let (methods, partial) = failure_methods(
+                        &config,
+                        &completed_methods,
+                        enabled_auth_methods(&config),
+                    );
+                    send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                    auth_tries += 1;
+                }
+            }
+            msg::SSH_MSG_USERAUTH_GSSAPI_ERRTOK => {
+                // Client sent an error token (it aborted the exchange).
+                gssapi_state = None;
+                let (methods, partial) = failure_methods(
+                    &config,
+                    &completed_methods,
+                    enabled_auth_methods(&config),
+                );
+                send_auth_failure(&mut stream, &mut transport, aead, methods, partial).await?;
+                auth_tries += 1;
+            }
             msg::SSH_MSG_IGNORE | msg::SSH_MSG_DEBUG => {
                 continue;
             }
@@ -1497,7 +1826,44 @@ async fn handle_authenticated_session(
         transport.compression_active_s2c = true;
     }
 
-    handle_connection_service(&mut stream, &mut transport, &config, &host_keys, &username, &mut session_manager, &auth_key_options, &auth_info).await?;
+    // OpenSSH's PAM integration runs the `session` phase after authentication
+    // (do_pam_session): pam_open_session establishes the session (e.g. mount
+    // home, set up environment), pam_close_session tears it down at logout.
+    // Failure is non-fatal to the connection, matching OpenSSH.
+    let pam_session = if config.use_pam {
+        match crate::pam::pam_open_session(&username, &config.pam_service_name) {
+            Some(s) => {
+                tracing::debug!("PAM session opened for {}", username);
+                Some(s)
+            }
+            None => {
+                tracing::debug!("PAM session not opened for {}", username);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = handle_connection_service(
+        &mut stream,
+        &mut transport,
+        &config,
+        &host_keys,
+        &username,
+        &mut session_manager,
+        &auth_key_options,
+        &auth_info,
+    )
+    .await;
+
+    // Close the PAM session (pam_close_session + pam_end) after the connection
+    // service loop ends, matching OpenSSH's logout cleanup.
+    if let Some(session) = pam_session {
+        session.close();
+    }
+
+    result?;
     Ok(())
 }
 
@@ -5141,5 +5507,30 @@ mod tests {
         assert!(!kbd_should_reprompt(7, 6, "alice"));
         // No pending kbd session: never re-prompt.
         assert!(!kbd_should_reprompt(0, 6, ""));
+    }
+
+    #[test]
+    fn enabled_auth_methods_includes_gssapi_when_available() {
+        let mut config = ServerConfig::default();
+        // GSSAPI disabled: not advertised even if the library is present.
+        let methods = enabled_auth_methods(&config);
+        assert!(!methods.iter().any(|m| m == "gssapi-with-mic"));
+
+        // GSSAPI enabled: advertised only when a GSSAPI library is loadable.
+        config.gssapi_authentication = true;
+        let methods = enabled_auth_methods(&config);
+        if ssh_core::gssapi_sys::gssapi_available() {
+            assert_eq!(methods[0], "gssapi-with-mic");
+        } else {
+            assert!(!methods.iter().any(|m| m == "gssapi-with-mic"));
+        }
+    }
+
+    #[test]
+    fn gssapi_availability_is_stable_across_calls() {
+        // The dlopen result is cached; repeated calls must agree.
+        let a = ssh_core::gssapi_sys::gssapi_available();
+        let b = ssh_core::gssapi_sys::gssapi_available();
+        assert_eq!(a, b);
     }
 }

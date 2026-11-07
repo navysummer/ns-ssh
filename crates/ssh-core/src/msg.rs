@@ -28,6 +28,17 @@ pub const SSH_MSG_USERAUTH_BANNER: u8 = 53;
 pub const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_REQUEST: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_RESPONSE: u8 = 61;
+// GSSAPI user auth (RFC 4462 §6): 60-66, used in the gssapi-with-mic method
+// context. Note 60/61 overlap PK_OK/INFO_REQUEST/INFO_RESPONSE (disambiguated
+// by the auth method in progress); 62 is unused.
+pub const SSH_MSG_USERAUTH_GSSAPI_RESPONSE: u8 = 60;
+pub const SSH_MSG_USERAUTH_GSSAPI_TOKEN: u8 = 61;
+pub const SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE: u8 = 63;
+pub const SSH_MSG_USERAUTH_GSSAPI_ERROR: u8 = 64;
+pub const SSH_MSG_USERAUTH_GSSAPI_ERRTOK: u8 = 65;
+pub const SSH_MSG_USERAUTH_GSSAPI_MIC: u8 = 66;
+
+pub const SSH_AUTH_METHOD_GSSAPI_WITH_MIC: &str = "gssapi-with-mic";
 
 pub const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 pub const SSH_MSG_REQUEST_SUCCESS: u8 = 81;

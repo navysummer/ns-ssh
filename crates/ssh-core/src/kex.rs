@@ -23,6 +23,13 @@ pub trait KexAlgorithm: Send + Sync {
     fn public_key_bytes(&self) -> Vec<u8>;
 }
 
+/// True for the hybrid key exchanges (RFC 9941 sntrup761x25519, RFC 9765
+/// mlkem768x25519), which encode the shared secret K as a `string` rather than
+/// an mpint in the exchange hash and key derivation.
+pub fn is_hybrid_kex(name: &str) -> bool {
+    name.starts_with("sntrup761x25519") || name.starts_with("mlkem768x25519")
+}
+
 enum Khasher {
     Sha1(Sha1),
     Sha256(Sha256),
@@ -639,10 +646,157 @@ impl KexAlgorithm for SntrupX25519Kex {
     }
 }
 
-/// RFC 9941 §3: compute the exchange hash for `sntrup761x25519-sha512`.
-/// Unlike finite-field DH and ECDH, the hybrid shared secret K is a 64-byte
-/// SHA-512 output encoded as a `string`, and Q_C/Q_S are byte strings.
+/// RFC 9765 `mlkem768x25519-sha256` hybrid key exchange (ML-KEM-768 + X25519).
+///
+/// The two roles are asymmetric (mirroring `SntrupX25519Kex`):
+/// - Client: `generate_keypair` produces an ML-KEM-768 keypair and an X25519
+///   keypair. `public_key_bytes` = mlkem_pk (1184) || x25519_pub (32) =
+///   1216 bytes (Q_C). `compute_shared_secret(Q_S)` decapsulates the server's
+///   1088-byte ciphertext and does X25519.
+/// - Server: `generate_keypair` produces only the X25519 keypair. The ML-KEM
+///   public key arrives in `compute_shared_secret(Q_C)`, which encapsulates
+///   into it; `public_key_bytes` then returns ct (1088) || x25519_pub (32) =
+///   1120 bytes (Q_S).
+///
+/// The shared secret K = SHA-256(mlkem_ss || x25519_shared) is 32 bytes and
+/// is encoded as a `string` (not an mpint) in the exchange hash and key
+/// derivation (RFC 9765 §3).
+pub struct MlkemX25519Kex {
+    x_private: x25519_dalek::StaticSecret,
+    x_public: x25519_dalek::PublicKey,
+    // Client role: our ML-KEM-768 keypair (None on the server until it
+    // receives the client's public key).
+    mlkem_ek: Option<ml_kem::EncapsulationKey768>,
+    mlkem_dk: Option<ml_kem::DecapsulationKey768>,
+    // Server role: the ciphertext produced by encapsulating into the client's
+    // public key (None until `compute_shared_secret`).
+    mlkem_ct: Option<ml_kem::ml_kem_768::Ciphertext>,
+}
+
+impl MlkemX25519Kex {
+    pub fn new() -> Self {
+        let x_private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let x_public = x25519_dalek::PublicKey::from(&x_private);
+        MlkemX25519Kex {
+            x_private,
+            x_public,
+            mlkem_ek: None,
+            mlkem_dk: None,
+            mlkem_ct: None,
+        }
+    }
+
+    pub fn kex_name() -> &'static str {
+        "mlkem768x25519-sha256"
+    }
+
+    /// The RFC 9765 shared secret K = SHA-256(mlkem_ss || x25519_shared).
+    fn hybrid_shared_secret(mlkem_ss: &[u8], x25519_shared: &[u8]) -> Vec<u8> {
+        let mut hasher = Sha256::new();
+        hasher.update(mlkem_ss);
+        hasher.update(x25519_shared);
+        hasher.finalize().to_vec()
+    }
+}
+
+impl KexAlgorithm for MlkemX25519Kex {
+    fn name(&self) -> &str {
+        Self::kex_name()
+    }
+
+    fn hash_name(&self) -> &'static str {
+        "sha256"
+    }
+
+    fn generate_keypair(&mut self) -> Result<()> {
+        // Client role: generate the ML-KEM-768 keypair and X25519 keypair.
+        // The ml-kem crate seeds from a 64-byte seed; derive it from the
+        // workspace RNG (like sntrup761, to avoid a rand version mismatch).
+        let x_private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let x_public = x25519_dalek::PublicKey::from(&x_private);
+        let seed_bytes = random_seed_64();
+        let seed = ml_kem::Seed::try_from(seed_bytes.as_slice())
+            .map_err(|_| SshError::KexFailed("invalid mlkem seed".into()))?;
+        let dk = ml_kem::DecapsulationKey768::from_seed(seed);
+        let ek = dk.encapsulation_key().clone();
+        self.x_private = x_private;
+        self.x_public = x_public;
+        self.mlkem_ek = Some(ek);
+        self.mlkem_dk = Some(dk);
+        Ok(())
+    }
+
+    fn compute_shared_secret(&mut self, peer_public_key: &[u8]) -> Result<Vec<u8>> {
+        // Q_C = 1216 bytes (client public key, server role) or Q_S = 1120
+        // bytes (server reply, client role). The length identifies the role.
+        if peer_public_key.len() == 1120 {
+            // Client role: Q_S = ciphertext (1088) || x25519_pub (32).
+            let mut x_pub = [0u8; 32];
+            x_pub.copy_from_slice(&peer_public_key[1088..]);
+            let peer = x25519_dalek::PublicKey::from(x_pub);
+            let x_shared = self.x_private.diffie_hellman(&peer);
+            let dk = self.mlkem_dk.as_ref()
+                .ok_or_else(|| SshError::KexFailed("mlkem768 decapsulation key not generated".into()))?;
+            use ml_kem::Decapsulate;
+            let ss = dk.decapsulate_slice(&peer_public_key[..1088])
+                .map_err(|_| SshError::KexFailed("invalid mlkem768 ciphertext".into()))?;
+            Ok(Self::hybrid_shared_secret(ss.as_slice(), x_shared.as_bytes()))
+        } else if peer_public_key.len() == 1216 {
+            // Server role: Q_C = mlkem_pk (1184) || x25519_pub (32).
+            use ml_kem::TryKeyInit;
+            let ek = ml_kem::EncapsulationKey768::new_from_slice(&peer_public_key[..1184])
+                .map_err(|_| SshError::KexFailed("invalid mlkem768 public key".into()))?;
+            let mut x_pub = [0u8; 32];
+            x_pub.copy_from_slice(&peer_public_key[1184..]);
+            let peer = x25519_dalek::PublicKey::from(x_pub);
+            let x_shared = self.x_private.diffie_hellman(&peer);
+            // Deterministic encapsulation from a fresh 32-byte seed.
+            let m = {
+                let mut m = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut OsRng, &mut m);
+                m
+            };
+            let (ct, ss) = ek.encapsulate_deterministic(&ml_kem::B32::from(m));
+            self.mlkem_ct = Some(ct);
+            Ok(Self::hybrid_shared_secret(ss.as_slice(), x_shared.as_bytes()))
+        } else {
+            Err(SshError::KexFailed(format!(
+                "invalid mlkem768x25519 peer key length {}",
+                peer_public_key.len()
+            )))
+        }
+    }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        // Client: Q_C = mlkem_pk (1184) || x25519_pub (32).
+        // Server: Q_S = ct (1088) || x25519_pub (32).
+        let mut out = Vec::new();
+        if let Some(ct) = &self.mlkem_ct {
+            out.extend_from_slice(ct.as_slice());
+        } else if let Some(ek) = &self.mlkem_ek {
+            use ml_kem::KeyExport;
+            out.extend_from_slice(ek.to_bytes().as_slice());
+        }
+        out.extend_from_slice(self.x_public.as_bytes());
+        out
+    }
+}
+
+/// Draw a fresh 64-byte seed from the workspace RNG for ml-kem key generation.
+fn random_seed_64() -> [u8; 64] {
+    use rand::RngCore;
+    let mut seed = [0u8; 64];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
+
+/// RFC 9941 §3 (sntrup761x25519-sha512) / RFC 9765 §3 (mlkem768x25519-sha256):
+/// compute the exchange hash for a hybrid KEX. Unlike finite-field DH and
+/// ECDH, the hybrid shared secret K is a hash output encoded as a `string`,
+/// and Q_C/Q_S are byte strings.
 pub fn compute_hybrid_exchange_hash(
+    hash_name: &str,
     exchange: &KexExchange,
     server_host_key: &[u8],
     client_public_key: &[u8],
@@ -650,7 +804,7 @@ pub fn compute_hybrid_exchange_hash(
     shared_secret: &[u8],
 ) -> Vec<u8> {
     // `SshString` is already in scope via `use crate::encoding::*`.
-    let mut hasher = Khasher::new("sha512");
+    let mut hasher = Khasher::new(hash_name);
 
     let mut buf = Vec::new();
     SshString(exchange.client_version.to_vec()).encode(&mut buf).unwrap();
@@ -681,15 +835,17 @@ pub fn compute_hybrid_exchange_hash(
     hasher.finalize()
 }
 
-/// RFC 9941 §3: derive keys from the hybrid K (encoded as a string).
+/// RFC 9941 §3 / RFC 9765 §3: derive keys from the hybrid K (encoded as a
+/// string), using the KEX's hash (sha512 for sntrup, sha256 for mlkem).
 pub fn derive_hybrid_key(
+    hash_name: &str,
     shared_secret: &[u8],
     exchange_hash: &[u8],
     session_id: &[u8],
     char_tag: u8,
     key_len: usize,
 ) -> Vec<u8> {
-    let mut hasher = Khasher::new("sha512");
+    let mut hasher = Khasher::new(hash_name);
 
     let mut buf = Vec::new();
     SshString(shared_secret.to_vec()).encode(&mut buf).unwrap();
@@ -706,7 +862,7 @@ pub fn derive_hybrid_key(
 
     let mut out = hash.clone();
     while out.len() < key_len {
-        let mut h = Khasher::new("sha512");
+        let mut h = Khasher::new(hash_name);
         let mut b = Vec::new();
         SshString(shared_secret.to_vec()).encode(&mut b).unwrap();
         h.update(&b);
@@ -718,6 +874,8 @@ pub fn derive_hybrid_key(
     out.truncate(key_len);
     out
 }
+
+
 pub fn derive_key(
     hash_name: &str,
     shared_secret: &[u8],
@@ -1017,6 +1175,43 @@ mod tests {
         client.generate_keypair().unwrap();
         assert!(client.compute_shared_secret(&[]).is_err());
         assert!(client.compute_shared_secret(&vec![0u8; 100]).is_err());
+    }
+
+    #[test]
+    fn mlkem_hybrid_round_trip_agrees_on_shared_secret() {
+        // Client role generates Q_C (1216) and decapsulates Q_S (1120).
+        let mut client = MlkemX25519Kex::new();
+        client.generate_keypair().unwrap();
+        let q_c = client.public_key_bytes();
+        assert_eq!(q_c.len(), 1216);
+
+        // Server role encapsulates into Q_C and produces Q_S (1120).
+        let mut server = MlkemX25519Kex::new();
+        server.generate_keypair().unwrap();
+        let server_k = server.compute_shared_secret(&q_c).unwrap();
+        let q_s = server.public_key_bytes();
+        assert_eq!(q_s.len(), 1120);
+
+        let client_k = client.compute_shared_secret(&q_s).unwrap();
+        assert_eq!(client_k.len(), 32);
+        assert_eq!(client_k, server_k, "hybrid shared secrets must agree");
+    }
+
+    #[test]
+    fn mlkem_hybrid_rejects_wrong_key_lengths() {
+        let mut client = MlkemX25519Kex::new();
+        client.generate_keypair().unwrap();
+        assert!(client.compute_shared_secret(&[]).is_err());
+        assert!(client.compute_shared_secret(&vec![0u8; 100]).is_err());
+    }
+
+    #[test]
+    fn is_hybrid_kex_matches_both_hybrid_families() {
+        assert!(is_hybrid_kex("sntrup761x25519-sha512"));
+        assert!(is_hybrid_kex("sntrup761x25519-sha512@openssh.com"));
+        assert!(is_hybrid_kex("mlkem768x25519-sha256"));
+        assert!(!is_hybrid_kex("curve25519-sha256"));
+        assert!(!is_hybrid_kex("diffie-hellman-group14-sha256"));
     }
 }
 

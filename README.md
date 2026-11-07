@@ -6,7 +6,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 
 ### ns-ssh (Client)
 - SSH-2.0 protocol support
-- Key exchange: Curve25519-SHA256, ECDH P-256/384/521, DH group14/16/18, DH group-exchange (SHA-256/SHA-1)
+- Key exchange: Curve25519-SHA256, ECDH P-256/384/521, DH group14/16/18, DH group-exchange (SHA-256/SHA-1), and the post-quantum hybrids `sntrup761x25519-sha512` (RFC 9941) and `mlkem768x25519-sha256` (RFC 9765, OpenSSH 9.9 default)
 - Ciphers: ChaCha20-Poly1305, AES-128/192/256-CTR, AES-128/256-GCM, AES-CBC, 3DES-CBC
 - MAC: HMAC-SHA2-256/512, HMAC-SHA1, UMAC-64/128 (including the ETM variants)
 - Host key algorithms: Ed25519, ECDSA P-256/384/521, RSA (rsa-sha2-256/512)

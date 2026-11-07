@@ -129,6 +129,79 @@ pub fn format_openssh_ecdsa(secret: &[u8]) -> Result<String> {
     Ok(encode_pem(&buf))
 }
 
+/// Encode a big unsigned integer as an SSH mpint (RFC 4251 §5): a uint32
+/// length followed by the two's-complement big-endian bytes. A leading 0x00
+/// is added when the high bit is set so the value stays positive.
+fn encode_mpint(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let mut v = bytes.to_vec();
+    while v.len() > 1 && v[0] == 0 {
+        v.remove(0);
+    }
+    if !v.is_empty() && (v[0] & 0x80) != 0 {
+        v.insert(0, 0);
+    }
+    buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&v);
+}
+
+/// Format an RSA private key as an OpenSSH private key (openssh-key-v1, no
+/// passphrase). The RSA private section carries the CRT parameters:
+/// `string "ssh-rsa"`, `mpint n`, `mpint e`, `mpint d`, `mpint iqmp`
+/// (q^-1 mod p), `mpint p`, `mpint q`.
+pub fn format_openssh_rsa(priv_key: &rsa::RsaPrivateKey) -> Result<String> {
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+
+    let n = priv_key.n().to_bytes_be();
+    let e = priv_key.e().to_bytes_be();
+    let d = priv_key.d().to_bytes_be();
+    let primes = priv_key.primes();
+    let iqmp = priv_key
+        .crt_coefficient()
+        .ok_or_else(|| SshError::InvalidKey("RSA key missing CRT coefficient".into()))?;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"openssh-key-v1\0");
+    buf.extend_from_slice(&4u32.to_be_bytes());
+    buf.extend_from_slice(b"none"); // cipher: none
+    buf.extend_from_slice(&4u32.to_be_bytes());
+    buf.extend_from_slice(b"none"); // kdf: none
+    buf.extend_from_slice(&0u32.to_be_bytes()); // kdf options: empty string
+    buf.extend_from_slice(&1u32.to_be_bytes());
+
+    let mut pub_key_buf = Vec::new();
+    pub_key_buf.extend_from_slice(&(7u32).to_be_bytes());
+    pub_key_buf.extend_from_slice(b"ssh-rsa");
+    encode_mpint(&mut pub_key_buf, &e);
+    encode_mpint(&mut pub_key_buf, &n);
+    buf.extend_from_slice(&(pub_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&pub_key_buf);
+
+    let mut priv_key_buf = Vec::new();
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // checkint 1
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // checkint 2
+    priv_key_buf.extend_from_slice(&(7u32).to_be_bytes());
+    priv_key_buf.extend_from_slice(b"ssh-rsa");
+    encode_mpint(&mut priv_key_buf, &n);
+    encode_mpint(&mut priv_key_buf, &e);
+    encode_mpint(&mut priv_key_buf, &d);
+    encode_mpint(&mut priv_key_buf, &iqmp.to_bytes_be());
+    if primes.len() >= 2 {
+        encode_mpint(&mut priv_key_buf, &primes[0].to_bytes_be());
+        encode_mpint(&mut priv_key_buf, &primes[1].to_bytes_be());
+    } else {
+        return Err(SshError::InvalidKey("RSA key must have two primes".into()));
+    }
+    priv_key_buf.extend_from_slice(&0u32.to_be_bytes()); // comment (empty)
+    let pad = (8 - (priv_key_buf.len() % 8)) % 8;
+    for i in 1..=pad {
+        priv_key_buf.push(i as u8);
+    }
+
+    buf.extend_from_slice(&(priv_key_buf.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&priv_key_buf);
+
+    Ok(encode_pem(&buf))
+}
 fn encode_pem(buf: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(buf);
     let mut result = String::from("-----BEGIN OPENSSH PRIVATE KEY-----\n");

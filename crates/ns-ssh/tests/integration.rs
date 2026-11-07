@@ -216,6 +216,122 @@ fn exec_round_trip_over_full_handshake() {
 }
 
 #[test]
+fn gssapi_configured_but_unavailable_falls_through_to_pubkey() {
+    // GSSAPIAuthentication=yes on both sides must not break a connection when
+    // no usable GSS-API library is present (this host's GSS.framework is a
+    // non-functional shim that the availability probe rejects). The client
+    // must fall through to pubkey authentication and the command must run.
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("gssapi");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("gssapiauthentication=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg("maxauthtries=10")
+        .arg("-o")
+        .arg("login_grace_time=30")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let kh = dir.join("known_hosts");
+    let output = Command::new(client_bin)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-l")
+        .arg(&user)
+        .arg("-i")
+        .arg(&id_path)
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("GSSAPIAuthentication=yes")
+        .arg("127.0.0.1")
+        .arg("echo gssapi-fallback-ok")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if !output.status.success() {
+        panic!(
+            "client failed: status={:?}\nstdout={}\nstderr={}\nserver_stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&server_out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("gssapi-fallback-ok"),
+        "expected command output, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn large_transfer_window_replenishment() {
     // A multi-MB transfer exceeds the default 2 MiB channel window, forcing the
     // send-side window gating (deferred data flushed on WINDOW_ADJUST) and the
@@ -1080,6 +1196,118 @@ fn sntrup_hybrid_kex_round_trip() {
 }
 
 #[test]
+fn mlkem_hybrid_kex_round_trip() {
+    // RFC 9765 mlkem768x25519-sha256: force it on both ends and verify a real
+    // exec round-trip. This exercises the client decapsulation and the server
+    // encapsulation roles, the string-encoded shared secret K, and the sha256
+    // exchange hash.
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("mlkem");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    let key = Ed25519HostKey::generate().expect("generate key");
+    let secret = key.secret_bytes();
+    let blob = key.public_key_bytes();
+    let pubkey: [u8; 32] = blob[blob.len() - 32..].try_into().expect("pubkey len");
+
+    let id_path = dir.join("id_ed25519");
+    std::fs::write(&id_path, openssh_ed25519_private(&secret, &pubkey)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&id_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let auth_path = dir.join("authorized_keys");
+    let auth_line = format!(
+        "ssh-ed25519 {} test\n",
+        base64::engine::general_purpose::STANDARD.encode(&blob)
+    );
+    std::fs::write(&auth_path, auth_line).unwrap();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=yes")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("permitrootlogin=yes")
+        .arg("-o")
+        .arg(format!("authorizedkeysfile={}", auth_path.display()))
+        .arg("-o")
+        .arg("kexalgorithms=mlkem768x25519-sha256")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let kh = dir.join("known_hosts");
+    let output = Command::new(client_bin)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-l")
+        .arg(&user)
+        .arg("-i")
+        .arg(&id_path)
+        .arg("-F")
+        .arg("/dev/null")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("KexAlgorithms=mlkem768x25519-sha256")
+        .arg("127.0.0.1")
+        .arg("echo MLKEM_KEX_OK")
+        .output()
+        .expect("run client");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if !output.status.success() {
+        panic!(
+            "mlkem KEX client failed: status={:?}\nstdout={}\nstderr={}\nserver_stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&server_out.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("MLKEM_KEX_OK"),
+        "expected mlkem KEX command output, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
 fn scp_requires_recursive_flag_for_directories() {
     // R03: `scp` without -r must reject a directory source (it used to recurse
     // silently); with -r it must copy the whole tree.
@@ -1518,6 +1746,158 @@ fn ssh_keyscan_prints_host_key() {
     );
 }
 
+/// Real OpenSSH `ssh-keyscan` must be able to retrieve the host key from our
+/// server. OpenSSH's keyscan waits for the server's identification string
+/// *before* sending its own version string; if the server reads the client
+/// version before sending its banner, the handshake deadlocks and keyscan
+/// returns nothing. This test exercises the real OpenSSH binary (not the
+/// symlinked `ns-ssh`), which is what exposes the ordering bug.
+#[test]
+fn real_openssh_keyscan_retrieves_host_key() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("keyscan-real");
+    let port = free_port();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=no")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("gssapiauthentication=no")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    // Use the real OpenSSH ssh-keyscan binary (must be on PATH).
+    let output = Command::new("ssh-keyscan")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-t")
+        .arg("ed25519")
+        .arg("127.0.0.1")
+        .output()
+        .expect("run real ssh-keyscan");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "real ssh-keyscan failed: status={:?}\nstdout={}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ssh-ed25519"),
+        "expected ssh-ed25519 host key line, got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("127.0.0.1"),
+        "expected host in keyscan output, got: {:?}",
+        stdout
+    );
+}
+
+/// `ns-ssh-keyscan -t ed25519` must map the short key type to the host key
+/// algorithm name (`ssh-ed25519`), otherwise KEX negotiation finds no common
+/// algorithm and the scan fails.
+#[test]
+fn ns_ssh_keyscan_t_type_maps_to_algorithm() {
+    let server_bin = workspace_target_dir();
+    if !server_bin.exists() {
+        eprintln!("SKIP: ns-ssh-server binary not built; run `cargo build` first");
+        return;
+    }
+
+    let dir = temp_dir("keyscan-type");
+    let port = free_port();
+    let host_key_path = dir.join("host_key_ed25519");
+
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("listenaddress=127.0.0.1")
+        .arg("-o")
+        .arg("pubkeyauthentication=no")
+        .arg("-o")
+        .arg("passwordauthentication=no")
+        .arg("-o")
+        .arg("gssapiauthentication=no")
+        .arg("--host-key-file")
+        .arg(host_key_path.to_str().unwrap())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let keyscan_link = dir.join("ssh-keyscan");
+    std::os::unix::fs::symlink(client_bin, &keyscan_link).unwrap();
+
+    let output = Command::new(&keyscan_link)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-t")
+        .arg("ed25519")
+        .arg("127.0.0.1")
+        .output()
+        .expect("run ssh-keyscan -t ed25519");
+
+    let mut server = server;
+    let _ = server.kill();
+    let server_out = server.wait_with_output().expect("wait server");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "ns-ssh-keyscan -t ed25519 failed: status={:?}\nstdout={}\nstderr={}\nserver_stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&server_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ssh-ed25519"),
+        "expected ssh-ed25519 host key line, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
 fn query_algorithms_lists_supported() {
     let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
@@ -1733,6 +2113,101 @@ fn ssh_keygen_generates_usable_key() {
         assert!(
             String::from_utf8_lossy(&sys.stdout).trim() == pub_content.trim(),
             "system ssh-keygen public key mismatch"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ssh-keygen -t rsa` must generate a key that the real OpenSSH ssh-keygen
+/// can read back (the private-key serialization path).
+#[test]
+fn ssh_keygen_rsa_key_is_readable_by_openssh() {
+    let dir = temp_dir("keygen-rsa");
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let keygen_link = dir.join("ssh-keygen");
+    std::os::unix::fs::symlink(client_bin, &keygen_link).unwrap();
+
+    let key_path = dir.join("test_rsa");
+    let out = Command::new(&keygen_link)
+        .arg("-t")
+        .arg("rsa")
+        .arg("-b")
+        .arg("2048")
+        .arg("-f")
+        .arg(&key_path)
+        .arg("-q")
+        .output()
+        .expect("run ssh-keygen -t rsa");
+    assert!(
+        out.status.success(),
+        "ns ssh-keygen -t rsa failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(key_path.exists(), "RSA private key not created");
+
+    // The real OpenSSH ssh-keygen must be able to read our RSA private key.
+    if let Ok(sys) = Command::new("ssh-keygen")
+        .arg("-y")
+        .arg("-f")
+        .arg(&key_path)
+        .output()
+    {
+        assert!(
+            sys.status.success(),
+            "system ssh-keygen could not read our RSA key: {}",
+            String::from_utf8_lossy(&sys.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&sys.stdout).starts_with("ssh-rsa "),
+            "unexpected RSA public key: {:?}",
+            String::from_utf8_lossy(&sys.stdout)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ssh-keygen -lf <file>` (attached short option) and the reported bit length
+/// must match OpenSSH: RSA keys report their modulus size, ed25519 reports 256.
+#[test]
+fn ssh_keygen_attached_lf_and_bit_length() {
+    let dir = temp_dir("keygen-lf");
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let keygen_link = dir.join("ssh-keygen");
+    std::os::unix::fs::symlink(client_bin, &keygen_link).unwrap();
+
+    for (ttype, expect_bits) in [("ed25519", "256"), ("rsa", "2048")] {
+        let key_path = dir.join(format!("k_{}", ttype));
+        let gen = Command::new(&keygen_link)
+            .arg("-t")
+            .arg(ttype)
+            .arg("-b")
+            .arg("2048")
+            .arg("-f")
+            .arg(&key_path)
+            .arg("-q")
+            .output()
+            .expect("run keygen");
+        assert!(gen.status.success(), "keygen {} failed", ttype);
+
+        // Attached `-lf <file>` form.
+        let out = Command::new(&keygen_link)
+            .arg("-lf")
+            .arg(&key_path)
+            .output()
+            .expect("run -lf");
+        assert!(
+            out.status.success(),
+            "-lf {} failed: {}",
+            ttype,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            line.starts_with(&format!("{} SHA256:", expect_bits)),
+            "-lf {} should report {} bits, got: {:?}",
+            ttype,
+            expect_bits,
+            line
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -3537,7 +4012,9 @@ fn client_streamlocal_bind_mask_and_unlink() {
 }
 
 /// A peer that never sends its SSH version must be dropped once
-/// `UnusedConnectionTimeout` elapses.
+/// `UnusedConnectionTimeout` elapses. The server sends its identification
+/// string immediately on accept (matching OpenSSH sshd), so the silent client
+/// first reads the banner, then observes the connection being closed.
 #[test]
 fn server_unused_connection_timeout_closes_silent_connection() {
     let dir = temp_dir("server-unused-timeout");
@@ -3550,8 +4027,27 @@ fn server_unused_connection_timeout_closes_silent_connection() {
         .set_read_timeout(Some(Duration::from_secs(8)))
         .expect("set read timeout");
     let start = Instant::now();
-    let mut buf = [0u8; 64];
+    let mut banner = Vec::new();
+    // The server sends its identification string first (matching OpenSSH
+    // sshd); read until the full line (terminated by \r\n) arrives. The
+    // version string and terminator are written separately, so a single read
+    // may return a partial line.
+    let mut byte = [0u8; 1];
+    while !banner.ends_with(b"\r\n") && banner.len() < 256 {
+        let n = stream.read(&mut byte).expect("read banner byte");
+        if n == 0 {
+            break;
+        }
+        banner.push(byte[0]);
+    }
+    assert!(
+        banner.starts_with(b"SSH-2.0-") && banner.ends_with(b"\r\n"),
+        "expected server identification string first, got {:?}",
+        String::from_utf8_lossy(&banner)
+    );
+
     // Stay silent: no version string is sent, so the server should give up.
+    let mut buf = [0u8; 64];
     let res = stream.read(&mut buf);
     let elapsed = start.elapsed();
 

@@ -42,6 +42,7 @@ thiserror = "2"
 dirs = "6"
 libc = "0.2"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
+ml-kem = "0.3"
 
 [features]
 default = []

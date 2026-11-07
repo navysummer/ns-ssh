@@ -13,6 +13,8 @@ pub mod sftp;
 pub mod known_hosts;
 pub mod keygen;
 pub mod cert;
+pub mod gssapi;
+pub mod gssapi_sys;
 
 pub use error::{SshError, Result};
 pub use encoding::{SshEncode, SshDecode, SshString, SshBytes, SshNameList, SshMpInt};

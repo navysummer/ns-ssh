@@ -165,7 +165,12 @@ pub struct HostConfig {
     pub hostbased_accepted_algorithms: Option<String>,
     #[serde(default)]
     pub kbd_interactive_authentication: Option<bool>,
+    /// GSSAPIAuthentication (OpenSSH default no).
     #[serde(default)]
+    pub gssapi_authentication: Option<bool>,
+    /// GSSAPIDelegateCredentials (OpenSSH default no).
+    #[serde(default)]
+    pub gssapi_delegate_credentials: Option<bool>,
     pub preferred_authentications: Option<String>,
     #[serde(default)]
     pub host_key_algorithms: Option<String>,
@@ -521,6 +526,12 @@ pub struct ResolvedConfig {
     /// HostbasedAcceptedAlgorithms: allowed client host key algorithms.
     pub hostbased_accepted_algorithms: Option<Vec<String>>,
     pub kbd_interactive_authentication: bool,
+    /// GSSAPIAuthentication: enable `gssapi-with-mic` authentication when a
+    /// loadable GSSAPI library is present (OpenSSH default no).
+    pub gssapi_authentication: bool,
+    /// GSSAPIDelegateCredentials: forward the Kerberos credential to the
+    /// server (OpenSSH default no). Only meaningful with GSSAPI enabled.
+    pub gssapi_delegate_credentials: bool,
     pub preferred_authentications: Option<Vec<String>>,
     pub host_key_algorithms: Option<Vec<String>>,
     pub kex_algorithms: Option<Vec<String>>,
@@ -661,6 +672,8 @@ impl ResolvedConfig {
             hostbased_authentication: false,
             hostbased_accepted_algorithms: None,
             kbd_interactive_authentication: true,
+            gssapi_authentication: false,
+            gssapi_delegate_credentials: false,
             preferred_authentications: None,
             host_key_algorithms: None,
             kex_algorithms: None,
@@ -1061,6 +1074,8 @@ impl SshConfig {
         let mut hostbased_authentication = None;
         let mut hostbased_accepted_algorithms = None;
         let mut kbd_interactive_authentication = None;
+        let mut gssapi_authentication = None;
+        let mut gssapi_delegate_credentials = None;
         let mut preferred_authentications = None;
         let mut host_key_algorithms = None;
         let mut kex_algorithms = None;
@@ -1166,6 +1181,8 @@ impl SshConfig {
                             hostbased_authentication: hostbased_authentication.take(),
                             hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
+                            gssapi_authentication: gssapi_authentication.take(),
+                            gssapi_delegate_credentials: gssapi_delegate_credentials.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
                             kex_algorithms: kex_algorithms.take(),
@@ -1288,6 +1305,8 @@ impl SshConfig {
                             hostbased_authentication: hostbased_authentication.take(),
                             hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
+                            gssapi_authentication: gssapi_authentication.take(),
+                            gssapi_delegate_credentials: gssapi_delegate_credentials.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
                             kex_algorithms: kex_algorithms.take(),
@@ -1390,6 +1409,8 @@ impl SshConfig {
                             hostbased_authentication: hostbased_authentication.take(),
                             hostbased_accepted_algorithms: hostbased_accepted_algorithms.take(),
                             kbd_interactive_authentication: kbd_interactive_authentication.take(),
+                            gssapi_authentication: gssapi_authentication.take(),
+                            gssapi_delegate_credentials: gssapi_delegate_credentials.take(),
                             preferred_authentications: preferred_authentications.take(),
                             host_key_algorithms: host_key_algorithms.take(),
                             kex_algorithms: kex_algorithms.take(),
@@ -1524,8 +1545,15 @@ impl SshConfig {
                 "pubkeyauthentication" | "pubkey_authentication" | "dsaauthentication" => pubkey_authentication = Some(yes(value)),
                 "kbdinteractiveauthentication" | "kbd_interactive_authentication"
                     | "challengeresponseauthentication" | "challenge-response-authentication"
-                    | "skeyauthentication" | "tisauthentication"
                     => kbd_interactive_authentication = Some(yes(value)),
+                "skeyauthentication" | "tisauthentication"
+                    => kbd_interactive_authentication = Some(yes(value)),
+                "gssapiauthentication" | "gssapi_authentication" => {
+                    gssapi_authentication = Some(yes(value));
+                }
+                "gssapidelegatecredentials" | "gssapi_delegate_credentials" => {
+                    gssapi_delegate_credentials = Some(yes(value));
+                }
                 "preferredauthentications" | "preferred_authentications" => preferred_authentications = Some(value.to_string()),
                 "hostkeyalgorithms" | "host_key_algorithms" => host_key_algorithms = Some(value.to_string()),
                 "kexalgorithms" | "kex_algorithms" => kex_algorithms = Some(value.to_string()),
@@ -1691,10 +1719,7 @@ impl SshConfig {
                 // keychain integration. The directives are accepted so that
                 // real ssh_config files remain loadable, but they have no
                 // effect: the client never attempts GSSAPI or security-key
-                // authentication and never loads a PKCS#11 provider.
-                "gssapiauthentication" | "gssapi_authentication"
-                | "gssapidelegatecredentials" | "gssapi_delegate_credentials"
-                | "securitykeyprovider" | "security_key_provider"
+                "securitykeyprovider" | "security_key_provider"
                 | "usekeychain" | "use_keychain" => {
                     // Accepted; explicitly not implemented.
                 }
@@ -1781,6 +1806,8 @@ impl SshConfig {
                 hostbased_authentication,
                 hostbased_accepted_algorithms: hostbased_accepted_algorithms.clone(),
                 kbd_interactive_authentication,
+                gssapi_authentication,
+                gssapi_delegate_credentials,
                 preferred_authentications: preferred_authentications.clone(),
                 host_key_algorithms: host_key_algorithms.clone(),
                 kex_algorithms: kex_algorithms.clone(),
@@ -2414,6 +2441,10 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.hosts.len(), 1);
         assert_eq!(cfg.hosts[0].host, "env");
+        // GSSAPIAuthentication/GSSAPIDelegateCredentials are parsed (not just
+        // accepted); the other two remain accepted-but-unimplemented.
+        assert_eq!(cfg.hosts[0].gssapi_authentication, Some(true));
+        assert_eq!(cfg.hosts[0].gssapi_delegate_credentials, Some(true));
     }
 
     #[test]

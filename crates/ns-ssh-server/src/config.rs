@@ -162,6 +162,9 @@ pub struct ServerConfig {
     pub ignore_rhosts: bool,
 
     #[serde(default)]
+    pub gssapi_authentication: bool,
+
+    #[serde(default)]
     pub hostbased_auth: bool,
 
     /// HostbasedAcceptedAlgorithms: client host key algorithms accepted for
@@ -1327,6 +1330,7 @@ impl Default for ServerConfig {
             permit_empty_passwords: false,
             use_pam: false,
             pam_service_name: default_pam_service(),
+            gssapi_authentication: false,
             ignore_rhosts: default_true(),
             hostbased_auth: false,
             hostbased_accepted_algorithms: None,
@@ -1886,8 +1890,10 @@ impl ServerConfig {
                 "pamservicename" | "pam_service_name" => {
                     config.pam_service_name = value.to_string();
                 }
-                "gssapiauthentication" | "gssapi_authentication"
-                | "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
+                "gssapiauthentication" | "gssapi_authentication" => {
+                    config.gssapi_authentication = value == "yes";
+                }
+                "gssapicleanupcredentials" | "gssapi_cleanup_credentials"
                 | "gssapistrictacceptorcheck" | "gssapi_strict_acceptor_check"
                 | "kerberosauthentication" | "kerberos_authentication"
                 | "kerberosgetafstoken" | "kerberos_get_afs_token"

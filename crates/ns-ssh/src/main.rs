@@ -373,9 +373,12 @@ fn main() {
         eprintln!("ns-ssh: -I PKCS#11 provider is not supported (got {:?})", pkcs11);
         std::process::exit(1);
     }
+    // -K: GSSAPI credential delegation. Requires GSSAPI auth to be enabled
+    // (GSSAPIAuthentication), and takes effect only when a GSSAPI library is
+    // present; otherwise the client falls through to other auth methods.
     if args.gssapi_deleg_creds {
-        eprintln!("ns-ssh: -K GSSAPI credential delegation is not supported");
-        std::process::exit(1);
+        config.gssapi_authentication = true;
+        config.gssapi_delegate_credentials = true;
     }
 
 
@@ -1195,7 +1198,18 @@ async fn scan_one_host(host: &str, port: u16, key_types: &[String]) -> Option<(S
     cfg.batch_mode = true;
     cfg.connect_timeout = Some(10);
     if !key_types.is_empty() {
-        cfg.host_key_algorithms = Some(key_types.to_vec());
+        // `ssh-keyscan -t ed25519` etc. take the *short* key type names that
+        // OpenSSH's -t option accepts, not the full host key algorithm names.
+        // Map them to the algorithm names the KEX negotiation uses.
+        let mut algs: Vec<String> = Vec::new();
+        for t in key_types {
+            for a in keyscan_keytype_to_algs(t) {
+                if !algs.contains(&a) {
+                    algs.push(a);
+                }
+            }
+        }
+        cfg.host_key_algorithms = Some(algs);
     } else {
         // ssh-keyscan reports plain host keys; certificate variants are
         // deliberately not requested here.
@@ -1213,6 +1227,25 @@ async fn scan_one_host(host: &str, port: u16, key_types: &[String]) -> Option<(S
     client.handshake().await.ok()?;
     client.captured_host_key.clone()
 }
+
+/// Map an `ssh-keyscan -t` short key type to the host key algorithm name(s)
+/// it selects, mirroring OpenSSH's `key_type_from_name` behavior.
+fn keyscan_keytype_to_algs(t: &str) -> Vec<String> {
+    match t {
+        "ed25519" => vec!["ssh-ed25519".to_string()],
+        "ecdsa" | "ecdsa-sha2-nistp256" => vec!["ecdsa-sha2-nistp256".to_string()],
+        "ecdsa-sha2-nistp384" => vec!["ecdsa-sha2-nistp384".to_string()],
+        "ecdsa-sha2-nistp521" => vec!["ecdsa-sha2-nistp521".to_string()],
+        "rsa" => vec!["rsa-sha2-512".to_string(), "rsa-sha2-256".to_string()],
+        "sk-ed25519" | "sk-ssh-ed25519@openssh.com" => vec!["sk-ssh-ed25519@openssh.com".to_string()],
+        "sk-ecdsa" | "sk-ecdsa-sha2-nistp256@openssh.com" => {
+            vec!["sk-ecdsa-sha2-nistp256@openssh.com".to_string()]
+        }
+        // Already a full host key algorithm name: pass it through.
+        _ => vec![t.to_string()],
+    }
+}
+
 
 /// Split `host[:port]` (IPv6 in brackets) into (host, port).
 fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
@@ -1285,6 +1318,30 @@ fn run_keygen_mode() -> i32 {
             "-h" | "--help" => {
                 eprintln!("usage: ssh-keygen [-t type] [-f file] [-b bits] [-y] [-l] [-F hostname] [-R hostname]");
                 return 1;
+            }
+            // Combined short-option forms (OpenSSH accepts `-lf <file>` and
+            // `-yf <file>`): the flag letter sets the mode and the trailing
+            // `f` takes the next argument as the key file, exactly as `-f`
+            // does.
+            s if s == "-lf" || s == "-yf" => {
+                if s == "-lf" {
+                    fingerprint = true;
+                } else {
+                    export_public = true;
+                }
+                if i + 1 < args.len() {
+                    i += 1;
+                    output_file = Some(args[i].clone());
+                }
+            }
+            // A bare positional argument is the key file in -l/-y mode
+            // (OpenSSH accepts `ssh-keygen -lf <file>` and `ssh-keygen -l
+            // <file>`; `-lf` may also be glued: `-lf<file>`).
+            _ if (fingerprint || export_public)
+                && !a.starts_with('-')
+                && output_file.is_none() =>
+            {
+                output_file = Some(a.clone());
             }
             _ => {}
         }
@@ -1394,11 +1451,38 @@ fn keygen_generate(key_type: &str, path: &str, bits: Option<u32>) -> i32 {
             0
         }
         "rsa" => {
-            // RSA generation requires the rsa crate; use a fixed 2048-bit key.
-            let key = ssh_core::hostkey::RsaHostKey::generate(2048).expect("generate rsa");
-            let _ = key;
-            eprintln!("ssh-keygen: RSA private-key serialization is not yet supported");
-            1
+            use ssh_core::hostkey::HostKeySigner;
+            let bits = bits.unwrap_or(3072) as usize;
+            let key = ssh_core::hostkey::RsaHostKey::generate(bits).expect("generate rsa");
+            let priv_key = match key.private_key() {
+                Some(k) => k,
+                None => {
+                    eprintln!("ssh-keygen: RSA private key not available");
+                    return 1;
+                }
+            };
+            let content = match ssh_core::keygen::format_openssh_rsa(priv_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ssh-keygen: {}", e);
+                    return 1;
+                }
+            };
+            if let Err(e) = ssh_core::keygen::write_private_key(std::path::Path::new(path), &content) {
+                eprintln!("ssh-keygen: write {}: {}", path, e);
+                return 1;
+            }
+            let pub_blob = key.public_key_bytes();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&pub_blob);
+            let pub_line = format!("ssh-rsa {}", encoded);
+            let pub_path = format!("{}.pub", path);
+            if let Err(e) = std::fs::write(&pub_path, format!("{}\n", pub_line)) {
+                eprintln!("ssh-keygen: write {}: {}", pub_path, e);
+                return 1;
+            }
+            println!("Your identification has been saved in {}", path);
+            println!("Your public key has been saved in {}", pub_path);
+            0
         }
         other => {
             eprintln!("ssh-keygen: unknown key type: {}", other);
@@ -1467,11 +1551,49 @@ fn print_fingerprint(blob: &[u8], path: &str) -> i32 {
     let digest = sha2::Sha256::digest(blob);
     let fp = base64::engine::general_purpose::STANDARD.encode(&digest);
     let fp = fp.trim_end_matches('=');
-    // Determine key type from the blob's leading string.
+    // Determine the key type and size from the blob's leading string.
     let mut p = blob;
     let kind = read_simple_string(&mut p).unwrap_or_else(|_| "SSH".to_string());
-    println!("256 SHA256:{} {} ({})", fp, path, kind);
+    let bits = key_bits(&kind, &mut p);
+    println!("{} SHA256:{} {} ({})", bits, fp, path, kind);
     0
+}
+
+/// Derive the key size in bits from the key blob, as `ssh-keygen -l` prints.
+/// `p` is positioned just past the leading key-type string.
+fn key_bits(kind: &str, p: &mut &[u8]) -> usize {
+    match kind {
+        "ssh-ed25519" | "sk-ssh-ed25519@openssh.com" => 256,
+        "ecdsa-sha2-nistp256" | "sk-ecdsa-sha2-nistp256@openssh.com" => 256,
+        "ecdsa-sha2-nistp384" => 384,
+        "ecdsa-sha2-nistp521" => 521,
+        // RSA: the modulus follows the type string as an mpint; its bit length
+        // is the key size. Skip the exponent mpint, then measure the modulus.
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => {
+            let _ = read_simple_string(p);
+            match read_simple_mpint(p) {
+                Some(n) => n.len() * 8,
+                None => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Read an SSH mpint (uint32 length + bytes) and return the raw bytes.
+fn read_simple_mpint(p: &mut &[u8]) -> Option<Vec<u8>> {
+    let len = read_simple_u32(p).ok()??;
+    if p.len() < len as usize {
+        return None;
+    }
+    let mut bytes = p[..len as usize].to_vec();
+    *p = &p[len as usize..];
+    // Strip a leading 0x00 pad byte (added so the mpint stays positive), so
+    // the byte length maps directly to the bit length.
+    while bytes.len() > 1 && bytes[0] == 0 {
+        bytes.remove(0);
+    }
+    Some(bytes)
 }
 
 /// Export the public key from a private key file (`-y`).
@@ -2506,6 +2628,12 @@ fn load_config(args: &SshArgs) -> ResolvedConfig {
             }
             if let Some(v) = host_config.kbd_interactive_authentication {
                 resolved.kbd_interactive_authentication = v;
+            }
+            if let Some(v) = host_config.gssapi_authentication {
+                resolved.gssapi_authentication = v;
+            }
+            if let Some(v) = host_config.gssapi_delegate_credentials {
+                resolved.gssapi_delegate_credentials = v;
             }
             if let Some(v) = &host_config.preferred_authentications {
                 resolved.preferred_authentications = Some(v.split(',').map(str::trim).map(|s| s.to_string()).collect());

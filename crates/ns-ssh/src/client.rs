@@ -1073,9 +1073,11 @@ impl SshClient {
                 server_kex_init: self.transport.server_kex_init.clone(),
             };
 
-            let exch_hash = if negotiation.kex_algorithm.starts_with("sntrup761x25519") {
-                // RFC 9941 §3: K is a string, Q_C/Q_S are byte strings.
+            let exch_hash = if ssh_core::kex::is_hybrid_kex(&negotiation.kex_algorithm) {
+                // RFC 9941 §3 / RFC 9765 §3: K is a string, Q_C/Q_S are byte
+                // strings.
                 ssh_core::kex::compute_hybrid_exchange_hash(
+                    &hash_name,
                     &exchange,
                     &host_key_blob,
                     &kex.public_key_bytes(),
@@ -1464,9 +1466,16 @@ impl SshClient {
         let mut auth_succeeded = false;
 
         let mut method_order: Vec<String> = Vec::new();
+        // OpenSSH's default `authmethods[]` order (sshconnect2.c): gssapi
+        // first, then hostbased, publickey, keyboard-interactive, password.
+        // GSSAPI is only offered when enabled *and* a GSSAPI library is
+        // present; otherwise it is skipped so the remaining methods still run.
+        let gssapi_ok = self.config.gssapi_authentication
+            && ssh_core::gssapi_sys::gssapi_available();
         if let Some(pref) = &self.config.preferred_authentications {
             for m in pref {
                 let ok = match m.as_str() {
+                    "gssapi-with-mic" => gssapi_ok,
                     "publickey" => self.config.pubkey_authentication,
                     "hostbased" => self.config.hostbased_authentication,
                     "keyboard-interactive" => self.config.kbd_interactive_authentication,
@@ -1481,6 +1490,7 @@ impl SshClient {
                 return Err(SshError::AuthFailed("no authentication methods enabled".into()));
             }
         } else {
+            if gssapi_ok { method_order.push("gssapi-with-mic".into()); }
             if self.config.hostbased_authentication { method_order.push("hostbased".into()); }
             if self.config.pubkey_authentication { method_order.push("publickey".into()); }
             if self.config.kbd_interactive_authentication { method_order.push("keyboard-interactive".into()); }
@@ -1639,6 +1649,151 @@ impl SshClient {
                             }
                         }
                     }
+                    if auth_succeeded { break; }
+                }
+                "gssapi-with-mic" => {
+                    // RFC 4462 §3: gssapi-with-mic. The client sends a
+                    // USERAUTH_REQUEST listing the mechanism OIDs it supports,
+                    // then exchanges GSS-API tokens with the server and
+                    // finishes with a MIC over the session id + request.
+                    // Only runs when a GSSAPI library is loadable and
+                    // GSSAPIAuthentication is enabled (checked in method_order).
+                    if !self.config.gssapi_authentication {
+                        continue;
+                    }
+                    if !ssh_core::gssapi_sys::gssapi_available() {
+                        continue;
+                    }
+                    let mechanisms: &[&[u8]] = ssh_core::gssapi::SUPPORTED_MECHANISMS;
+                    let req = ssh_core::gssapi::build_userauth_request(
+                        &username,
+                        msg::SSH_SERVICE_NAME_CONNECTION,
+                        mechanisms,
+                    );
+                    send_encrypted_packet(stream, &req, &mut self.transport, false, aead).await?;
+                    let resp = read_auth_packet(stream, &mut self.transport, aead).await?;
+                    if resp.first() != Some(&msg::SSH_MSG_USERAUTH_GSSAPI_RESPONSE) {
+                        // Server rejected gssapi outright (no GSSAPI_RESPONSE):
+                        // it must be a USERAUTH_FAILURE naming other methods.
+                        continue;
+                    }
+                    // The selected mechanism is validated by the server's
+                    // choice; no client-side action depends on its value here.
+                    let _selected_oid = match ssh_core::gssapi::decode_response(&resp[1..]) {
+                        Ok(oid) => oid,
+                        Err(_) => continue,
+                    };
+                    // Import the host-based service name for this host.
+                    let mut target = match ssh_core::gssapi_sys::import_hostbased_service(
+                        &self.config.hostname,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::debug!("gssapi: import_hostbased_service failed: {}", e);
+                            continue;
+                        }
+                    };
+                    let mut ctx: ssh_core::gssapi_sys::GssCtxId = std::ptr::null_mut();
+                    let mut input_token: Vec<u8> = Vec::new();
+                    let mut integ_ok = false;
+                    let mut done = false;
+                    // GSS-API token exchange loop (RFC 4462 §3.4): each side
+                    // sends TOKEN packets until CONTINUE_NEEDED clears.
+                    for _round in 0..64 {
+                        let step = ssh_core::gssapi_sys::init_sec_context(
+                            &mut ctx,
+                            target,
+                            &input_token,
+                            self.config.gssapi_delegate_credentials,
+                        );
+                        match step {
+                            Ok(r) => {
+                                integ_ok = r.integ_avail;
+                                if !r.token.is_empty() {
+                                    let tok = ssh_core::gssapi::build_token(&r.token);
+                                    send_encrypted_packet(
+                                        stream,
+                                        &tok,
+                                        &mut self.transport,
+                                        false,
+                                        aead,
+                                    ).await?;
+                                }
+                                if !r.continue_needed {
+                                    done = true;
+                                    break;
+                                }
+                                let next = read_auth_packet(stream, &mut self.transport, aead).await?;
+                                match next.first() {
+                                    Some(&msg::SSH_MSG_USERAUTH_GSSAPI_TOKEN) => {
+                                        input_token = ssh_core::gssapi::decode_token(&next[1..])
+                                            .unwrap_or_default();
+                                    }
+                                    Some(&msg::SSH_MSG_USERAUTH_GSSAPI_ERRTOK) => {
+                                        // Server reported a GSS-API error token.
+                                        ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                                        continue;
+                                    }
+                                    Some(&msg::SSH_MSG_USERAUTH_FAILURE) => {
+                                        ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                                        continue;
+                                    }
+                                    _ => {
+                                        ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                                        continue;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("gssapi: init_sec_context failed: {}", e);
+                                ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                                break;
+                            }
+                        }
+                    }
+                    if !done {
+                        ssh_core::gssapi_sys::release_name(&mut target);
+                        continue;
+                    }
+                    // RFC 4462 §3.5: the server confirms the context is
+                    // established by sending GSSAPI_EXCHANGE_COMPLETE before
+                    // the client sends its MIC.
+                    let exchange = read_auth_packet(stream, &mut self.transport, aead).await?;
+                    if exchange.first() != Some(&msg::SSH_MSG_USERAUTH_GSSAPI_EXCHANGE_COMPLETE) {
+                        ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                        ssh_core::gssapi_sys::release_name(&mut target);
+                        continue;
+                    }
+                    // MIC data (RFC 4462 §3.5): session id, the original
+                    // USERAUTH_REQUEST bytes, and the method name.
+                    let mic_data = ssh_core::gssapi::build_mic_data(
+                        &session_id,
+                        &username,
+                        msg::SSH_SERVICE_NAME_CONNECTION,
+                    );
+                    // §3.5: when the mechanism has no integrity protection the
+                    // client sends a zero-length MIC rather than failing.
+                    let mic: Vec<u8> = if integ_ok {
+                        match ssh_core::gssapi_sys::get_mic(ctx, &mic_data) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::debug!("gssapi: get_mic failed: {}", e);
+                                ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                                ssh_core::gssapi_sys::release_name(&mut target);
+                                continue;
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let mic_msg = ssh_core::gssapi::build_mic(&mic);
+                    send_encrypted_packet(stream, &mic_msg, &mut self.transport, false, aead).await?;
+                    let mic_resp = read_auth_packet(stream, &mut self.transport, aead).await?;
+                    if mic_resp.first() == Some(&msg::SSH_MSG_USERAUTH_SUCCESS) {
+                        auth_succeeded = true;
+                    }
+                    ssh_core::gssapi_sys::delete_sec_context(&mut ctx);
+                    ssh_core::gssapi_sys::release_name(&mut target);
                     if auth_succeeded { break; }
                 }
                 "hostbased" => {

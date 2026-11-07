@@ -129,6 +129,8 @@ mod imp {
         pam_start: PamStart,
         pam_authenticate: PamAuthenticate,
         pam_acct_mgmt: PamAcctMgmt,
+        pam_open_session: PamOpenSession,
+        pam_close_session: PamCloseSession,
         pam_end: PamEnd,
     }
 
@@ -152,16 +154,20 @@ mod imp {
             if handle.is_null() {
                 continue;
             }
-            if let (Some(start), Some(auth), Some(acct), Some(end)) = (
+            if let (Some(start), Some(auth), Some(acct), Some(open), Some(close), Some(end)) = (
                 unsafe { sym::<PamStart>(handle, b"pam_start\0") },
                 unsafe { sym::<PamAuthenticate>(handle, b"pam_authenticate\0") },
                 unsafe { sym::<PamAcctMgmt>(handle, b"pam_acct_mgmt\0") },
+                unsafe { sym::<PamOpenSession>(handle, b"pam_open_session\0") },
+                unsafe { sym::<PamCloseSession>(handle, b"pam_close_session\0") },
                 unsafe { sym::<PamEnd>(handle, b"pam_end\0") },
             ) {
                 return Some(PamLib {
                     pam_start: start,
                     pam_authenticate: auth,
                     pam_acct_mgmt: acct,
+                    pam_open_session: open,
+                    pam_close_session: close,
                     pam_end: end,
                 });
             }
@@ -224,6 +230,81 @@ mod imp {
         }
         let _ = unsafe { (lib.pam_end)(pamh, auth_rc) };
         Some(ok)
+    }
+
+    type PamOpenSession = unsafe extern "C" fn(PamHandle, c_int) -> c_int;
+    type PamCloseSession = unsafe extern "C" fn(PamHandle, c_int) -> c_int;
+
+    /// A live PAM session opened by `pam_open_session`. Dropping it closes the
+    /// session via `pam_close_session` + `pam_end` (OpenSSH's `do_pam_session`).
+    /// It is `Send` because the handle outlives the async connection: the
+    /// `pamh` pointer is owned by us and `pam_close_session` is called exactly
+    /// once, on the connection task.
+    pub struct PamSession {
+        pamh: PamHandle,
+    }
+
+    // `pamh` is a private pointer we own for the session's lifetime; moving it
+    // across a thread boundary is sound because libpam session handles are
+    // not tied to any particular thread on Linux/macOS.
+    unsafe impl Send for PamSession {}
+
+    impl PamSession {
+        /// Close the session (`pam_close_session` then `pam_end`). Safe to call
+        /// once; afterwards the handle is consumed.
+        pub fn close(self) {
+            let lib = match load() {
+                Some(l) => l,
+                None => return, // library unloaded between open and close
+            };
+            let rc = unsafe { (lib.pam_close_session)(self.pamh, PAM_SILENT) };
+            let _ = unsafe { (lib.pam_end)(self.pamh, rc) };
+        }
+    }
+
+    impl Drop for PamSession {
+        fn drop(&mut self) {
+            // Best-effort close on drop (e.g. connection error before explicit
+            // close). `pam_close_session` + `pam_end` are idempotent-ish here
+            // only if not already closed; the explicit `close()` consumes the
+            // value so drop cannot run afterwards.
+            if let Some(lib) = load() {
+                let rc = unsafe { (lib.pam_close_session)(self.pamh, PAM_SILENT) };
+                let _ = unsafe { (lib.pam_end)(self.pamh, rc) };
+            }
+        }
+    }
+
+    /// Open a PAM session for `user` after a successful authentication, using
+    /// the same `service`. Returns `None` when libpam is unavailable (caller
+    /// should proceed without a PAM session, as OpenSSH does when PAM is off).
+    /// `pam_open_session` runs the `session` phase of the stack (e.g. mount
+    /// home, set up environment); its failure is non-fatal to login, matching
+    /// OpenSSH's `do_pam_session` semantics.
+    pub fn pam_open_session(user: &str, service: &str) -> Option<PamSession> {
+        let lib = load()?;
+        let user_c = CString::new(user).ok()?;
+        let service_c = CString::new(service).ok()?;
+        // The conversation is not used by pam_open_session for our purposes
+        // (no prompts expected); pass a null conversation.
+        let mut pamh: PamHandle = std::ptr::null_mut();
+        let rc = unsafe {
+            (lib.pam_start)(
+                service_c.as_ptr(),
+                user_c.as_ptr(),
+                std::ptr::null(),
+                &mut pamh,
+            )
+        };
+        if rc != PAM_SUCCESS || pamh.is_null() {
+            return None;
+        }
+        let rc = unsafe { (lib.pam_open_session)(pamh, PAM_SILENT) };
+        if rc != PAM_SUCCESS {
+            let _ = unsafe { (lib.pam_end)(pamh, rc) };
+            return None;
+        }
+        Some(PamSession { pamh })
     }
 
     #[cfg(test)]
@@ -339,7 +420,20 @@ mod imp {
     pub fn pam_available() -> bool {
         false
     }
+    pub fn pam_open_session(_user: &str, _service: &str) -> Option<PamSession> {
+        None
+    }
+    pub struct PamSession;
+    impl PamSession {
+        pub fn close(self) {}
+    }
 }
+
+#[cfg(unix)]
+pub use imp::PamSession;
+#[cfg(not(unix))]
+pub use imp::PamSession;
+
 
 pub fn verify_pam_password(user: &str, password: &str, service: &str) -> Option<bool> {
     imp::verify_pam_password(user, password, service)
@@ -351,6 +445,17 @@ pub fn verify_pam_password(user: &str, password: &str, service: &str) -> Option<
 pub fn pam_available() -> bool {
     imp::pam_available()
 }
+
+/// Open the PAM `session` phase for a just-authenticated user. Returns `None`
+/// when libpam is unavailable or the session phase fails; the connection
+/// proceeds without a PAM session (matching OpenSSH's non-fatal semantics).
+pub fn pam_open_session(user: &str, service: &str) -> Option<PamSession> {
+    imp::pam_open_session(user, service)
+}
+
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -374,5 +479,26 @@ mod tests {
         let first = verify_pam_password("ns_ssh_no_such_user_xyz", "x", "sshd");
         let second = verify_pam_password("ns_ssh_no_such_user_xyz", "x", "sshd");
         assert_eq!(first, second);
+    }
+
+    /// `pam_open_session` for an unknown user must not panic or hang: either
+    /// libpam is unavailable (None) or the session phase rejects the user
+    /// (None). When a session IS opened (real user, functioning stack), closing
+    /// it must be a no-op-safe operation that never crashes.
+    #[test]
+    fn pam_session_open_and_close_is_safe() {
+        let session = pam_open_session("ns_ssh_no_such_user_xyz", "sshd");
+        // Unknown user: never a live session.
+        if let Some(s) = session {
+            // Unexpected, but closing it must not crash.
+            s.close();
+        }
+    }
+
+    /// A session handle must be `Send` (the async connection task owns it).
+    #[test]
+    fn pam_session_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PamSession>();
     }
 }

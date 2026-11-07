@@ -23,6 +23,7 @@ const DEFAULT_KEX: &[&str] = &[
     "ecdh-sha2-nistp256",
     "sntrup761x25519-sha512",
     "sntrup761x25519-sha512@openssh.com",
+    "mlkem768x25519-sha256",
     "curve25519-sha256",
     "curve25519-sha256@libssh.org",
     "ecdh-sha2-nistp384",
@@ -40,14 +41,19 @@ const DEFAULT_HOST_KEYS: &[&str] = &[
     "ecdsa-sha2-nistp256-cert-v01@openssh.com",
     "ecdsa-sha2-nistp384-cert-v01@openssh.com",
     "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    "sk-ssh-ed25519-cert-v01@openssh.com",
+    "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
     "rsa-sha2-512-cert-v01@openssh.com",
     "rsa-sha2-256-cert-v01@openssh.com",
     "ssh-ed25519",
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
     "rsa-sha2-512",
     "rsa-sha2-256",
+
 ];
 
 const DEFAULT_CIPHERS: &[&str] = &[
@@ -112,12 +118,19 @@ const SUPPORTED_MACS: &[&str] = &[
     "umac-128-etm@openssh.com",
 ];
 /// Return the default supported algorithms for a `-Q` query (key/cipher/mac/kex).
+/// Return the supported algorithms for a `-Q` query (key/cipher/mac/kex).
+///
+/// OpenSSH's `-Q <type>` lists the *usable* set (all algorithms you can
+/// configure), not just the default proposal. So `cipher`/`mac`/`key` return
+/// the full supported sets, while `kex` returns the default preference (the
+/// set that is actually negotiated by default).
 pub fn supported_algorithms(query: &str) -> Option<&'static [&'static str]> {
     match query.to_lowercase().as_str() {
         "key" | "hostkey" | "host-key" => Some(DEFAULT_HOST_KEYS),
         "key-sig" | "sig" => Some(DEFAULT_SIG_ALGS),
-        "cipher" | "ciphers" => Some(DEFAULT_CIPHERS),
-        "mac" | "macs" => Some(DEFAULT_MACS),
+        // `none` is a valid config value but is never listed by OpenSSH `-Q`.
+        "cipher" | "ciphers" => Some(&SUPPORTED_CIPHERS[1..]),
+        "mac" | "macs" => Some(&SUPPORTED_MACS[1..]),
         "kex" | "key-exchange" | "key-exchange-algorithm" => Some(DEFAULT_KEX),
         "help" => Some(&["help", "key", "key-sig", "sig", "cipher", "mac", "kex"]),
         _ => None,
@@ -542,6 +555,9 @@ impl SshTransport {
             "sntrup761x25519-sha512" | "sntrup761x25519-sha512@openssh.com" => {
                 Ok(Box::new(SntrupX25519Kex::new()))
             }
+            "mlkem768x25519-sha256" => {
+                Ok(Box::new(MlkemX25519Kex::new()))
+            }
             "ecdh-sha2-nistp256" => {
                 Ok(Box::new(EcdhP256Kex::new()))
             }
@@ -597,15 +613,15 @@ impl SshTransport {
         let s2c_iv_len = crate::cipher::create_cipher(&negotiation.server_to_client_cipher)?.iv_len();
         let s2c_mac_len = crate::mac::create_mac(&negotiation.server_to_client_mac)?.key_len();
 
-        // RFC 9941 §3: the hybrid KEX encodes K as a `string` (not an mpint)
-        // in both the exchange hash and key derivation. All other KEX methods
-        // use the canonical mpint form.
-        let hybrid = negotiation.kex_algorithm.starts_with("sntrup761x25519");
+        // RFC 9941 §3 / RFC 9765 §3: the hybrid KEX encodes K as a `string`
+        // (not an mpint) in both the exchange hash and key derivation. All
+        // other KEX methods use the canonical mpint form.
+        let hybrid = crate::kex::is_hybrid_kex(&negotiation.kex_algorithm);
         let (c2s_iv, c2s_key, c2s_mac_key) = if hybrid {
             (
-                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'A', iv_len),
-                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'C', key_len),
-                crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'E', mac_len),
+                crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'A', iv_len),
+                crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'C', key_len),
+                crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'E', mac_len),
             )
         } else {
             (
@@ -616,17 +632,17 @@ impl SshTransport {
         };
 
         let s2c_iv = if hybrid {
-            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'B', s2c_iv_len)
+            crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'B', s2c_iv_len)
         } else {
             crate::kex::derive_s2c_initial_iv(hash_name, shared_secret, exchange_hash, session_id, s2c_iv_len)
         };
         let s2c_key = if hybrid {
-            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'D', s2c_key_len)
+            crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'D', s2c_key_len)
         } else {
             crate::kex::derive_s2c_encryption_key(hash_name, shared_secret, exchange_hash, session_id, s2c_key_len)
         };
         let s2c_mac_key = if hybrid {
-            crate::kex::derive_hybrid_key(shared_secret, exchange_hash, session_id, b'F', s2c_mac_len)
+            crate::kex::derive_hybrid_key(hash_name, shared_secret, exchange_hash, session_id, b'F', s2c_mac_len)
         } else {
             crate::kex::derive_s2c_integrity_key(hash_name, shared_secret, exchange_hash, session_id, s2c_mac_len)
         };

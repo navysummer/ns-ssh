@@ -539,6 +539,12 @@ impl RsaHostKey {
         let bits = public_key.size() * 8;
         Ok(RsaHostKey { private_key: None, public_key, bits })
     }
+
+    /// The RSA private key, if this host key holds one (a public-only host key
+    /// parsed from a blob has no private component).
+    pub fn private_key(&self) -> Option<&RsaPrivateKey> {
+        self.private_key.as_ref()
+    }
 }
 
 impl HostKeySigner for RsaHostKey {

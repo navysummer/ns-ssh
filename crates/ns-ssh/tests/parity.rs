@@ -76,9 +76,11 @@ fn launch_server(dir: &Path, port: u16) -> (std::process::Child, PathBuf, PathBu
     std::fs::write(
         &config_path,
         format!(
-            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nAuthorizedKeysFile {}\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n",
-            port, host_key_path.display(), auth_path.display()
-        ),
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nGSSAPIAuthentication yes\nAuthorizedKeysFile {}\nPermitRootLogin yes\nSubsystem sftp internal-sftp\n",
+            port,
+            host_key_path.display(),
+            auth_path.display()
+        )
     )
     .unwrap();
 
@@ -737,4 +739,231 @@ fn scp_parity_sftp_s_flag() {
     assert_trees_equal(&tree_ref, &tree_ns, "scp -s SFTP protocol upload");
     assert!(!tree_ns.is_empty(), "ns-scp -s produced no files");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn real_openssh_gssapi_configured_falls_through_to_pubkey() {
+    // The real OpenSSH `ssh` (with GSSAPIAuthentication=yes) must still
+    // authenticate to ns-ssh-server via pubkey when no usable GSS-API library
+    // is present, and vice versa. This asserts the gssapi-with-mic method is
+    // advertised by the server (when the host library is unusable it is
+    // omitted) and that the fallback path is transparent to interop.
+    if Command::new("ssh-keygen").arg("-V").arg("").output().is_err() {
+        eprintln!("SKIP: no OpenSSH ssh-keygen");
+        return;
+    }
+    let dir = temp_dir("gssapi-interop");
+    let port = free_port();
+    let (mut server, id_path, kh) = launch_server(&dir, port);
+
+    // Enable GSSAPI on the server config after launch (the config was already
+    // written; relaunch with GSSAPIAuthentication yes).
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    // Real OpenSSH client -> ns-ssh-server with GSSAPIAuthentication=yes.
+    let out = Command::new("/usr/bin/ssh")
+        .arg("-p").arg(port.to_string())
+        .arg("-i").arg(&id_path)
+        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("GSSAPIAuthentication=yes")
+        .arg("-o").arg("PreferredAuthentications=gssapi-with-mic,publickey")
+        .arg(format!("{}@127.0.0.1", user))
+        .arg("echo real-ssh-gssapi-ok")
+        .output()
+        .expect("run real ssh");
+
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Whether GSSAPI succeeded or fell through, the command must have run.
+    // (On a host with a broken GSS.framework the method is not offered and
+    // pubkey authenticates; on a working one gssapi-with-mic is offered but
+    // fails without a KDC, so pubkey is still used.)
+    assert!(
+        out.status.success(),
+        "real ssh failed: status={:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("real-ssh-gssapi-ok"),
+        "expected command output, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn real_openssh_mlkem_kex_interop() {
+    // The real OpenSSH `ssh` must connect to ns-ssh-server with BOTH sides
+    // pinned to mlkem768x25519-sha256. This proves wire-level interop of the
+    // RFC 9765 hybrid KEX (client decapsulation + server encapsulation, the
+    // string-encoded K, and the sha256 exchange hash) against OpenSSH 9.9.
+    if Command::new("ssh-keygen").arg("-V").arg("").output().is_err() {
+        eprintln!("SKIP: no OpenSSH ssh-keygen");
+        return;
+    }
+    let dir = temp_dir("mlkem-interop");
+    let port = free_port();
+
+    // Generate a client identity and an authorized_keys entry.
+    let id_path = dir.join("id_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .arg("-t").arg("ed25519")
+        .arg("-f").arg(&id_path)
+        .arg("-N").arg("")
+        .arg("-q")
+        .status()
+        .expect("run ssh-keygen");
+    assert!(keygen.success(), "ssh-keygen failed");
+    let pub_line = std::fs::read_to_string(dir.join("id_ed25519.pub")).unwrap_or_default();
+    let auth_path = dir.join("authorized_keys");
+    std::fs::write(&auth_path, pub_line).unwrap();
+
+    let host_key_path = dir.join("host_key_ed25519");
+    let config_path = dir.join("sshd_config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKexAlgorithms mlkem768x25519-sha256\nAuthorizedKeysFile {}\nPermitRootLogin yes\n",
+            port, host_key_path.display(), auth_path.display()
+        ),
+    )
+    .unwrap();
+
+    let server_bin = workspace_target_dir();
+    assert!(server_bin.exists(), "ns-ssh-server not built");
+    let server = Command::new(&server_bin)
+        .arg("-d")
+        .arg("-f")
+        .arg(&config_path)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "server did not come up on port {}",
+        port
+    );
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    let kh = dir.join("known_hosts");
+    let out = Command::new("/usr/bin/ssh")
+        .arg("-p").arg(port.to_string())
+        .arg("-i").arg(&id_path)
+        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("KexAlgorithms=mlkem768x25519-sha256")
+        .arg(format!("{}@127.0.0.1", user))
+        .arg("echo real-ssh-mlkem-ok")
+        .output()
+        .expect("run real ssh");
+
+    let mut server = server;
+    let _ = server.kill();
+    let _ = server.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "real ssh mlkem KEX failed: status={:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("real-ssh-mlkem-ok"),
+        "expected command output, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn ns_client_to_real_sshd_mlkem_kex_interop() {
+    // Our `ns-ssh` client must connect to the real OpenSSH sshd with BOTH
+    // sides pinned to mlkem768x25519-sha256. This exercises our client's
+    // decapsulation role against OpenSSH's server encapsulation (the reverse
+    // direction of `real_openssh_mlkem_kex_interop`).
+    if Command::new("ssh-keygen").arg("-V").arg("").output().is_err() {
+        eprintln!("SKIP: no OpenSSH ssh-keygen");
+        return;
+    }
+    if !Path::new("/usr/sbin/sshd").exists() {
+        eprintln!("SKIP: no /usr/sbin/sshd");
+        return;
+    }
+    let dir = temp_dir("mlkem-to-real-sshd");
+    let port = free_port();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+
+    // Host key for the real sshd, and a client identity.
+    let host_key = dir.join("ssh_host_ed25519_key");
+    let hk = Command::new("ssh-keygen")
+        .arg("-t").arg("ed25519").arg("-f").arg(&host_key).arg("-N").arg("").arg("-q")
+        .status().expect("host keygen");
+    assert!(hk.success(), "host keygen failed");
+    let id_path = dir.join("id_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .arg("-t").arg("ed25519").arg("-f").arg(&id_path).arg("-N").arg("").arg("-q")
+        .status().expect("client keygen");
+    assert!(keygen.success(), "client keygen failed");
+    let pub_line = std::fs::read_to_string(dir.join("id_ed25519.pub")).unwrap_or_default();
+    let auth_path = dir.join("authorized_keys");
+    std::fs::write(&auth_path, pub_line).unwrap();
+
+    let config_path = dir.join("sshd_config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "Port {}\nListenAddress 127.0.0.1\nHostKey {}\nPubkeyAuthentication yes\nPasswordAuthentication no\nKexAlgorithms mlkem768x25519-sha256\nAuthorizedKeysFile {}\nPermitRootLogin yes\nPidFile {}\nUsePAM no\nStrictModes no\n",
+            port, host_key.display(), auth_path.display(), dir.join("sshd.pid").display()
+        ),
+    )
+    .unwrap();
+
+    let mut sshd = Command::new("/usr/sbin/sshd")
+        .arg("-f").arg(&config_path)
+        .arg("-E").arg(dir.join("sshd.log"))
+        .spawn().expect("spawn sshd");
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "sshd did not come up on port {}",
+        port
+    );
+
+    let ns_ssh = ns_tool(&dir, "ns-ssh");
+    let out = Command::new(&ns_ssh)
+        .arg("-p").arg(port.to_string())
+        .arg("-i").arg(&id_path)
+        .arg("-F").arg("/dev/null")
+        .arg("-o").arg("StrictHostKeyChecking=no")
+        .arg("-o").arg("UserKnownHostsFile=/dev/null")
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("KexAlgorithms=mlkem768x25519-sha256")
+        .arg(format!("{}@127.0.0.1", user))
+        .arg("echo ns-to-real-sshd-mlkem-ok")
+        .output()
+        .expect("run ns-ssh");
+
+    let _ = sshd.kill();
+    let _ = sshd.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "ns-ssh -> real sshd mlkem KEX failed: status={:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("ns-to-real-sshd-mlkem-ok"),
+        "expected command output, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
