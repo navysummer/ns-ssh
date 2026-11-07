@@ -209,14 +209,14 @@ impl SessionManager {
 
         let mut pty_stdio = pty_stdio;
         let mut build_base = |c: &mut TokioCommand| {
+            c.env_clear(); // must come first: later .env() calls populate the env
             c.current_dir(&effective_workdir)
                 .env("HOME", &user_info.home_dir)
                 .env("USER", &username)
                 .env("LOGNAME", &username)
                 .env("SHELL", &user_info.shell)
                 .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-                .env("TERM", &session.term)
-                .env_clear();
+                .env("TERM", &session.term);
             for (name, value) in &env_vars {
                 c.env(name, value);
             }
@@ -269,8 +269,8 @@ impl SessionManager {
             None
         };
 
-        // PermitUserRC: run ~/.ssh/rc before the user's command/shell.
-        let rc_path = format!("{}/.ssh/rc", user_info.home_dir);
+        // PermitUserRC: run ~/.config/ns-ssh/rc before the user's command/shell.
+        let rc_path = format!("{}/.config/ns-ssh/rc", user_info.home_dir);
         let run_rc = should_run_user_rc(permit_user_rc, &rc_path);
 
         let mut cmd = if run_rc {

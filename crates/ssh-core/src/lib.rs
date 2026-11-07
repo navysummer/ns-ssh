@@ -15,6 +15,7 @@ pub mod keygen;
 pub mod cert;
 pub mod gssapi;
 pub mod gssapi_sys;
+pub mod paths;
 
 pub use error::{SshError, Result};
 pub use encoding::{SshEncode, SshDecode, SshString, SshBytes, SshNameList, SshMpInt};

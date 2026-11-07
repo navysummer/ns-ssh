@@ -4797,3 +4797,106 @@ fn remote_stderr_is_separated_from_stdout() {
         "remote stderr leaked into stdout: {stdout}"
     );
 }
+
+/// The client must read its default config from ns-ssh's own path
+/// (`~/.config/ns-ssh/config`, redirectable via `NS_SSH_CONFIG_DIR`), never
+/// OpenSSH's `~/.ssh/config`.
+#[test]
+fn client_default_config_comes_from_ns_ssh_path() {
+    let dir = temp_dir("default-config-path");
+    let cfg_dir = dir.join("ns-cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config"),
+        "Host testhost\n  User testuser\n  Port 2222\n",
+    )
+    .unwrap();
+
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let output = Command::new(client_bin)
+        .env("NS_SSH_CONFIG_DIR", &cfg_dir)
+        .arg("-G")
+        .arg("testhost")
+        .output()
+        .expect("run -G");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "-G failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("testuser"), "-G should read User from ns-ssh config, got:\n{out}");
+}
+
+/// `ns-ssh-keygen -F` must search the ns-ssh known_hosts path
+/// (`~/.config/ns-ssh/known_hosts`), not OpenSSH's `~/.ssh/known_hosts`.
+#[test]
+fn keygen_known_hosts_defaults_to_ns_ssh_path() {
+    let dir = temp_dir("default-kh-path");
+    let cfg_dir = dir.join("ns-cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+
+    // `-F` searches the default known_hosts; with an empty ns-ssh dir it must
+    // report "No such file" pointing at the ns-ssh path (not ~/.ssh).
+    let client_bin = env!("CARGO_BIN_EXE_ns-ssh");
+    let keygen_link = dir.join("ssh-keygen");
+    std::os::unix::fs::symlink(client_bin, &keygen_link).unwrap();
+    let output = Command::new(&keygen_link)
+        .env("NS_SSH_CONFIG_DIR", &cfg_dir)
+        .arg("-F")
+        .arg("somehost")
+        .output()
+        .expect("run -F");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("known_hosts"),
+        "-F should reference the known_hosts file, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(".ssh/known_hosts"),
+        "-F must not fall back to OpenSSH's ~/.ssh/known_hosts, got: {stderr}"
+    );
+}
+
+/// The server must load its default config from ns-ssh's own path
+/// (`/etc/ns-ssh/sshd_config`, redirectable via `NS_SSH_ETC_DIR`), never
+/// OpenSSH's `/etc/ssh/sshd_config`.
+#[test]
+fn server_default_config_comes_from_ns_ssh_path() {
+    let dir = temp_dir("default-server-config-path");
+    let etc_dir = dir.join("ns-etc");
+    std::fs::create_dir_all(&etc_dir).unwrap();
+
+    let server_bin = workspace_target_dir();
+    assert!(server_bin.exists(), "ns-ssh-server binary not built; run `cargo build`");
+
+    let cfg = etc_dir.join("sshd_config");
+    std::fs::write(&cfg, "Port 23999\nListenAddress 127.0.0.1\n").unwrap();
+
+    // -T dumps the effective config (does not bind a socket), so we can assert
+    // the file at the ns-ssh path was actually read.
+    let output = Command::new(&server_bin)
+        .env("NS_SSH_ETC_DIR", &etc_dir)
+        .arg("-T")
+        .output()
+        .expect("run server -T");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        output.status.success(),
+        "server -T failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains("23999"),
+        "-T should read Port from ns-ssh sshd_config, got:\n{out}"
+    );
+}

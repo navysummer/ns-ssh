@@ -248,21 +248,12 @@ pub fn blob_algorithm(blob: &[u8]) -> Option<String> {
 pub fn get_identity_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
 
-    if let Some(home) = dirs::home_dir() {
-        let ssh_dir = home.join(".ssh");
-        if ssh_dir.exists() {
-            let candidates = [
-                "id_ed25519",
-                "id_ecdsa",
-                "id_rsa",
-                "id_dsa",
-                "id_xmss",
-            ];
-            for name in &candidates {
-                let path = ssh_dir.join(name);
-                if path.exists() {
-                    files.push(path);
-                }
+    let ssh_dir = ssh_core::paths::user_dir();
+    if ssh_dir.exists() {
+        for name in ssh_core::paths::DEFAULT_IDENTITY_NAMES {
+            let path = ssh_dir.join(format!("id_{name}"));
+            if path.exists() {
+                files.push(path);
             }
         }
     }

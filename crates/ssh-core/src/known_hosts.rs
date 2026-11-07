@@ -52,14 +52,11 @@ impl KnownHosts {
     }
 
     pub fn default_client_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ssh")
-            .join("known_hosts")
+        crate::paths::user_known_hosts()
     }
 
     pub fn default_server_path() -> PathBuf {
-        PathBuf::from("/etc/ssh/known_hosts")
+        crate::paths::global_known_hosts()
     }
 
     fn load_from_file(path: &Path) -> Result<Vec<KnownHostEntry>> {

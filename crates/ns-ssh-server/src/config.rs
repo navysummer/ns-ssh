@@ -1279,9 +1279,9 @@ impl Default for ServerConfig {
             port: default_port(),
             listen_address: default_listen_address(),
             host_key_files: vec![
-                "/etc/ssh/ssh_host_ed25519_key".to_string(),
-                "/etc/ssh/ssh_host_rsa_key".to_string(),
-                "/etc/ssh/ssh_host_ecdsa_key".to_string(),
+                "/etc/ns-ssh/ssh_host_ed25519_key".to_string(),
+                "/etc/ns-ssh/ssh_host_rsa_key".to_string(),
+                "/etc/ns-ssh/ssh_host_ecdsa_key".to_string(),
             ],
             host_key_algorithms: None,
             kex_algorithms: None,
@@ -1302,8 +1302,7 @@ impl Default for ServerConfig {
             permit_root_login: false,
             permit_root_login_mode: "no".to_string(),
             authorized_keys_files: vec![
-                "~/.ssh/authorized_keys".to_string(),
-                "~/.ssh/authorized_keys2".to_string(),
+                "~/.config/ns-ssh/authorized_keys".to_string(),
             ],
             allow_groups: Vec::new(),
             deny_groups: Vec::new(),
@@ -1401,18 +1400,13 @@ impl ServerConfig {
     }
 
     pub fn load() -> Result<Self> {
-        let paths = [
-            "/etc/ssh/sshd_config",
-            "/etc/ns-ssh/sshd_config",
-        ];
+        let path = ssh_core::paths::server_config();
 
-        for path in &paths {
-            if Path::new(path).exists() {
-                return Self::load_from(Path::new(path));
-            }
+        if Path::new(&path).exists() {
+            Self::load_from(Path::new(&path))
+        } else {
+            Ok(Self::default())
         }
-
-        Ok(Self::default())
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {

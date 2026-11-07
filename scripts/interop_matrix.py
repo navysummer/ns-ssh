@@ -56,8 +56,11 @@ def make_dir(prefix):
 def keygen(d, tool, ttype="ed25519", name="id"):
     """Generate with a specific keygen tool; return (priv, pub)."""
     priv = f"{d}/{name}"
+    # RSA prime generation in the pure-Rust debug build is slow (can exceed
+    # 60s); give it a generous deadline so the check is not flaky.
+    timeout = 240 if ttype == "rsa" else 30
     r = (ns if tool.startswith("ns-") else op)(tool if not tool.startswith("ns-") else tool,
-            "-t", ttype, "-f", priv, "-N", "", "-q")
+            "-t", ttype, "-f", priv, "-N", "", "-q", timeout=timeout)
     return priv, f"{priv}.pub", r
 
 # ===========================================================================

@@ -1361,8 +1361,7 @@ fn run_keygen_mode() -> i32 {
     if remove_known {
         if let Some(host) = &hostname {
             let file = output_file.clone()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".ssh/known_hosts").to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "~/.ssh/known_hosts".to_string());
+                .unwrap_or_else(|| ssh_core::paths::user_known_hosts().to_string_lossy().into_owned());
             return keygen_remove_from_known_hosts(host, &file);
         }
         eprintln!("ssh-keygen: -R requires a hostname");
@@ -1661,9 +1660,7 @@ fn read_simple_u32(r: &mut &[u8]) -> Result<Option<u32>, ()> {
 
 /// Search a hostname in the user's known_hosts file (`-F`).
 fn keygen_find_in_known_hosts(hostname: &str) -> i32 {
-    let path = std::path::PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-    ).join(".ssh/known_hosts");
+    let path = ssh_core::paths::user_known_hosts();
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => {
@@ -2047,6 +2044,10 @@ fn run_ssh_copy_id_mode() -> i32 {
     let mut port: Option<String> = None;
     let mut ssh_options: Vec<String> = Vec::new();
     let mut target: Option<String> = None;
+    // Remote authorized_keys path. Defaults to ns-ssh's own location
+    // (`~/.config/ns-ssh/authorized_keys`); override with `--authorized-keys-file`
+    // to install into a real sshd's `~/.ssh/authorized_keys`.
+    let mut remote_keys_file: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -2070,8 +2071,12 @@ fn run_ssh_copy_id_mode() -> i32 {
                 i += 1;
                 if i < args.len() { ssh_options.push(format!("-F {}", args[i])); }
             }
+            "--authorized-keys-file" => {
+                i += 1;
+                if i < args.len() { remote_keys_file = Some(args[i].clone()); }
+            }
             "-h" | "-?" | "--help" => {
-                eprintln!("usage: ns-ssh-copy-id [-f] [-n] [-i identity_file] [-p port] [-o option] [user@]hostname");
+                eprintln!("usage: ns-ssh-copy-id [-f] [-n] [-i identity_file] [-p port] [-o option] [--authorized-keys-file PATH] [user@]hostname");
                 return 1;
             }
             _ => {
@@ -2117,9 +2122,8 @@ fn run_ssh_copy_id_mode() -> i32 {
     } else if let Ok(agent_lines) = load_agent_public_keys() {
         agent_lines
     } else {
-        // Fall back to the newest default identity file.
-        let home = dirs::home_dir().unwrap_or_default();
-        let ssh_dir = home.join(".ssh");
+        // Fall back to the newest default identity file in our own directory.
+        let ssh_dir = ssh_core::paths::user_dir();
         let mut candidates: Vec<_> = std::fs::read_dir(&ssh_dir)
             .ok()
             .into_iter()
@@ -2143,16 +2147,34 @@ fn run_ssh_copy_id_mode() -> i32 {
     }
 
     // Build the remote command: append each key line to authorized_keys unless
-    // already present (or force).
+    // already present (or force). The remote path defaults to ns-ssh's own
+    // `~/.config/ns-ssh/authorized_keys`; pass `--authorized-keys-file` to
+    // target a real sshd's `~/.ssh/authorized_keys` instead.
+    let raw_keys = remote_keys_file.unwrap_or_else(|| {
+        "~/.config/ns-ssh/authorized_keys".to_string()
+    });
+    // Rewrite a leading `~/` as `$HOME/` so the *remote* shell expands it:
+    // single quotes suppress `~` expansion, but `$HOME` inside double quotes
+    // expands to the remote account's home (not the local user's).
+    let remote_keys = if let Some(rest) = raw_keys.strip_prefix("~/") {
+        format!("$HOME/{}", rest)
+    } else {
+        raw_keys
+    };
     let mut remote_cmd = String::new();
-    remote_cmd.push_str("umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys; ");
+    // Derive the parent dir so `mkdir -p` targets the right place even for a
+    // bare filename, then append each key unless already present (or force).
+    remote_cmd.push_str(&format!(
+        "umask 077; _nsk=\"{}\"; _nsd=$(dirname \"$_nsk\"); mkdir -p \"$_nsd\" && touch \"$_nsk\"; ",
+        remote_keys
+    ));
     for line in &key_lines {
         let escaped = line.replace('\'', "'\\''");
         if force {
-            remote_cmd.push_str(&format!("echo '{}' >> ~/.ssh/authorized_keys; ", escaped));
+            remote_cmd.push_str(&format!("echo '{}' >> \"$_nsk\"; ", escaped));
         } else {
             remote_cmd.push_str(&format!(
-                "grep -qxF '{}' ~/.ssh/authorized_keys 2>/dev/null || echo '{}' >> ~/.ssh/authorized_keys; ",
+                "grep -qxF '{}' \"$_nsk\" 2>/dev/null || echo '{}' >> \"$_nsk\"; ",
                 escaped, escaped
             ));
         }

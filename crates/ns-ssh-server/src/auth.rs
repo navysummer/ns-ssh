@@ -425,7 +425,7 @@ impl ServerAuth {
         }
 
         let patterns = if self.authorized_keys_patterns.is_empty() {
-            vec!["~/.ssh/authorized_keys".to_string(), "~/.ssh/authorized_keys2".to_string()]
+            vec!["~/.config/ns-ssh/authorized_keys".to_string()]
         } else {
             self.authorized_keys_patterns.clone()
         };
@@ -751,13 +751,11 @@ impl ServerAuth {
         ignore_user_known_hosts: bool,
     ) -> bool {
         let mut paths: Vec<std::path::PathBuf> = vec![
-            std::path::PathBuf::from("/etc/ssh/ssh_known_hosts"),
-            std::path::PathBuf::from("/etc/ssh/ssh_known_hosts2"),
+            std::path::PathBuf::from("/etc/ns-ssh/known_hosts"),
         ];
         if !ignore_user_known_hosts {
             if let Some(home) = Self::home_dir_for_user(username) {
-                paths.push(std::path::PathBuf::from(&home).join(".ssh/known_hosts"));
-                paths.push(std::path::PathBuf::from(&home).join(".ssh/known_hosts2"));
+                paths.push(std::path::PathBuf::from(&home).join(".config/ns-ssh/known_hosts"));
             }
         }
         if !Self::host_key_in_known_hosts(&paths, client_host, key_type, public_key) {

@@ -892,10 +892,7 @@ fn glob_capture<'a>(pattern: &str, text: &'a str) -> Option<Option<&'a str>> {
 
 impl SshConfig {
     pub fn load() -> Result<Self> {
-        let config_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".ssh")
-            .join("config");
+        let config_path = ssh_core::paths::client_config();
 
         Self::load_from(&config_path)
     }

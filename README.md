@@ -16,7 +16,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Interactive shell
 - Local and remote port forwarding
 - Known hosts management
-- SSH client config file parsing (~/.ssh/config)
+- SSH client config file parsing (~/.config/ns-ssh/config)
 - Automatic rekeying (RekeyLimit; client- and server-initiated)
 
 ### ns-ssh-server (Server)
@@ -27,7 +27,7 @@ A pure Rust implementation of OpenSSH client (`ssh`) and server (`sshd`), with n
 - Session and channel management
 - PTY allocation support
 - Environment variable handling
-- Server config file (/etc/ssh/sshd_config compatible)
+- Server config file (/etc/ns-ssh/sshd_config)
 - Automatic host key generation
 - Daemon mode support
 - Automatic rekeying (RekeyLimit)
@@ -89,7 +89,7 @@ ns-ssh -p 2222 user@hostname
 ns-ssh user@hostname ls -la
 
 # Use specific identity file
-ns-ssh -i ~/.ssh/my_key user@hostname
+ns-ssh -i ~/.config/ns-ssh/my_key user@hostname
 
 # Local port forwarding
 ns-ssh -L 8080:localhost:80 user@hostname
@@ -133,20 +133,20 @@ for t in ns-ssh ns-ssh-add ns-ssh-agent ns-ssh-copy-id ns-ssh-keyscan ns-ssh-key
 done
 
 # key generation
-ns-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
+ns-ssh-keygen -t ed25519 -f ~/.config/ns-ssh/id_ed25519
 
 # agent daemon (holds private keys, exports SSH_AUTH_SOCK/SSH_AGENT_PID)
 eval "$(ns-ssh-agent -s)"
-ns-ssh-add ~/.ssh/id_ed25519
+ns-ssh-add ~/.config/ns-ssh/id_ed25519
 ns-ssh-add -l          # list identities
 ns-ssh-add -L          # list public keys
 ns-ssh-add -D          # remove all
 
 # copy a public key to a remote account's authorized_keys
-ns-ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host
+ns-ssh-copy-id -i ~/.config/ns-ssh/id_ed25519.pub user@host
 
 # scan a host's public keys into known_hosts
-ns-ssh-keyscan host > ~/.ssh/known_hosts
+ns-ssh-keyscan host > ~/.config/ns-ssh/known_hosts
 ```
 
 All five interoperate with the real OpenSSH tools: `ssh-add`/`ssh` work against
@@ -154,31 +154,50 @@ All five interoperate with the real OpenSSH tools: `ssh-add`/`ssh` work against
 
 ## Configuration
 
-### Client (~/.ssh/config)
+ns-ssh uses its **own** configuration and key paths, deliberately separate from
+OpenSSH, so the two never read or overwrite each other's files:
+
+| 用途 | 路径 |
+|---|---|
+| 客户端配置 | `~/.config/ns-ssh/config`（可用 `-F` 覆盖） |
+| 客户端 known_hosts | `~/.config/ns-ssh/known_hosts`（可用 `UserKnownHostsFile` 覆盖） |
+| 全局 known_hosts | `/etc/ns-ssh/known_hosts`（可用 `GlobalKnownHostsFile` 覆盖） |
+| 默认身份密钥 | `~/.config/ns-ssh/id_ed25519` / `id_ecdsa` / `id_rsa` |
+| 服务端配置 | `/etc/ns-ssh/sshd_config`（可用 `-f` 覆盖） |
+| 服务端主机密钥 | `/etc/ns-ssh/ssh_host_ed25519_key` / `ssh_host_rsa_key` / `ssh_host_ecdsa_key` |
+| 服务端 authorized_keys | `~/.config/ns-ssh/authorized_keys`（可用 `AuthorizedKeysFile` 覆盖） |
+| 服务端用户 rc（PermitUserRC） | `~/.config/ns-ssh/rc` |
+
+> 环境变量 `NS_SSH_CONFIG_DIR`（用户级，默认 `~/.config/ns-ssh`）与
+> `NS_SSH_ETC_DIR`（系统级，默认 `/etc/ns-ssh`）可整体重定向这些默认位置。
+> 除上述默认值外，所有配置指令（`HostKey`、`AuthorizedKeysFile`、
+> `UserKnownHostsFile`、`IdentityFile` 等）仍可指向任意路径。
+
+### Client (~/.config/ns-ssh/config)
 
 ```
 Host myserver
     HostName 192.168.1.100
     User admin
     Port 22
-    IdentityFile ~/.ssh/id_ed25519
+    IdentityFile ~/.config/ns-ssh/id_ed25519
 
 Host *
     StrictHostKeyChecking ask
     ForwardAgent no
 ```
 
-### Server (/etc/ssh/sshd_config compatible)
+### Server (/etc/ns-ssh/sshd_config)
 
 ```
 Port 22
 ListenAddress 0.0.0.0
-HostKey /etc/ssh/ssh_host_ed25519_key
-HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ns-ssh/ssh_host_ed25519_key
+HostKey /etc/ns-ssh/ssh_host_rsa_key
 PasswordAuthentication yes
 PubkeyAuthentication yes
 PermitRootLogin no
-AuthorizedKeysFile ~/.ssh/authorized_keys
+AuthorizedKeysFile ~/.config/ns-ssh/authorized_keys
 MaxAuthTries 6
 MaxSessions 10
 ```

@@ -35,11 +35,11 @@ fn terminal_size() -> std::io::Result<(u32, u32)> {
     Ok((ws.ws_col as u32, ws.ws_row as u32))
 }
 
-/// Host key files tried for hostbased authentication, in OpenSSH's order.
+/// Host key files tried for hostbased authentication, in ns-ssh's order.
 const HOST_KEY_CANDIDATES: &[&str] = &[
-    "/etc/ssh/ssh_host_ed25519_key",
-    "/etc/ssh/ssh_host_ecdsa_key",
-    "/etc/ssh/ssh_host_rsa_key",
+    "/etc/ns-ssh/ssh_host_ed25519_key",
+    "/etc/ns-ssh/ssh_host_ecdsa_key",
+    "/etc/ns-ssh/ssh_host_rsa_key",
 ];
 
 /// Saves terminal state and puts it in raw mode. Restores on Drop.

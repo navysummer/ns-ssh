@@ -31,6 +31,7 @@
 | S14 | `ssh-keygen -lf`（附着短选项）与指纹位数 | **已实现可用** | `main.rs` keygen 参数解析支持 `-lf`/`-yf` 与位置文件参数；`print_fingerprint` 按密钥类型计算位数（RSA=模长，ed25519=256）；`ssh_keygen_attached_lf_and_bit_length` |
 | S15 | `ssh-keyscan -t <type>` 短类型名映射 | **已实现可用** | `main.rs` `keyscan_keytype_to_algs`：`ed25519`→`ssh-ed25519`、`rsa`→`rsa-sha2-512/256` 等；`ns_ssh_keyscan_t_type_maps_to_algorithm`（此前 `-t ed25519` 把 `ed25519` 当算法名导致 KEX 无公共算法、扫描失败） |
 | S16 | 全工具双向互通矩阵 | **已实现可用** | `scripts/interop_matrix.py`：keygen/agent/scp/sftp/copy-id/keyscan/exec × `ns-*`/OpenSSH 双向 × `ns-ssh-server`/`sshd`，49 项全过；`ns-ssh` 客户端经 `ns-ssh-agent`/`ssh-agent` 均可签名认证 |
+| S17 | 配置文件/密钥路径与 OpenSSH 完全隔离 | **已实现可用** | `ssh-core/src/paths.rs`（`NS_SSH_CONFIG_DIR`/`NS_SSH_ETC_DIR` 可重定向）：客户端 `~/.config/ns-ssh/{config,known_hosts,id_*}`、全局 `/etc/ns-ssh/known_hosts`；服务端 `/etc/ns-ssh/{sshd_config,ssh_host_*}`、`~/.config/ns-ssh/{authorized_keys,known_hosts,rc}`；不再读/写 `~/.ssh` 或 `/etc/ssh`。验证：`client_default_config_comes_from_ns_ssh_path`、`server_default_config_comes_from_ns_ssh_path`、`keygen_known_hosts_defaults_to_ns_ssh_path` 集成测试；端到端 smoke（服务端从 `/etc/ns-ssh/sshd_config` 启动，客户端用默认 `known_hosts`/默认身份连接成功） |
 
 ## 2. 算法集对齐（全部与 OpenSSH 9.9 一致）
 
@@ -65,3 +66,6 @@
   - `cargo test -p ns-ssh --test integration ssh_keygen_attached_lf_and_bit_length`（S14）
   - `cargo test -p ns-ssh --test integration ns_ssh_keyscan_t_type_maps_to_algorithm`（S15）
   - `python3 scripts/interop_matrix.py`（S16：49 项双向互通全过）
+  - `cargo test -p ns-ssh --test integration client_default_config_comes_from_ns_ssh_path`（S17）
+  - `cargo test -p ns-ssh --test integration server_default_config_comes_from_ns_ssh_path`（S17）
+  - `cargo test -p ns-ssh --test integration keygen_known_hosts_defaults_to_ns_ssh_path`（S17）
